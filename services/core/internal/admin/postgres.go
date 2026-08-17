@@ -36,10 +36,13 @@ type postgresStore struct{}
 // disputeColumns is every column of a dispute, in the order [scanDispute] reads them.
 //
 // resolved_at has no COALESCE because PostgreSQL's NULL has no representation in time.Time, and
-// because the distinction it carries is the whole of [Dispute.Open].
+// because the distinction it carries is the whole of [Dispute.Open]. `outcome` and `resolved_by`
+// (SHIP-164, `000804`) are null under the same condition and for the same reason —
+// `ck_disputes_resolution` holds all three together.
 const disputeColumns = `
 	id, job_id, complainant_id, complainant_party, category, description, desired_outcome,
-	occurred_at, evidence, idempotency_key, resolved_at, created_at, updated_at`
+	occurred_at, evidence, idempotency_key, resolved_at, outcome, resolved_by,
+	created_at, updated_at`
 
 // scanDispute reads one row of [disputeColumns].
 //
@@ -51,23 +54,31 @@ func scanDispute(row pgx.Row) (Dispute, error) {
 		d          Dispute
 		key        *string
 		resolvedAt *time.Time
+		outcome    *string
+		resolvedBy *uuid.UUID
 	)
 
 	if err := row.Scan(
 		&d.ID, &d.JobID, &d.ComplainantID, &d.ComplainantParty, &d.Category,
 		&d.Description, &d.DesiredOutcome, &d.OccurredAt, &d.Evidence,
-		&key, &resolvedAt, &d.CreatedAt, &d.UpdatedAt,
+		&key, &resolvedAt, &outcome, &resolvedBy, &d.CreatedAt, &d.UpdatedAt,
 	); err != nil {
 		return Dispute{}, err
 	}
 
-	// Two nullable columns, and each null means something the zero value says just as well: no
+	// Four nullable columns, and each null means something the zero value says just as well: no
 	// request behind the row, and not resolved yet.
 	if key != nil {
 		d.Key = *key
 	}
 	if resolvedAt != nil {
 		d.ResolvedAt = *resolvedAt
+	}
+	if outcome != nil {
+		d.Outcome = Outcome(*outcome)
+	}
+	if resolvedBy != nil {
+		d.ResolvedBy = *resolvedBy
 	}
 	return d, nil
 }

@@ -121,6 +121,56 @@ func (j testJobs) Unpublish(
 	}
 }
 
+// ResolveAsCompleted and ResolveAsCancelled are SHIP-164's moves, as cmd/api's disputeLifecycle
+// performs them — a copy of the adapter rather than a stub, for the reason [testJobs.Unpublish]
+// records: the transition is a real one through the real guard against a real database, so Docs/02
+// §2's table decides which jobs can be resolved rather than this file deciding it.
+func (j testJobs) ResolveAsCompleted(
+	ctx context.Context,
+	r db.Runner,
+	jobID, actorID uuid.UUID,
+	reason string,
+) (JobMove, error) {
+	return j.resolve(ctx, r, jobID, actorID, jobs.StatusCompleted, reason)
+}
+
+func (j testJobs) ResolveAsCancelled(
+	ctx context.Context,
+	r db.Runner,
+	jobID, actorID uuid.UUID,
+	reason string,
+) (JobMove, error) {
+	return j.resolve(ctx, r, jobID, actorID, jobs.StatusCancelled, reason)
+}
+
+func (j testJobs) resolve(
+	ctx context.Context,
+	r db.Runner,
+	jobID, actorID uuid.UUID,
+	to jobs.Status,
+	reason string,
+) (JobMove, error) {
+	_, err := j.svc.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     to,
+		Actor:  jobs.User(jobs.ActorAdmin, actorID),
+		Reason: reason,
+	})
+
+	switch {
+	case err == nil:
+		return JobMoved, nil
+	case errors.Is(err, jobs.ErrJobNotFound):
+		return JobNotFound, nil
+	case errors.Is(err, jobs.ErrAlreadyInStatus):
+		return JobAlreadyResolved, nil
+	case errors.Is(err, jobs.ErrTransitionNotPermitted):
+		return JobNotResolvable, nil
+	default:
+		return JobMoveUnrecognised, err
+	}
+}
+
 // testParties is admin.JobParties over the job and its accepted bid, as cmd/api reads it.
 type testParties struct{}
 
@@ -172,6 +222,16 @@ func (s staticJobs) MoveToDisputed(context.Context, db.Runner, uuid.UUID, uuid.U
 // Unpublish answers the same canned outcome. Present so the type still satisfies [Jobs]; the
 // enforcement tests use [testJobs], which performs a real transition.
 func (s staticJobs) Unpublish(context.Context, db.Runner, uuid.UUID, uuid.UUID, string) (JobMove, error) {
+	return s.move, s.err
+}
+
+// The two SHIP-164 moves answer the same canned outcome, for the reason above. The resolution
+// tests use [testJobs], which performs a real transition.
+func (s staticJobs) ResolveAsCompleted(context.Context, db.Runner, uuid.UUID, uuid.UUID, string) (JobMove, error) {
+	return s.move, s.err
+}
+
+func (s staticJobs) ResolveAsCancelled(context.Context, db.Runner, uuid.UUID, uuid.UUID, string) (JobMove, error) {
 	return s.move, s.err
 }
 
@@ -267,6 +327,31 @@ func acceptBid(t *testing.T, pool *pgxpool.Pool, jobID, providerID uuid.UUID) {
 
 // deliveredJob is a job that has been published, awarded, driven and delivered — the state a
 // dispute is most often raised from, and the one Docs/02 §6.1's 72-hour window runs against.
+// anAdminUser inserts an `admin_users` row and answers its identifier.
+//
+// Inserted rather than created through [Credentials], because the only thing needing one here is
+// `fk_disputes_resolved_by`: any row of the right table will do, and going through the service
+// would drag a password hasher into a fixture about an index.
+func anAdminUser(t *testing.T, pool *pgxpool.Pool, email string) uuid.UUID {
+	t.Helper()
+
+	id, err := uuid.NewV7()
+	if err != nil {
+		t.Fatalf("generating an administrator id: %v", err)
+	}
+	// A syntactically valid argon2id encoding, because `ck_admin_users_password_hash` requires
+	// the prefix (`000801`). Nothing signs in as this account — it exists to satisfy
+	// `fk_disputes_resolved_by` — so the derivation behind it is deliberately not a real one.
+	const hash = "$argon2id$v=19$m=64,t=1,p=1$c2FsdHNhbHRzYWx0c2Fs$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+	if _, err := pool.Exec(t.Context(), `
+		INSERT INTO admin_users (id, email, name, password_hash, role)
+		VALUES ($1, $2, 'A Moderator', $3, 'moderator')`, id, email, hash); err != nil {
+		t.Fatalf("inserting %s: %v", email, err)
+	}
+	return id
+}
+
 func deliveredJob(t *testing.T, pool *pgxpool.Pool, customer, provider uuid.UUID) uuid.UUID {
 	t.Helper()
 
@@ -716,8 +801,17 @@ func TestASecondPartyIsRefusedWhileOneIsOpen(t *testing.T) {
 
 	// And once it is resolved the job can be disputed again, which is what makes the index
 	// partial rather than a unique constraint. The job goes back into the lifecycle the way
-	// SHIP-164's outcome will put it there.
-	if _, err := pool.Exec(t.Context(), `UPDATE disputes SET resolved_at = now() WHERE job_id = $1`, jobID); err != nil {
+	// SHIP-164's outcome puts it there.
+	//
+	// **All three resolution columns, because `ck_disputes_resolution` binds them** (SHIP-164,
+	// `000804`). This fixture wrote `resolved_at` alone until that constraint existed — the
+	// wave-13 collision in miniature, and the reason a ticket adding a CHECK sweeps for the
+	// fixtures it did not write.
+	resolver := anAdminUser(t, pool, "reopen-resolver@example.com")
+	if _, err := pool.Exec(t.Context(), `
+		UPDATE disputes
+		SET resolved_at = now(), outcome = 'Delivery completed as agreed', resolved_by = $2
+		WHERE job_id = $1 AND resolved_at IS NULL`, jobID, resolver); err != nil {
 		t.Fatalf("resolving: %v", err)
 	}
 	moveJobBecause(t, pool, jobID, jobs.User(jobs.ActorAdmin, customer),

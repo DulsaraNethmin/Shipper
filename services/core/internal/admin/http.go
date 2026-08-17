@@ -68,6 +68,7 @@ type Handler struct {
 	notes         *Notes
 	suspensions   *Suspensions
 	verifications *Verifications
+	disputes      *DisputeWorkflow
 	pool          *pgxpool.Pool
 	log           *slog.Logger
 }
@@ -117,6 +118,15 @@ type HandlerServices struct {
 	// Verifications is Docs/04 §5's first queue and Docs/04 §6's decision (SHIP-153,
 	// SHIP-154).
 	Verifications *Verifications
+
+	// DisputeWorkflow is Docs/04 §7's investigation and outcome stages (SHIP-164).
+	//
+	// **Beside [Disputes] rather than replacing it**, because the two are the same document's
+	// stages on opposite credentials: [Disputes] is intake, called by a customer or a provider
+	// with the ordinary access token, and this is what an administrator does with what they
+	// reported. One service carrying both would put the audit writer into the constructor of
+	// the one endpoint in this package that deliberately writes no entry.
+	DisputeWorkflow *DisputeWorkflow
 }
 
 // NewHandler wires the handlers to the services.
@@ -192,6 +202,12 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// provider and no way to make one.
 		return nil, errors.New("admin: a handler needs the verification console")
 	}
+	if s.DisputeWorkflow == nil {
+		// SHIP-164. The same argument once more, and here it guards the endpoints that unfreeze
+		// a job: a nil discovered at the first request is a delivery frozen by a complaint with
+		// no way to settle it, and Docs/02 §6.1's auto-complete stopped for as long as it lasts.
+		return nil, errors.New("admin: a handler needs the dispute workflow")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
@@ -207,6 +223,7 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		notes:         s.Notes,
 		suspensions:   s.Suspensions,
 		verifications: s.Verifications,
+		disputes:      s.DisputeWorkflow,
 		pool:          pool,
 		log:           log,
 	}, nil
@@ -670,6 +687,41 @@ func apiError(err error) error {
 		// field failure either way, because a client that sent a bad state has made a mistake
 		// about a field somebody typed.
 		return fieldProblem("state", err)
+
+	// --- Docs/04 §7's investigation and outcome stages (SHIP-164) ----------------------------
+
+	case errors.Is(err, ErrDisputeNotFound):
+		// Disclosed plainly, like the two 404s above and unlike the one on dispute intake: the
+		// caller is an administrator holding a permission over disputes, and the
+		// indistinguishability intake needs is a rule about strangers rather than about the
+		// console.
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such dispute.").WithCause(err)
+
+	case errors.Is(err, ErrDisputeAlreadyResolved):
+		return httpx.NewError(http.StatusConflict, CodeDisputeAlreadyResolved,
+			"This dispute has already been resolved.").WithCause(err)
+
+	case errors.Is(err, ErrJobNotResolvable):
+		return httpx.NewError(http.StatusConflict, CodeJobNotResolvable,
+			"This job is no longer waiting on a dispute. Reload it — its status has moved "+
+				"since the dispute was opened.").WithCause(err)
+
+	case errors.Is(err, ErrDisputeOutcomeUnrecognised):
+		// The five are named in the message, which this package function *can* do here and
+		// cannot do for a verification state: Docs/04 §7's outcomes are this domain's own
+		// closed list, and Docs/04 §4's belong to `profiles` and arrive through cmd/api.
+		return fieldProblem("outcome", fmt.Errorf(
+			"that is not a dispute outcome; use one of %s", strings.Join(OutcomesWire(), ", ")))
+
+	case errors.Is(err, ErrJobOutcomeUnrecognised):
+		return fieldProblem("job_outcome", fmt.Errorf(
+			"that is not a destination for a resolved dispute; use one of %s",
+			strings.Join(jobOutcomeNames(), ", ")))
+
+	case errors.Is(err, ErrDisputeStateUnrecognised):
+		return fieldProblem("state", fmt.Errorf(
+			"that is not a dispute queue; use one of %s", strings.Join(disputeStateNames(), ", ")))
 
 	case errors.Is(err, ErrAdminUnavailable):
 		// 503 rather than 500: a dependency is not answering, and retrying is the right
@@ -3074,6 +3126,440 @@ func providerIDFrom(r *http.Request) (uuid.UUID, error) {
 	if err != nil {
 		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
 			"The provider id in the path is not a valid identifier.").WithCause(err)
+	}
+	return id, nil
+}
+
+// --- SHIP-164: Docs/04 §7's investigation and outcome stages ---------------------------------------
+//
+// Three handlers, and everything below this line belongs to them. A delimited region rather than
+// handlers threaded in beside their nearest relative, because this file is large and a reviewer
+// should be able to read one ticket's transport surface without a diff tool.
+//
+// The permissions were declared by SHIP-148 and granted before there was an endpoint behind them:
+// `disputes.read` is held by every role including `support`, and `disputes.resolve` by `moderator`
+// and `owner`. That is Docs/04 §9's least privilege as two permissions on two endpoints, the same
+// split `jobs.read` against `jobs.unpublish` makes — a support administrator investigates and a
+// moderator decides.
+
+// disputeSummaryResponse is one dispute as the queue shows it.
+//
+// **No description, no desired outcome and no evidence**, which is structural rather than a saving:
+// [DisputeSummary] has nowhere to put them, so no change to this mapping can acquire one. They are
+// what `GET /v1/admin/disputes/{id}` is for.
+//
+// **No budget and no bid amount**, on [verificationEntryResponse]'s reasoning and Docs/01 §4.3's
+// invariant. `Docs/11` records SHIP-152's decision to leave the budget off the administrative job
+// shape and names this ticket as the revisit; this ticket does not take it, and says so rather than
+// leaving the silence to be read either way. Nothing here needs it — a resolution is a finding and a
+// destination, neither of which is a number — and an administrator who does need the offers a
+// disputed award was chosen over opens `GET /v1/admin/jobs/{id}`, where every bid amount already is.
+//
+// The four resolution fields are always present and empty on an open dispute, so a console renders
+// one shape rather than branching on which keys exist.
+type disputeSummaryResponse struct {
+	ID    string `json:"id"`
+	JobID string `json:"job_id"`
+
+	ComplainantID string `json:"complainant_id"`
+
+	// ComplainantParty is which side of the job they were on, resolved by the platform at
+	// intake. Not their account role — `000800`s column comment says why the two differ.
+	ComplainantParty string `json:"complainant_party"`
+
+	Category string `json:"category"`
+
+	// OccurredAt is the complainant's clock and RaisedAt is the platform's. Both, because the
+	// gap between them is what triage reads and a queue showing one is showing the wrong one
+	// half the time.
+	OccurredAt string `json:"occurred_at"`
+	RaisedAt   string `json:"raised_at"`
+
+	// ResolvedAt, Outcome and ResolvedBy are empty together on the open queue —
+	// `ck_disputes_resolution` is what makes that true of the row rather than of this mapping.
+	ResolvedAt string `json:"resolved_at"`
+	Outcome    string `json:"outcome"`
+	ResolvedBy string `json:"resolved_by"`
+}
+
+func disputeSummaryFrom(s DisputeSummary) disputeSummaryResponse {
+	out := disputeSummaryResponse{
+		ID:               s.ID.String(),
+		JobID:            s.JobID.String(),
+		ComplainantID:    s.ComplainantID.String(),
+		ComplainantParty: s.ComplainantParty.String(),
+		Category:         s.Category.Wire(),
+		OccurredAt:       timestamp(s.OccurredAt),
+		RaisedAt:         timestamp(s.RaisedAt),
+		ResolvedAt:       timestamp(s.ResolvedAt),
+	}
+	if !s.Open() {
+		out.Outcome = s.Outcome.Wire()
+		out.ResolvedBy = s.ResolvedBy.String()
+	}
+	return out
+}
+
+// adminDisputeResponse is one dispute with everything the complainant sent.
+//
+// **A shape of its own rather than [disputeResponse] reused**, which `000800`s header predicted:
+// "the administrative view of a dispute is a shape of its own rather than this one reached by
+// another route". The complainant's shape omits the complainant (they are the caller) and the
+// resolution (it had none); this one names both, and the two would have to diverge the moment
+// either changed.
+//
+// The evidence is passed through as the complainant wrote it. The platform stores references in
+// somebody's own words and does not resolve them (`000800`), so there is nothing here to expand.
+type adminDisputeResponse struct {
+	ID    string `json:"id"`
+	JobID string `json:"job_id"`
+
+	ComplainantID    string `json:"complainant_id"`
+	ComplainantParty string `json:"complainant_party"`
+
+	Category       string   `json:"category"`
+	Description    string   `json:"description"`
+	DesiredOutcome string   `json:"desired_outcome"`
+	Evidence       []string `json:"evidence"`
+
+	OccurredAt string `json:"occurred_at"`
+	RaisedAt   string `json:"raised_at"`
+
+	ResolvedAt string `json:"resolved_at"`
+	Outcome    string `json:"outcome"`
+	ResolvedBy string `json:"resolved_by"`
+}
+
+func adminDisputeFrom(d Dispute) adminDisputeResponse {
+	// Never null. An empty list rather than `null` when nothing was described, so a console
+	// iterating without checking does not crash on the ordinary case.
+	evidence := d.Evidence
+	if evidence == nil {
+		evidence = []string{}
+	}
+
+	out := adminDisputeResponse{
+		ID:               d.ID.String(),
+		JobID:            d.JobID.String(),
+		ComplainantID:    d.ComplainantID.String(),
+		ComplainantParty: d.ComplainantParty.String(),
+		Category:         d.Category.Wire(),
+		Description:      d.Description,
+		DesiredOutcome:   d.DesiredOutcome,
+		Evidence:         evidence,
+		OccurredAt:       timestamp(d.OccurredAt),
+		RaisedAt:         timestamp(d.CreatedAt),
+		ResolvedAt:       timestamp(d.ResolvedAt),
+	}
+	if !d.Open() {
+		out.Outcome = d.Outcome.Wire()
+		out.ResolvedBy = d.ResolvedBy.String()
+	}
+
+	// The idempotency key is deliberately absent, as it is from the complainant's own shape:
+	// it is the client's value coming back at it, and putting it in a response invites a reader
+	// to treat it as an identifier the platform issued.
+	return out
+}
+
+// DisputeQueue handles GET /v1/admin/disputes (SHIP-164).
+//
+// Docs/04 §5's **sixth** moderation queue — "open disputes" — and the endpoint `idx_disputes_open`
+// was built for in `000800` and read by nothing for four waves. It needs [PermissionDisputesRead],
+// which every role holds including `support`: reading a queue is what the least-privileged role
+// exists to be able to do.
+//
+// **Serving it is in scope because the *Done when* says a dispute "moves through investigation", and
+// an administrator cannot investigate a dispute they cannot find.** Nothing else in the console
+// lists one: `GET /v1/admin/jobs` searches jobs and would need a moderator to already know which job
+// to look at, which is the question this queue answers.
+//
+// # `state` defaults to `open`, which is the opposite of the verification queue
+//
+// A deliberate difference rather than an inconsistency, and [DisputeQuery.State] argues it: Docs/04
+// §5's first queue is "new **or changed**" submissions, so there is no document-given default and an
+// omitted filter would answer an empty page that reads exactly like a quiet week. §5's sixth queue is
+// named "Open disputes". A console that forgets this parameter gets the queue, so the failure the
+// other endpoint's rule exists to prevent cannot occur here.
+func (h *Handler) DisputeQueue() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionDisputesRead); err != nil {
+			return err
+		}
+
+		query, err := disputeQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so that "is there another page" is answered by the rows
+		// rather than by a second COUNT — the arrangement every other queue here uses.
+		query.Limit++
+
+		entries, err := h.disputes.Queue(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(entries) == query.Limit {
+			last := entries[len(entries)-2]
+
+			// The cursor carries whichever clock this half is ordered by, which is what
+			// makes it decodable against the statement that issued it. A cursor from the
+			// open queue replayed against the resolved one compares a `created_at` to a
+			// `resolved_at` and pages through nonsense — so the state is part of what a
+			// console has to keep, exactly as `limit` is.
+			at := last.RaisedAt
+			if query.State == DisputeStateResolved {
+				at = last.ResolvedAt
+			}
+
+			next = pagination.Cursor{timestamp(at), last.ID.String()}.Encode()
+			entries = entries[:len(entries)-1]
+		}
+
+		out := make([]disputeSummaryResponse, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, disputeSummaryFrom(e))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
+		return nil
+	})
+}
+
+// disputeQueryFrom reads the page parameters.
+//
+// A package function rather than a method, unlike [Handler.verificationQueryFrom]: the vocabulary it
+// validates against is this domain's own closed list rather than one cmd/api supplied, so there is
+// no service to ask.
+func disputeQueryFrom(r *http.Request) (DisputeQuery, error) {
+	values := r.URL.Query()
+
+	// Defaulted rather than required. See [Handler.DisputeQueue].
+	state := DisputeState(strings.TrimSpace(values.Get("state")))
+	if state == "" {
+		state = DisputeStateOpen
+	}
+	if !state.Valid() {
+		return DisputeQuery{}, apiError(fmt.Errorf("%w: %q", ErrDisputeStateUnrecognised, state))
+	}
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return DisputeQuery{}, err
+	}
+
+	after, err := decodeDisputeCursor(values.Get("cursor"))
+	if err != nil {
+		return DisputeQuery{}, err
+	}
+
+	return DisputeQuery{State: state, Limit: limit, After: after}, nil
+}
+
+// decodeDisputeCursor reads the two fields the queue's ordering is total on.
+func decodeDisputeCursor(raw string) (DisputeCursor, error) {
+	if raw == "" {
+		return DisputeCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return DisputeCursor{}, err
+	}
+
+	at, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return DisputeCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	id, err := uuid.Parse(fields[1])
+	if err != nil {
+		return DisputeCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return DisputeCursor{At: at, ID: id}, nil
+}
+
+// OpenDispute handles GET /v1/admin/disputes/{id} (SHIP-164).
+//
+// Docs/04 §7's investigation stage, or the half of it this ticket builds. §7 asks a reviewer to
+// "review the job listing, awarded bid, messages, status history, proof of delivery, and relevant
+// verification details", and every one of those was already reachable: `GET /v1/admin/jobs/{id}`
+// answers with the listing, every bid and every recorded transition in one snapshot (SHIP-152) and
+// `GET /v1/admin/verifications` is the verification half (SHIP-153). **The complaint itself was
+// reachable from nowhere**, and this is it.
+//
+// It needs [PermissionDisputesRead], which permissions.go describes as "reading a dispute and its
+// evidence" — this endpoint is what that sentence was written about.
+//
+// It answers for a resolved dispute as readily as an open one. An outcome that could not be read
+// back afterwards would not be a *documented* outcome, and the audit entry naming the dispute in its
+// metadata would point at something nothing could open.
+func (h *Handler) OpenDispute() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionDisputesRead); err != nil {
+			return err
+		}
+
+		disputeID, err := disputeIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		dispute, err := h.disputes.Dispute(r.Context(), disputeID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, adminDisputeFrom(dispute))
+		return nil
+	})
+}
+
+// resolveDisputeRequest is the body of POST /v1/admin/disputes/{id}/resolution.
+//
+//	{"outcome": "failed_delivery_recorded",
+//	 "job_outcome": "cancelled",
+//	 "reason": "Two crates damaged in transit; provider accepts the delivery failed."}
+//
+// **Two vocabularies and both are required**, which is `000804`s argument arriving at the wire:
+// `outcome` is Docs/04 §7's finding and `job_outcome` is Docs/02 §2's destination for the job, and
+// three of §7's five outcomes are true of a delivery that completed and equally of one that failed.
+// Deriving one from the other would mean inventing an answer for the majority of the list.
+//
+// **`job_outcome` is deliberately not called `status`.** CLAUDE.md's invariant is that job status is
+// never a settable field, and a body key spelled like one invites exactly the reading the invariant
+// forbids — a client naming a status rather than choosing between two documented resolutions.
+//
+// No dispute identifier and no administrator: the first is in the path and the second is whoever the
+// credential says is calling. httpx.DecodeJSON refuses unknown fields, so a console sending either is
+// told the field does not exist rather than having it quietly ignored.
+type resolveDisputeRequest struct {
+	Outcome    string `json:"outcome"`
+	JobOutcome string `json:"job_outcome"`
+	Reason     string `json:"reason"`
+}
+
+// resolutionResponse is what the resolution did.
+//
+// It names the job as well as the dispute, because unfreezing the job is what the *Done when* is
+// about and a console that had to fetch the job to find out whether it moved would be a console that
+// sometimes did not.
+type resolutionResponse struct {
+	DisputeID string `json:"dispute_id"`
+	JobID     string `json:"job_id"`
+
+	Outcome    string `json:"outcome"`
+	JobOutcome string `json:"job_outcome"`
+
+	// Reason is read back so a console can render what was recorded without a second request,
+	// and so that what the platform *stored* is what the administrator sees rather than what
+	// they typed. The two differ by trimming.
+	Reason string `json:"reason"`
+
+	ResolvedAt string `json:"resolved_at"`
+	ResolvedBy string `json:"resolved_by"`
+}
+
+// ResolveDispute handles POST /v1/admin/disputes/{id}/resolution (SHIP-164).
+//
+// Docs/04 §7's outcome stage and Docs/04 §6 step 6 — "record the decision, actor, timestamp, reason,
+// and evidence reference" — and the act the ticket's *Done when* is about: a documented outcome that
+// unfreezes the job. It needs [PermissionDisputesResolve], which `moderator` and `owner` hold and
+// `support` does not.
+//
+// # The path names the dispute, not the job
+//
+// Unlike every other administrative action on a job. One job may accumulate several disputes over
+// its life while never having two open at once (`uq_disputes_open_per_job`), so "the dispute on this
+// job" is unambiguous only while one is open — and a resolution addressed that way could not be
+// replayed against the row it actually settled once a second dispute had been raised.
+//
+// # POST on a named sub-resource rather than PATCH on the dispute
+//
+// The only thing an administrator may set is the outcome, and setting it is a transition rather than
+// an edit: it writes three columns `ck_disputes_resolution` binds together and moves a job through
+// the one guarded function. A PATCH would invite a body that grows keys on a row whose other columns
+// are the complainant's account of what happened.
+//
+// # The Idempotency-Key matters more here than usual
+//
+// Every state-changing endpoint takes one (SHIP-15) and this one is refused without it. What makes a
+// *replay* safe rather than merely idempotent is the refusal underneath: a second resolution of a
+// settled dispute is [ErrDisputeAlreadyResolved] rather than a second outcome, held by a row lock
+// and by the `UPDATE`'s own predicate. `audit_log` is append-only and `job_status_history` is the
+// evidence a customer's support conversation reads, so neither duplicate could be tidied up
+// afterwards.
+func (h *Handler) ResolveDispute() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		// The grant is used rather than discarded: the resolution is attributed to whoever
+		// took it, and taking the actor from the grant means a handler cannot record one
+		// without having stated the permission it was acting under.
+		grant, err := h.permitted(r, PermissionDisputesResolve)
+		if err != nil {
+			return err
+		}
+
+		disputeID, err := disputeIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req resolveDisputeRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		// Read from the wire form rather than cast. A client sends `failed_delivery_recorded`
+		// and the stored form is a sentence; casting the string would put whatever arrived
+		// into a column `ck_disputes_outcome` then refuses, which is a constraint name in a
+		// 500 rather than a field error naming the five choices (Docs/10 §4.6).
+		outcome, known := OutcomeFromWire(strings.TrimSpace(req.Outcome))
+		if !known {
+			return apiError(fmt.Errorf("%w: %q", ErrDisputeOutcomeUnrecognised, req.Outcome))
+		}
+
+		resolved, err := h.disputes.Resolve(r.Context(), ResolutionCommand{
+			DisputeID:  disputeID,
+			ActorID:    grant.Administrator.ID,
+			Outcome:    outcome,
+			JobOutcome: JobOutcome(strings.TrimSpace(req.JobOutcome)),
+			Reason:     req.Reason,
+		})
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, resolutionResponse{
+			DisputeID:  resolved.DisputeID.String(),
+			JobID:      resolved.JobID.String(),
+			Outcome:    resolved.Outcome.Wire(),
+			JobOutcome: resolved.JobOutcome.String(),
+			Reason:     strings.TrimSpace(req.Reason),
+			ResolvedAt: timestamp(resolved.ResolvedAt),
+			ResolvedBy: resolved.ResolvedBy.String(),
+		})
+		return nil
+	})
+}
+
+// disputeIDFrom reads and parses the {id} path parameter on the dispute routes.
+//
+// A fifth function beside [jobIDFrom], [userIDFrom], [reviewIDFrom] and [providerIDFrom] rather than
+// a shared one, for the reason userIDFrom records: the message names the thing, and on these two
+// routes the thing in the path is a dispute rather than the job it is about — which is the
+// distinction most worth being clear about here, because every other administrative route under a
+// job takes the job.
+func disputeIDFrom(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"The dispute id in the path is not a valid identifier.").WithCause(err)
 	}
 	return id, nil
 }

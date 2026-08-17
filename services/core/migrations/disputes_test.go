@@ -53,6 +53,25 @@ func raise(
 	return id, err
 }
 
+// settle resolves every open dispute on a job, the way `000804` requires one to be resolved.
+//
+// **All three columns, because `ck_disputes_resolution` binds them** (SHIP-164). These three tests
+// each free `uq_disputes_open_per_job` in order to reach a *second* refusal, and each of them wrote
+// `resolved_at` alone until that constraint existed — which is the wave-13 collision in miniature: a
+// constraint added by one ticket refusing fixtures written by another, in a file the constraint's
+// own branch had no reason to open. One helper rather than three copies, so the next column the
+// resolution grows is one edit.
+func settle(t *testing.T, pool *pgxpool.Pool, jobID uuid.UUID, by uuid.UUID) {
+	t.Helper()
+
+	if _, err := pool.Exec(t.Context(), `
+		UPDATE disputes
+		SET resolved_at = now(), outcome = 'Delivery completed as agreed', resolved_by = $2
+		WHERE job_id = $1 AND resolved_at IS NULL`, jobID, by); err != nil {
+		t.Fatalf("resolving the disputes on %s: %v", jobID, err)
+	}
+}
+
 // disputeFixture is a job, its customer, and the instant everything below is dated from.
 func disputeFixture(t *testing.T, suffix string) (*pgxpool.Pool, uuid.UUID, uuid.UUID, time.Time) {
 	t.Helper()
@@ -166,8 +185,7 @@ func TestDisputePartyConstraintMatchesTheGoConstants(t *testing.T) {
 func TestOneOpenDisputePerJob(t *testing.T) {
 	pool, job, customer, at := disputeFixture(t, "01")
 
-	first, err := raise(t, pool, job, customer, "customer", "Goods damaged or missing", at, nil, "key-1")
-	if err != nil {
+	if _, err := raise(t, pool, job, customer, "customer", "Goods damaged or missing", at, nil, "key-1"); err != nil {
 		t.Fatalf("raising the first dispute: %v", err)
 	}
 
@@ -176,10 +194,7 @@ func TestOneOpenDisputePerJob(t *testing.T) {
 			"is what stops one job being frozen twice")
 	}
 
-	if _, err := pool.Exec(t.Context(),
-		`UPDATE disputes SET resolved_at = now() WHERE id = $1`, first); err != nil {
-		t.Fatalf("resolving the first dispute: %v", err)
-	}
+	settle(t, pool, job, aModerator(t, pool, "dispute-index-01@example.com"))
 
 	if _, err := raise(t, pool, job, customer, "customer", "Delivery is late", at, nil, "key-2"); err != nil {
 		t.Fatalf("a job could not be disputed again after the first was resolved: %v", err)
@@ -201,9 +216,7 @@ func TestOneDisputePerIdempotencyKey(t *testing.T) {
 
 	// Resolved, so that the refusal below can only be the idempotency index rather than the
 	// one-open-per-job index answering first.
-	if _, err := pool.Exec(t.Context(), `UPDATE disputes SET resolved_at = now() WHERE job_id = $1`, job); err != nil {
-		t.Fatalf("resolving: %v", err)
-	}
+	settle(t, pool, job, aModerator(t, pool, "dispute-index-02@example.com"))
 
 	if _, err := raise(t, pool, job, customer, "customer", "Delivery is late", at, nil, "same-key"); err == nil {
 		t.Fatal("one idempotency key raised two disputes on one job")
@@ -230,9 +243,7 @@ func TestAKeylessDisputeIsOutsideTheIdempotencyIndex(t *testing.T) {
 	if _, err := raise(t, pool, job, customer, "customer", "Other", at, nil, nil); err != nil {
 		t.Fatalf("raising a keyless dispute: %v", err)
 	}
-	if _, err := pool.Exec(t.Context(), `UPDATE disputes SET resolved_at = now() WHERE job_id = $1`, job); err != nil {
-		t.Fatalf("resolving: %v", err)
-	}
+	settle(t, pool, job, aModerator(t, pool, "dispute-index-03@example.com"))
 	if _, err := raise(t, pool, job, customer, "customer", "Other", at, nil, nil); err != nil {
 		t.Fatalf("a second keyless dispute was refused by the idempotency index, which is "+
 			"partial precisely so that it is not: %v", err)

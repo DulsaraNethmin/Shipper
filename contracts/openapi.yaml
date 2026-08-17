@@ -182,6 +182,12 @@ paths:
     $ref: './paths/admin.yaml#/AdminAdministrators'
   /v1/admin/audit:
     $ref: './paths/admin.yaml#/AdminAudit'
+  /v1/admin/disputes:
+    $ref: './paths/admin.yaml#/AdminDisputes'
+  /v1/admin/disputes/{id}:
+    $ref: './paths/admin.yaml#/AdminDispute'
+  /v1/admin/disputes/{id}/resolution:
+    $ref: './paths/admin.yaml#/AdminDisputeResolution'
   /v1/admin/jobs:
     $ref: './paths/admin.yaml#/AdminJobs'
   /v1/admin/jobs/{id}:

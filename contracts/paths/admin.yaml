@@ -4145,3 +4145,730 @@ VerificationDecisionResult:
         The reason as it was **stored** — trimmed and collapsed — so that what the platform recorded
         is what the reviewer sees rather than what they typed.
       example: Licence, registration and insurance all current and matching the account.
+
+# --- Docs/04 §7's investigation and outcome stages (SHIP-164) ------------------------------------
+#
+# The other two thirds of the dispute procedure. `Disputes` at the top of this file is the intake
+# stage on the mobile credential; everything below is an administrator on the console credential,
+# and the two cannot reach each other's endpoints.
+#
+# **The dispute is named by its own identifier, not by the job.** One job may accumulate several
+# disputes over its life while never having two open at once, so "the dispute on this job" is
+# unambiguous only while one is open — and a settled one could not be addressed at all.
+
+AdminDisputes:
+  get:
+    operationId: adminDisputeQueue
+    summary: Open or settled disputes, one page
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/04 §5's **sixth** moderation queue — "open disputes" — and the screen an administrator
+      starts an investigation from (SHIP-164).
+
+      Nothing else in the console lists a dispute. `GET /v1/admin/jobs` searches jobs, which needs a
+      moderator to already know which job to look at; this answers that question.
+
+      ## `state` defaults to `open`, unlike the verification queue
+
+      A deliberate difference. Docs/04 §5's first queue is "new **or changed**" verification
+      submissions, so there is no document-given default there and an omitted filter would answer an
+      empty page that reads exactly like a quiet week. §5's sixth queue is *named* "open disputes",
+      so the default is the document's and a console that forgets the parameter gets the queue.
+
+      A value that is neither `open` nor `resolved` is still refused rather than ignored.
+
+      ## Ordering, which is opposite in the two halves
+
+      **Open disputes come oldest first.** Docs/04 §8 sets an acknowledgement target of two business
+      days and a resolution target of ten, so the oldest entry is the one closest to breaching one.
+
+      **Settled disputes come newest first.** A resolved dispute is looked up to see what was
+      decided, and the decision somebody is asking about is overwhelmingly a recent one — the same
+      split the account and job searches make against the review queues.
+
+      A cursor is issued against the half that produced it and is not portable between them: the two
+      order by different clocks, so a cursor from one paged against the other would compare
+      `created_at` to `resolved_at`. Keep the `state` alongside the cursor.
+
+      ## What an entry carries, and what it never will
+
+      Enough to triage: who complained, which side of the job they were on, what it is about, when
+      it happened and when it was reported. **Not the account, the desired outcome or the evidence**
+      — those are what `GET /v1/admin/disputes/{id}` is for, and a page of fifty carrying four
+      thousand characters each is a queue nobody loads twice.
+
+      **Nothing commercial, and there is nowhere in this shape to put any.** A customer's maximum
+      budget is never exposed in any form (Docs/01 §4.3). A dispute is frequently about price and the
+      administrator resolving it may genuinely need the number; what they open for that is
+      `GET /v1/admin/jobs/{id}`, which carries every bid amount.
+
+      ## Permission
+
+      Needs `disputes.read`, which every administrator role holds **including `support`** — looking
+      is what the least-privileged role exists to be able to do. Recording an outcome is
+      `disputes.resolve` on a different endpoint.
+    parameters:
+      - name: state
+        in: query
+        required: false
+        description: |
+          Which half of the queue to list. Defaults to `open`, which is what Docs/04 §5 names the
+          queue.
+        schema:
+          type: string
+          enum: [open, resolved]
+          default: open
+        example: open
+      - name: limit
+        in: query
+        required: false
+        description: How many disputes to return.
+        schema:
+          type: integer
+        example: 25
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page — a client that sent one has a bug, and
+          answering "nothing here" would let it page for ever through a queue it never saw.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of disputes, ordered as described above.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DisputeQueuePage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `disputes.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          `state` was neither `open` nor `resolved` (`validation_failed`, with one `error.details`
+          entry naming `state` and listing the choices).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminDispute:
+  get:
+    operationId: adminOpenDispute
+    summary: One dispute, with everything the complainant sent
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    parameters:
+      - $ref: '#/DisputeID'
+    description: |
+      Docs/04 §7's **investigation** stage, or the half of it the platform serves (SHIP-164).
+
+      §7 asks a reviewer to "review the job listing, awarded bid, messages, status history, proof of
+      delivery, and relevant verification details", and every one of those is reachable already:
+      `GET /v1/admin/jobs/{id}` answers with the listing, every bid and every recorded transition in
+      one snapshot, and `GET /v1/admin/verifications` is the verification half. **The complaint
+      itself was reachable from nowhere**, and this is it.
+
+      §7's other investigation clause — "give the other party a reasonable opportunity to respond" —
+      **is not built.** There is no place to record a response, no notification telling the other
+      party one is wanted, and no window after which an administrator may proceed without it. It is
+      recorded as unbuilt rather than approximated.
+
+      It answers for a settled dispute as readily as an open one: an outcome that could not be read
+      back afterwards would not be a documented one.
+
+      ## Permission
+
+      Needs `disputes.read` — permissions.go describes it as "reading a dispute and its evidence",
+      and this endpoint is what that sentence was written about. Every role holds it.
+    responses:
+      '200':
+        description: The dispute.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AdminDisputeDetail'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `disputes.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          No dispute with that identifier (`not_found`).
+
+          **Disclosed plainly, unlike the `404` on intake.** A stranger raising a dispute about
+          somebody else's job gets the same answer a missing job gets, because telling them apart
+          would confirm that the job exists. The caller here holds a permission over disputes and
+          there is nothing being kept from them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminDisputeResolution:
+  post:
+    operationId: adminResolveDispute
+    summary: Record a dispute's outcome and unfreeze the job
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    parameters:
+      - $ref: '#/DisputeID'
+      - $ref: '#/IdempotencyKey'
+    description: |
+      Docs/04 §7's **outcome** stage, and Docs/04 §6 step 6 — "record the decision, actor, timestamp,
+      reason, and evidence reference" (SHIP-164). **This is the only thing in the platform that
+      unfreezes a disputed job.**
+
+      ## Two vocabularies, and both are required
+
+      Docs/04 §7 lists five possible outcomes of a dispute and Docs/02 §2 offers a disputed job
+      exactly two ways out. **Three of the five map to neither** — directing the parties to settle
+      externally, warning or restricting somebody, and referring a matter to an insurer are all
+      things that can be true of a delivery that nevertheless completed *or* failed.
+
+      So `outcome` records what was found and `job_outcome` says where the job goes, and neither is
+      derived from the other. A delivery issue acknowledged on a job the customer nonetheless
+      accepts is `delivery_issue_acknowledged` with `completed`; the same finding where the customer
+      does not is the same outcome with `cancelled`.
+
+      `job_outcome` is deliberately **not** called `status`. Job status is never a settable field:
+      the move runs through the one guarded transition, which reads Docs/02 §2 for itself, and the
+      two values here name the two rows that table has rather than a status a client chooses.
+
+      ## What it freezes and unfreezes
+
+      A dispute freezes automatic completion (Docs/02 §3, §6.1). There is no separate pause: the job
+      sits in `disputed`, where the 72-hour auto-complete has nothing to run on. Resolving moves it
+      to `completed` or `cancelled` through the guard, in the same transaction as the outcome — so a
+      resolution never leaves a job frozen with nothing to settle it, and never settles a dispute
+      against a job that did not move.
+
+      The customer and the awarded provider are notified as a consequence of that move rather than by
+      a second announcement of it.
+
+      ## What it writes
+
+      One transaction, four rows, and none is redundant:
+
+        * `disputes` — the outcome, the instant and the administrator, which is what makes it
+          *documented*;
+        * `job_status_history` — the transition, its actor and the reason, which is what a
+          customer's support conversation reads;
+        * `audit_log` — the administrator's accountability record (Docs/04 §9), append-only, with
+          both vocabularies in its metadata;
+        * the outbox — `job.status_changed`, which is what notifies the parties.
+
+      ## Refusals worth branching on
+
+      A dispute somebody else has already settled answers `admin_dispute_already_resolved`; the
+      right response is to reload, and the audit trail will say who got there first. A job that has
+      moved out from under its dispute answers `admin_job_not_resolvable` — same advice, opposite
+      cause.
+
+      ## Permission
+
+      Needs `disputes.resolve`, which `moderator` and `owner` hold and `support` does not. Reading a
+      dispute is `disputes.read` and every role has it — Docs/04 §9's least privilege as two
+      permissions on two endpoints.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/ResolveDisputeRequest'
+    responses:
+      '200':
+        description: The dispute is settled and the job has moved.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ResolutionResult'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `disputes.resolve`
+          (`admin_permission_denied`). `support` reads disputes and does not settle them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          No dispute with that identifier (`not_found`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          The dispute has already been resolved (`admin_dispute_already_resolved`), or the job is no
+          longer waiting on it (`admin_job_not_resolvable`). Reload; the world has moved.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          `outcome`, `job_outcome` or `reason` was absent or not one of the accepted values
+          (`validation_failed`, with one `error.details` entry per field).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+# --- SHIP-164 parameters and schemas -------------------------------------------------------------
+
+DisputeID:
+  name: id
+  in: path
+  required: true
+  description: |
+    The **dispute's** identifier, which is `id` on a queue entry — not the job's. A job may carry
+    several disputes over its life, so addressing one by its job would be unambiguous only while one
+    was open.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e3
+
+DisputeQueuePage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/DisputeQueueEntry'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page, **with the same `state`**. Absent when this is the last
+        one.
+      example: MjAyNi0wOC0xM1QwMjoxNTozMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like and a client should not have to know the difference.
+      example: false
+
+DisputeQueueEntry:
+  type: object
+  additionalProperties: false
+  required:
+    [id, job_id, complainant_id, complainant_party, category, occurred_at, raised_at, resolved_at,
+     outcome, resolved_by]
+  description: |
+    One dispute as the queue shows it. Every field is always present; the three resolution fields are
+    empty strings on an open dispute, so a console renders one shape rather than branching on which
+    keys exist.
+
+    **No account, no desired outcome and no evidence** — `GET /v1/admin/disputes/{id}` carries those.
+    **Nothing commercial, and nowhere in this shape to put any** (Docs/01 §4.3).
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: The dispute, and what the resolution endpoint's path names.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e3
+    job_id:
+      type: string
+      format: uuid
+      description: |
+        The job the complaint is about. Open it with `GET /v1/admin/jobs/{id}` for the listing, the
+        bids and the status history.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    complainant_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2
+    complainant_party:
+      type: string
+      enum: [customer, provider]
+      description: |
+        Which side of *this job* they were on, resolved by the platform at intake from the job and
+        its accepted bid. Not their account role — being the customer who owns this job is a
+        stronger statement than carrying a customer account.
+      example: customer
+    category:
+      type: string
+      enum:
+        - provider_fails_to_arrive
+        - goods_differ_from_listing
+        - customer_unavailable
+        - delivery_is_late
+        - goods_damaged_or_missing
+        - other
+      example: goods_damaged_or_missing
+    occurred_at:
+      type: string
+      format: date-time
+      description: |
+        When the complainant says the problem happened, in UTC, uncorrected.
+      example: '2026-08-11T15:40:00.000Z'
+    raised_at:
+      type: string
+      format: date-time
+      description: |
+        When the platform received the report, in UTC. What the **open** queue is ordered by, and a
+        different instant from `occurred_at` — the gap between them is what triage reads.
+      example: '2026-08-13T02:15:30.000Z'
+    resolved_at:
+      type: string
+      description: |
+        When it was settled, in UTC, or an empty string while it is open. What the **resolved** queue
+        is ordered by.
+      example: ''
+    outcome:
+      type: string
+      enum:
+        - ''
+        - delivery_completed_as_agreed
+        - delivery_issue_acknowledged
+        - failed_delivery_recorded
+        - warning_restriction_or_suspension
+        - referred_to_legal_insurer_or_authorities
+      description: |
+        Docs/04 §7's finding, or an empty string while the dispute is open. **Orthogonal to where the
+        job went**, which is on the job.
+      example: ''
+    resolved_by:
+      type: string
+      description: |
+        The administrator who settled it, or an empty string while it is open. An `admin_users`
+        identifier — a separate account system from the one `complainant_id` names.
+      example: ''
+
+AdminDisputeDetail:
+  type: object
+  additionalProperties: false
+  required:
+    [id, job_id, complainant_id, complainant_party, category, description, desired_outcome,
+     evidence, occurred_at, raised_at, resolved_at, outcome, resolved_by]
+  description: |
+    One dispute with everything the complainant sent — Docs/04 §7's investigation read.
+
+    **A shape of its own rather than the complainant's.** That one omits the complainant (they are
+    the caller) and the resolution (it had none); this one names both, and the two would have to
+    diverge the moment either changed.
+
+    **The idempotency key is not here and will not be.** It is the client's own value coming back at
+    it, and a response carrying it invites a reader to treat it as an identifier the platform issued.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e3
+    job_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    complainant_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2
+    complainant_party:
+      type: string
+      enum: [customer, provider]
+      example: customer
+    category:
+      type: string
+      enum:
+        - provider_fails_to_arrive
+        - goods_differ_from_listing
+        - customer_unavailable
+        - delivery_is_late
+        - goods_damaged_or_missing
+        - other
+      example: goods_damaged_or_missing
+    description:
+      type: string
+      description: What happened, in the complainant's own words, as it was stored.
+      example: Two of the four crates arrived with the sides staved in.
+    desired_outcome:
+      type: string
+      description: |
+        What they want done about it. Shipper records outcomes and supports resolution; for the MVP
+        it does not promise compensation or adjudicate liability (Docs/04 §7), so this is what the
+        administrator works towards rather than what they are obliged to deliver.
+      example: A record of the damage, and the provider contacted about it.
+    evidence:
+      type: array
+      items:
+        type: string
+      description: |
+        References in the complainant's own words, in the order they were sent. Always present; an
+        empty array rather than `null` when nothing was described.
+
+        **These are not uploads and the platform does not resolve them.** Attaching a file is not
+        built (SHIP-114); when it is, attachments arrive alongside this list rather than replacing
+        it.
+      example:
+        - Photographed the crates at the depot
+    occurred_at:
+      type: string
+      format: date-time
+      example: '2026-08-11T15:40:00.000Z'
+    raised_at:
+      type: string
+      format: date-time
+      example: '2026-08-13T02:15:30.000Z'
+    resolved_at:
+      type: string
+      description: When it was settled, in UTC, or an empty string while it is open.
+      example: ''
+    outcome:
+      type: string
+      enum:
+        - ''
+        - delivery_completed_as_agreed
+        - delivery_issue_acknowledged
+        - failed_delivery_recorded
+        - warning_restriction_or_suspension
+        - referred_to_legal_insurer_or_authorities
+      description: Docs/04 §7's finding, or an empty string while the dispute is open.
+      example: ''
+    resolved_by:
+      type: string
+      description: The administrator who settled it, or an empty string while it is open.
+      example: ''
+
+ResolveDisputeRequest:
+  type: object
+  additionalProperties: false
+  required: [outcome, job_outcome, reason]
+  description: |
+    **No dispute identifier** — it is in the path. **No administrator**: the actor is whoever the
+    credential says is calling, and a body that named its own actor would be an audit trail the
+    client writes. Unknown fields are refused, so a console typo fails loudly.
+  properties:
+    outcome:
+      type: string
+      enum:
+        - delivery_completed_as_agreed
+        - delivery_issue_acknowledged
+        - failed_delivery_recorded
+        - warning_restriction_or_suspension
+        - referred_to_legal_insurer_or_authorities
+      description: |
+        Docs/04 §7's finding. The five are the document's own list, shortened where its punctuation
+        has no legal form as an identifier:
+
+          * `delivery_completed_as_agreed` — "Delivery completed as agreed."
+          * `delivery_issue_acknowledged` — "Delivery issue acknowledged; parties directed to
+            resolve externally."
+          * `failed_delivery_recorded` — "Job cancelled / failed delivery recorded." The "job
+            cancelled" half is `job_outcome`, not this.
+          * `warning_restriction_or_suspension` — "User warning, restriction, or suspension." Which
+            measure it was is recorded where the measure was taken.
+          * `referred_to_legal_insurer_or_authorities` — "Referral to legal, insurer, or authorities
+            where required."
+
+        There is no "no action". A dispute that turns out to be unfounded is
+        `delivery_completed_as_agreed` — a finding rather than the absence of one.
+      example: failed_delivery_recorded
+    job_outcome:
+      type: string
+      enum: [completed, cancelled]
+      description: |
+        Where the job goes — Docs/02 §2's two rows out of `disputed`, and **not** a status a client
+        chooses. Required in every case and never derived from `outcome`: three of the five outcomes
+        are equally true of a delivery that completed and one that failed.
+      example: cancelled
+    reason:
+      type: string
+      minLength: 10
+      maxLength: 500
+      description: |
+        Why, and it is required. It is written into the job's status history, where a customer's
+        support conversation reads it, and into the append-only audit trail. The floor is what stops
+        a required field being satisfied without recording anything.
+      example: Two crates damaged beyond use; the provider accepts the delivery failed.
+
+ResolutionResult:
+  type: object
+  additionalProperties: false
+  required: [dispute_id, job_id, outcome, job_outcome, reason, resolved_at, resolved_by]
+  description: |
+    What the resolution did. It names the **job** as well as the dispute, because unfreezing the job
+    is the point of the endpoint and a console that had to fetch the job to find out whether it moved
+    would be a console that sometimes did not.
+  properties:
+    dispute_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e3
+    job_id:
+      type: string
+      format: uuid
+      description: The job, which has now left `disputed`.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    outcome:
+      type: string
+      enum:
+        - delivery_completed_as_agreed
+        - delivery_issue_acknowledged
+        - failed_delivery_recorded
+        - warning_restriction_or_suspension
+        - referred_to_legal_insurer_or_authorities
+      example: failed_delivery_recorded
+    job_outcome:
+      type: string
+      enum: [completed, cancelled]
+      description: The job's new status, in the wire spelling the jobs endpoints use.
+      example: cancelled
+    reason:
+      type: string
+      description: |
+        The reason as it was **stored** — trimmed — so that what the platform recorded is what the
+        administrator sees rather than what they typed.
+      example: Two crates damaged beyond use; the provider accepts the delivery failed.
+    resolved_at:
+      type: string
+      format: date-time
+      description: |
+        When it was settled, in UTC. The same instant the audit entry carries — one action, one
+        clock.
+      example: '2026-08-17T04:20:00.000Z'
+    resolved_by:
+      type: string
+      format: uuid
+      description: The administrator who settled it, taken from the session.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e9

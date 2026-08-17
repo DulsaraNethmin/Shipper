@@ -118,6 +118,28 @@ const (
 	// makes ending it after that a support case. An administrator who needs one stopped raises a
 	// dispute and resolves it, which is the path that records both sides.
 	JobNotRemovable
+
+	// JobAlreadyResolved means the job had already left 'Disputed' for the status the
+	// resolution would have put it in (SHIP-164).
+	//
+	// Reachable rather than defensive, and `service.go` names one path to it: its
+	// [JobAlreadyDisputed] branch admits a dispute onto a job that was *already* frozen, which
+	// is the state a resolution would leave behind if its transition ever failed after its
+	// outcome committed. The ordinary path is a stale console — a moderator resolving from a
+	// queue loaded before somebody else finished the job.
+	//
+	// Distinct from [JobNotResolvable] for [JobAlreadyDisputed]'s reason: a job already where it
+	// was going has refused nothing.
+	JobAlreadyResolved
+
+	// JobNotResolvable means Docs/02 §2 has no row from the job's status to the destination the
+	// resolution named (SHIP-164).
+	//
+	// The ordinary case is a job that is not disputed at all. Docs/02 §2 permits 'Completed'
+	// from 'Delivered' and 'Disputed', and 'Cancelled' from Draft, Open, Negotiating and
+	// 'Disputed' — so this is what a resolution gets when the job has moved out from under its
+	// dispute, and the console's answer is to reload rather than to try the other destination.
+	JobNotResolvable
 )
 
 func (m JobMove) String() string {
@@ -134,6 +156,10 @@ func (m JobMove) String() string {
 		return "already unpublished"
 	case JobNotRemovable:
 		return "not unpublishable"
+	case JobAlreadyResolved:
+		return "already resolved"
+	case JobNotResolvable:
+		return "not resolvable"
 	default:
 		return "unrecognised"
 	}
@@ -147,8 +173,11 @@ func (m JobMove) String() string {
 // guard chooses it. The method names the one move SHIP-163 makes, and a ticket that needs another
 // declares another.
 //
-// SHIP-164 needs the moves *out* of 'Disputed' — Docs/02 §2 offers Completed and Cancelled — and
-// they are that ticket's to add here, one method each, for the same reason.
+// SHIP-164 needed the moves *out* of 'Disputed' — Docs/02 §2 offers Completed and Cancelled — and
+// added them here, one method each, for the same reason. **The port now has four methods and no
+// parameter anywhere on it names a job status**, which is the property this shape exists to keep: a
+// fifth move is a fifth method somebody has to declare, review and wire, rather than a fifth string
+// a caller may pass.
 type Jobs interface {
 	// MoveToDisputed runs the guarded transition on behalf of the complainant, inside the
 	// caller's transaction. actorID is the account recorded against it and party is which kind
@@ -187,6 +216,40 @@ type Jobs interface {
 	// A non-nil error is a failure of the mechanism. A refusal comes back as a [JobMove] with a
 	// nil error, because "Docs/02 does not permit this" is an answer rather than a fault.
 	Unpublish(ctx context.Context, r db.Runner, jobID, actorID uuid.UUID, reason string) (JobMove, error)
+
+	// ResolveAsCompleted runs Docs/02 §2's `Disputed → Completed` — "admin resolves dispute with
+	// delivery accepted" — inside the caller's transaction (SHIP-164).
+	//
+	// # Two methods rather than one taking a destination, and this is where that rule earns its keep
+	//
+	// The temptation is sharpest here: SHIP-164's caller genuinely has two destinations and a
+	// `Resolve(jobID, status, reason)` would collapse them into one line. It would also be the
+	// first time this domain named a job status, which is the whole thing the four-method shape
+	// exists to prevent — and the collapse buys nothing, because the caller still has to choose.
+	// What it would cost is that a third destination becomes a string somebody passes rather
+	// than a method somebody declares.
+	//
+	// # This is not the same act as [Unpublish], although both end in 'Cancelled'
+	//
+	// [Unpublish] removes a job nobody has committed to, from Draft, Open or Negotiating.
+	// [ResolveAsCancelled] ends a delivery somebody *has* committed to, from 'Disputed', after
+	// an administrator has read a complaint and made a finding. Two acts, two audit actions, two
+	// reasons written into `job_status_history` — and one method serving both would make the
+	// trail unable to tell a policy removal from a resolved dispute.
+	//
+	// The reason is required, by `ck_job_status_history_admin_reason` and by the guard, and the
+	// service checks it before opening a transaction so the failure names the field.
+	//
+	// A non-nil error is a failure of the mechanism. A refusal comes back as a [JobMove] with a
+	// nil error — [JobAlreadyResolved] or [JobNotResolvable].
+	ResolveAsCompleted(ctx context.Context, r db.Runner, jobID, actorID uuid.UUID, reason string) (JobMove, error)
+
+	// ResolveAsCancelled runs Docs/02 §2's `Disputed → Cancelled` — "admin resolves as
+	// cancelled/failed delivery" — inside the caller's transaction (SHIP-164).
+	//
+	// See [ResolveAsCompleted] for why these are two methods, and for why this is a different
+	// act from [Unpublish] despite ending in the same status.
+	ResolveAsCancelled(ctx context.Context, r db.Runner, jobID, actorID uuid.UUID, reason string) (JobMove, error)
 }
 
 // --- SHIP-117, SHIP-157: the delivery-exception moderation queue ---------------------------------

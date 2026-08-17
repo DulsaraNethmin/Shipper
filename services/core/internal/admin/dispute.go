@@ -357,6 +357,17 @@ type Dispute struct {
 	// what unfreezes the job.
 	ResolvedAt time.Time
 
+	// Outcome is Docs/04 §7's finding, and ResolvedBy is the administrator who recorded it
+	// (SHIP-164, `000804`). Both are zero while the dispute is open, and
+	// `ck_disputes_resolution` is what makes the three move together — there is no half-resolved
+	// dispute and no way to reach one.
+	//
+	// **Neither is on the intake response.** Every other field here is read straight back to the
+	// complainant, and these two are the administrator's; `disputeResponse` maps field by field,
+	// so a shape reaches a complainant only because somebody put it there.
+	Outcome    Outcome
+	ResolvedBy uuid.UUID
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

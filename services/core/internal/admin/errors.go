@@ -550,3 +550,87 @@ var (
 		"This provider already has that verification outcome. Reload the queue — another "+
 			"administrator may have decided it already, and the audit trail will say who.")
 )
+
+// --- Docs/04 §7's investigation and outcome stages (SHIP-164) -------------------------------------
+//
+// The refusals a dispute workflow makes, and they divide the same way SHIP-163's do: what is wrong
+// with the *request* is a validation failure naming a field, and what is wrong with the *state* is a
+// conflict with a code. A console reaching the second has not made a mistake — it has read a queue
+// that has since moved.
+var (
+	// ErrDisputeNotFound means there is no dispute with that identifier.
+	//
+	// **Disclosed plainly, unlike intake's [ErrNotAParty]**, and the difference is who is asking.
+	// Intake refuses a stranger with the same answer a missing job gets, because telling them
+	// apart would confirm that somebody else's job exists. The caller here holds
+	// `disputes.read` on the administrator credential and there is nothing being kept from them;
+	// a 404 that could not be told from a 403 would only make a mistyped identifier look like a
+	// permissions problem.
+	ErrDisputeNotFound = errors.New("admin: no such dispute")
+
+	// ErrDisputeAlreadyResolved means somebody has already recorded an outcome against it.
+	//
+	// The ordinary outcome of two moderators reading one queue, and refused rather than absorbed
+	// on [ErrVerificationUnchanged]'s reasoning: a resolution is *an act by a person* that
+	// Docs/04 §6 step 6 requires be recorded with a reason, and a second one would overwrite the
+	// first administrator's finding with nothing to say which stands.
+	//
+	// It is raised from two places one statement apart — the row lock's read, which produces a
+	// message naming the outcome already recorded, and the `UPDATE`'s own
+	// `WHERE resolved_at IS NULL`, which is what is true of the table however it is written to.
+	ErrDisputeAlreadyResolved = errors.New("admin: that dispute has already been resolved")
+
+	// ErrDisputeOutcomeUnrecognised means the finding asked for is not one of Docs/04 §7's five.
+	ErrDisputeOutcomeUnrecognised = errors.New("admin: that is not a dispute outcome")
+
+	// ErrJobOutcomeUnrecognised means the destination asked for is not one of Docs/02 §2's two.
+	//
+	// A separate sentinel from the one above rather than one covering both, because they are two
+	// vocabularies — `000804`s whole argument — and a client that sent a good outcome with a bad
+	// destination must be told which of the two fields is wrong.
+	ErrJobOutcomeUnrecognised = errors.New("admin: that is not a destination for a resolved dispute")
+
+	// ErrDisputeStateUnrecognised means the queue was asked for a half that does not exist.
+	//
+	// Refused rather than ignored, on [ErrVerificationStateUnrecognised]'s reasoning: an ignored
+	// filter answers a page that looks like an answer to the question somebody meant to ask.
+	ErrDisputeStateUnrecognised = errors.New("admin: that is not a dispute queue")
+
+	// ErrJobNotResolvable means Docs/02 §2 has no row from the job's status to the destination
+	// the resolution named.
+	//
+	// [JobNotResolvable] and [JobAlreadyResolved] both land here — the second with the status it
+	// already holds appended — because a console's response to either is the same: reload, the
+	// job has moved out from under this dispute. Telling them apart matters to the trail rather
+	// than to the caller, and the trail records neither, because a refused resolution writes
+	// nothing at all.
+	ErrJobNotResolvable = errors.New("admin: this job cannot be resolved to that status")
+)
+
+// The error codes the dispute workflow answers with (SHIP-164).
+//
+// **Two**, on the restraint the verification block above records. A dispute that does not exist is
+// `not_found`, an outcome Docs/04 §7 does not have is `validation_failed` naming the field, a reason
+// too short to record anything is the same, and a role without `disputes.resolve` is
+// `admin_permission_denied`. These two are the states a console has to *do* something different
+// about, and in both cases the something is "reload; the world has moved".
+var (
+	// CodeDisputeAlreadyResolved is returned when another administrator got there first.
+	//
+	// 409 rather than 422: the caller holds the permission and the request is well formed, and
+	// what is refused is the state. [CodeSameAdministrator] records the same reading of the same
+	// distinction.
+	CodeDisputeAlreadyResolved = httpx.RegisterCode("admin_dispute_already_resolved",
+		"This dispute has already been resolved. Reload it — another administrator may have "+
+			"recorded an outcome already, and the audit trail will say who.")
+
+	// CodeJobNotResolvable is returned when the job is no longer where Docs/02 §2 needs it to be.
+	//
+	// Distinct from [CodeDisputeAlreadyResolved] because the two are opposite halves of the same
+	// drift and want opposite next steps: there, the dispute has moved and the job has not; here,
+	// the job has moved and the dispute has not — which is the state SHIP-163's `service.go`
+	// warned about, and the one an administrator most needs told plainly rather than as a 500.
+	CodeJobNotResolvable = httpx.RegisterCode("admin_job_not_resolvable",
+		"This job is no longer waiting on a dispute. Reload it — its status has moved since "+
+			"this dispute was opened.")
+)

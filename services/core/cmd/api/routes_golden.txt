@@ -2,6 +2,9 @@ GET    /health                                  public       operational
 POST   /v1/account/deletion                     user         v1
 POST   /v1/admin/administrators                 admin        v1
 GET    /v1/admin/audit                          admin        v1
+GET    /v1/admin/disputes                       admin        v1
+GET    /v1/admin/disputes/{id}                  admin        v1
+POST   /v1/admin/disputes/{id}/resolution       admin        v1
 GET    /v1/admin/jobs                           admin        v1
 GET    /v1/admin/jobs/{id}                      admin        v1
 POST   /v1/admin/jobs/{id}/unpublish            admin        v1
