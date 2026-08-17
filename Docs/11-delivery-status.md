@@ -14867,6 +14867,14 @@ rather than guessing them.
 whole of its story: there is no expiry column anywhere on the verification tables and no document
 table to hang one on. §6 has that half.
 
+**One more piece of work is blocked on a decision rather than on a ticket, and it is deliberately not
+a row in the table above.** The in-app capture half of `Docs/04` §3.1 — photograph, no photo-library
+write, on-device compression, clear-after-upload, file-upload fallback — is blocked on an **owner
+decision about `Docs/07` §2's feature list**, which a closed-set test enforces, and on a proposed
+`Docs/09` row that does not yet exist. **§5's table is keyed on Track-X rows and lists real tickets;
+adding a row for a ticket nobody has written would be this file describing its own proposal as
+fact.** §9 has the entry, the two measured blockers and the proposed backlog rows in full.
+
 ## 6. Ready to start now
 
 Strict build order says the next ticket is the lowest-numbered open one, which is **SHIP-24** — and it is blocked on X-2, as are the other three M0 stragglers. **Sixteen tickets have every dependency met: 11 code tickets worth 37 points, plus five Track-X tickets worth 12.** The lowest startable ticket of any kind is **X-1**; the lowest startable *code* ticket is **SHIP-81b**, which has been the lowest for two waves and has been declined in both. Build order is a preference rather than a constraint at this point.
@@ -17900,7 +17908,9 @@ in a dispatch naming which gate is load-bearing for which ticket.
 
 ---
 
-**The eight below were found at the wave-13 reconciliation, and none of them is owned by a ticket.**
+**The ten below were found at the wave-13 reconciliation, and none of them is owned by a ticket.**
+The last two were added after this pass's first four commits, at the orchestrator's request, and are
+marked where they begin.
 **This pass also corrected four figures rather than adding them**, and the pattern across the four is
 what it is really reporting: the `MaxConns` sentence and the banner's line numbers, both corrected in
 place above; SHIP-182's self-counting grep, corrected in §6 for the second consecutive pass; and
@@ -18024,6 +18034,134 @@ SHIP-120a, SHIP-91 was closed by an owner ruling, X-6 is a decision recorded in 
 tool prints *"check it is not wishful"* every time. **A list that is right for three consecutive waves
 stops being read**, which is the failure mode the tool exists to prevent, in the tool's own output.
 Nothing to fix; the habit is to re-read it at each reconciliation, which this pass did.
+
+---
+
+**Two more were added after this pass's first four commits, at the orchestrator's request. The first
+is the most consequential instrument finding of the wave and the second is an owner edit this branch
+was refused permission to make.**
+
+### `make verify` can exit 0 having run no checks at all
+
+**Found by wave 14's Lane A, reproduced by the orchestrator in three runs, and reproduced again here
+in three runs of my own before it was written down.** `scripts/verify-foundation.sh:158-161` defines
+`cleanup()`, whose last statement is a successful `rm -rf "$WORKDIR"`, and `:162` installs it as
+`trap cleanup EXIT`. On **bash 3.2.57**, which is what `/usr/bin/env bash` resolves to on this
+machine and on every macOS, **a `set -u` abort leaves no pending status for the trap to preserve, so
+the trap's own success becomes the script's exit status.** `make verify` then reports **exit 0 having
+printed no count line and run no checks.**
+
+**Reproduced with three scripts differing in one thing each, three runs apiece, nine runs in total:**
+
+| Script | Abort | Trap | Exit |
+|---|---|---|---|
+| a | `set -u` on an unset variable | installed | **0, three times out of three** |
+| b | `set -u` on an unset variable | none | 1, three times out of three |
+| c | `set -e` on a failing command | installed | 1, three times out of three |
+
+**So it is specifically `set -u` that is masked**, and the trap is what masks it. `set -e` is not
+affected, which is why this has never been seen: almost every way the harness can fail is a command
+returning non-zero, and that path is honest.
+
+**This is a false pass, and the repository already documents the harness's false *failure*.**
+`CLAUDE.md`'s worktree table describes concurrent runs producing a subset or equality failure on a
+tree where nothing is wrong, and its own sentence about the pair is the reason this entry is ranked
+first: **"A false failure costs an hour; a false pass ships."** The false failure has cost this
+project an hour more than once. **The false pass has never been caught, and nothing would have caught
+it** — every gate downstream of `make verify` reads its exit status.
+
+**The rule that follows, and it should be read as a rule rather than as a note about one bug:**
+**`make verify`'s exit status is not a verdict in either direction.** Read the *"N checks passed
+across M sections"* line. **Its absence is the signal** — a run that prints no count line ran no
+checks, whatever it exited with. `Docs/11` §3's count line and every wave plan's verify figure are
+already quoted from that line rather than from the status, so the habit is half-established; what was
+missing is anybody saying that the status is the unreliable half.
+
+**Not fixed here, deliberately.** `scripts/verify-foundation.sh` is on `CLAUDE.md`'s shared-file list
+and this is the owner's call. The obvious repairs — capturing `$?` at the head of `cleanup` and
+re-exiting with it, or making the last statement of `cleanup` not swallow the status — are one line
+each and both change the exit behaviour of the gate every branch is measured by, which is not
+something a reconciliation pass may alter under four concurrent lanes.
+
+### `Docs/09`'s SHIP-81b bundles a platform half and a client half, and closing it would close M3 falsely
+
+**This entry is a proposal, not a change. The rows below are not in `Docs/09`** — this branch was
+refused permission to edit that file and did not edit it, so `make status`, the milestone tables in
+§1 and §6's arithmetic all still read the unsplit backlog. **Do not cite SHIP-81c as though it
+exists.**
+
+**The hazard, stated first because it is the part with a deadline.** SHIP-81b's *Done when* opens *"A
+provider photographs each of `Docs/04` §3's four documents … **in the app**"* and then describes the
+upload, the record and the private storage. Wave 14's Lane B built the second half and **declined the
+first with measured structural reasons**, then claimed `SHIP-81b` in `Docs/11-done.txt`. **On the
+merged tree that reads M3 as closed at 37 of 37** on a ticket whose first clause is not built — the
+same shape as SHIP-151 shipping three search terms of four, which cost this file a §4 row and a wave,
+except that here it also completes a milestone. **A milestone that closes on an unbuilt clause is the
+most expensive version of this file's oldest failure**, because nobody re-reads a closed milestone.
+
+**The proposed split, in full, so the owner can apply it without re-deriving it.** Narrow SHIP-81b to
+exactly what was demonstrated and give the capture experience its own row:
+
+> `| SHIP-81b | The verification document record and its upload | 3 | Each of Docs 04 §3's four
+> documents — licence, registration, insurance and ABN evidence — uploads directly through a
+> short-lived pre-signed URL on SHIP-114's precedent, with the API never in the path of the bytes;
+> each stored document names its kind and the verification record it belongs to, is private, and is
+> reachable only by a fresh signed URL | SHIP-81a, SHIP-114 |`
+>
+> `| SHIP-81c | A provider captures their verification documents in the app | 3 | A provider
+> photographs each of the four kinds in the app and it reaches SHIP-81b's upload; the image is never
+> written to the device photo library, is compressed on the device, and is cleared from app storage
+> once uploaded; and a file-upload fallback exists because the camera permission may be declined
+> (Docs 04 §3.1) | SHIP-81b |`
+
+**SHIP-81b stays at 3 and stays in `Docs/11-done.txt`** — Lane B's row is correct under the narrowed
+scope and needs no edit. **M3 becomes 38 rows and 128 points**, so it reads 37 of 38 rather than
+closing, and the backlog totals become **232 tickets and 717 points**.
+
+**SHIP-81c is three points, and the split therefore adds three rather than redistributing them.**
+That is the honest statement: **the original row was under-sized, not over-scoped.** The comparison
+that sets the number is `Docs/09`'s own M4 rows. **SHIP-130 is 5** — *"Flutter camera capture with
+on-device compression: photo captured, compressed, queued, and never written to the photo library"* —
+and it wrote the camera, the compression policy and the photo-library guarantee from nothing.
+**SHIP-81c writes none of that**; it moves three existing classes and points them at a different
+upload. **SHIP-131 is 3** for the denied-permission fallback, and SHIP-81c's fallback is a file
+picker rather than a second recording path, which is narrower. What SHIP-81c adds that neither had is
+four document kinds rather than one photo, and clearing app storage once uploaded. **Three also
+matches SHIP-100 and SHIP-173**, the other client rows that drive one flow over machinery that
+already exists.
+
+**Two blockers make it unstartable rather than merely unstarted, and both were measured on
+`54ea9af`.**
+
+- **The Flutter feature list is a closed set of exactly seven.**
+  `apps/mobile/test/architecture_test.dart:21-29` declares `expectedFeatures` as `identity`,
+  `profile`, `fleet`, `jobs`, `bidding`, `delivery`, `notifications`, and the test at `:38` asserts
+  `lib/features` holds exactly those. Its failure text is the instruction: *"Docs/07 §2 draws the
+  list, so change the document first — a feature nobody decided on is how the split stops meaning
+  anything."*
+- **The three things `Docs/04` §3.1 needs all live inside another feature.** `ProofCamera`
+  (`features/delivery/proof_camera.dart:49`), `ProofImagePolicy` (`features/delivery/proof_image.
+  dart:62`) and `ProofStore` (`:219`) are exactly the camera, the compression-and-no-photo-library
+  policy and the scoped store that SHIP-81c wants — and `architecture_test.dart`'s second test
+  forbids one feature importing another. **Reusing them means moving them to `core/`**, whose
+  precedent is `ProviderOnly` at `core/auth/provider_only.dart:81`, moved there by SHIP-100 for the
+  same reason.
+
+**The owner decision, which is why this is recorded rather than taken.** `Docs/07` §2 already assigns
+verification display to `features/profile/` — *"profile/ customer and provider profiles"* — and
+`apps/mobile/lib/features/profile/profile.dart` says so in its own doc comment: *"A provider's public
+profile is what a customer judges a bid by, and what verification (`Docs/04`) attaches to. Verification
+state is displayed here and decided nowhere near here."* **It is a 292-byte stub and holds nothing
+else.** So **a new `features/verification/` directory is probably the wrong answer** and
+`features/profile/` is probably the right one — but whether `Docs/07` §2's list gains an entry or
+`profile/` becomes the home is a document decision, **and `Docs/07` is not this branch's to edit.**
+Recorded as an owner decision, unresolved.
+
+**`Docs/09` is not this branch's to edit either, and this pass was refused permission to try.** The
+proposal above is complete enough to apply verbatim. **Until it is applied, §1's totals, §6's
+arithmetic and `make status` all describe the unsplit backlog and are correct about it** — this entry
+is the only place in the file that describes the split, and it says throughout that the split has not
+happened.
 
 ## 10. The done list, in a form a script can read
 
