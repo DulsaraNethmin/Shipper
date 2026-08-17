@@ -69,8 +69,8 @@ below was written** — 188 / 231 tickets, 576 / 714 points, remaining 43 and 13
 milestone rows cell for cell — which is the only way to tell a measured figure from a copied one,
 and this file has been wrong five times by copying.
 
-**Wave 13 delivered five tickets and 19 points, and the figure agrees with the wave's own plan for
-the first time in three waves.** The set is the difference between `Docs/11-done.txt` at `4fd7fd5`
+**Wave 13 delivered five tickets and 19 points, and the figure agrees with the wave's own plan** —
+which the wave before it could not say. The set is the difference between `Docs/11-done.txt` at `4fd7fd5`
 (183 declared, 557 points) and at `54ea9af` (188, 576), with the points read off `Docs/09`'s rows:
 **M3** SHIP-103 (5), **M4** SHIP-131a (3), **M6** SHIP-153 and SHIP-154 (8), **M7** SHIP-169 (3).
 That sums to 19 and 557 + 19 is 576, which `make status` prints. **One of six dispatched tickets was
@@ -15255,10 +15255,15 @@ wave 11 41, wave 12 26, and wave 13 **19 across four lanes** — the smallest ye
 dispatch yet. **Six rows were dispatched where wave 12 dispatched eleven**, so the delivery rate per
 dispatched row went up rather than down.
 
-**`make verify` went from 892 checks across 16 sections to 926 across 16.** No new section: the
-verification work extended `90-admin.sh` and `62-profiles.sh`, and SHIP-169 extended `40-identity.sh`.
-**Measured by the orchestrator on the merged tree through the mutex** — 926 passed, zero failures, and
-the only non-zero exit is §3's count line, which no branch may write and which still reads 862 here.
+**`make verify` went from 892 checks across 16 sections to 926 across 16.** No new section — the first
+wave since wave 11 to add none. Four existing files grew, measured with
+`git diff --stat 4fd7fd5..54ea9af -- scripts/verify/`: `90-admin.sh` and `62-profiles.sh` for the
+verification chain, `40-identity.sh` for SHIP-169, and `70-delivery.sh` for SHIP-131a.
+**Taken on report rather than measured by this pass** — the orchestrator ran it on the merged tree
+through the mutex and reports 926 passed and zero failures. **This branch changes no file under
+`services/`, `scripts/`, `contracts/`, `deploy/`, `mk/` or the `Makefile`**, so it has nothing for the
+harness to say about it and did not run it. The only non-zero exit that run reports is §3's count
+line, which no branch may write and which still reads 862 here.
 
 ### Three resolutions, all in this file, measured on the merges as performed
 
@@ -17815,6 +17820,13 @@ collector to a third surface covers its own screen; **every other provider-facin
 as the collector written for it.** This wants an owner and a decision about scope rather than another
 ticket-sized patch, and it is the one item in this section that touches a `CLAUDE.md` invariant.
 
+**Wave 14 has a lane writing an enumeration into §3** — taken from that wave's dispatch rather than
+measured here, and not readable from this branch. **This entry is the standing statement of why one
+is needed and should be read against that work rather than duplicated into it**: four guards, four
+different defeating mechanisms, and no list anywhere of the channels a string can travel down. **A
+§3 entry describing one enumeration does not close this**; what closes it is a decision that the list
+is the contract and every provider-facing screen is held to it.
+
 **A rendered banner interpolates the platform's own free text, and no closed key set can cover
 prose.** `ApiErrorResponse.userMessage` returns `message` — the error contract's human-readable
 string, written by the platform — and it is interpolated straight into rendered widgets. **The
@@ -17856,9 +17868,9 @@ client's.
 **The instrument lesson is worth more here than the finding.** A line number is the fastest-decaying
 fact this file records — faster than a commit count, a check count or a table count — because any
 lane editing anywhere above it moves it, and **nothing anywhere in the repository checks a line
-citation.** `place_bid_panel.dart:402` became `:403` from a one-line insertion. **Cite the symbol and
-the file; cite a line only with the ref beside it, and expect to re-run the grep rather than to read
-the number.**
+citation.** `place_bid_panel.dart:402` became `:403` while the interpolation itself was untouched.
+**Cite the symbol and the file; cite a line only with the ref beside it, and expect to re-run the grep
+rather than to read the number.**
 
 **The mutation-revert recipe has a second route to a silent `git diff`, and it does not name it.**
 `CLAUDE.md` step 4 explains that after a destructive `git checkout` the file matches the index, so
@@ -17892,10 +17904,13 @@ in a dispatch naming which gate is load-bearing for which ticket.
 **This pass also corrected four figures rather than adding them**, and the pattern across the four is
 what it is really reporting: the `MaxConns` sentence and the banner's line numbers, both corrected in
 place above; SHIP-182's self-counting grep, corrected in §6 for the second consecutive pass; and
-SHIP-164's partition count, the first entry below. **Every one of the four was correct on the ref it
-named.** This file's errors have stopped being copied figures and become **expired** ones, which needs
-a different habit to catch: a copied figure is caught by re-deriving it once, and an expired figure is
-caught only by re-measuring on the ref you are publishing against.
+SHIP-164's partition count, the first entry below. **Three of the four were correct on the ref they
+named and expired afterwards; only SHIP-164's was wrong from the start**, and it was wrong by being
+copied out of a §3 entry where the same words were true of something else. So this file's errors are
+now of two kinds and they need different habits: **a copied figure is caught by re-deriving it once,
+and an expired figure is caught only by re-measuring on the ref you are publishing against.** The
+second is the newer failure and the harder one, because re-deriving does not help — the derivation was
+right.
 
 **A decision each of two tickets defers to the other stays open indefinitely and no gate detects
 it.** Measured on `54ea9af`. §3's SHIP-163 entry says a `dispute.raised` event *"would need a fourth
