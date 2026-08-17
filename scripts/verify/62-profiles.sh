@@ -241,3 +241,354 @@ done
 [[ "$(grep -o "'" <<<"$accepted" | wc -l | tr -d ' ')" == "10" ]] \
   || fail "ck_provider_verifications_state accepts something other than exactly five states: $accepted"
 ok "the database accepts Docs/04 §4's five outcomes and no sixth"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-81b  a provider photographs each of Docs/04 §3's four documents and uploads them directly"
+
+# The *Done when* has four clauses and only one of them can be demonstrated here rather than in a Go
+# test: **"uploads it directly through a short-lived pre-signed URL, with the API never in the path
+# of the bytes"**. So this section signs, uploads to a host that is not the API, reads the object
+# back out of the store itself, and then proves the same object is refused without a signature.
+#
+# The other three — the kind, the verification record it belongs to, and the record's own coherence —
+# are held by `internal/profiles`'s tests against a real database, and by
+# `ck_provider_verification_documents_kind` underneath them.
+#
+# # Everything here fences on ids
+#
+# The object key carries the provider id and a fresh UUIDv7, and the bucket may be shared with four
+# other worktrees (CLAUDE.md's worktree table). So no check counts objects or lists a prefix; each
+# one names the key it created, which is 70-delivery.sh's rule and the same rule CLAUDE.md states for
+# Kafka.
+
+prof_post() {
+  curl -s -X POST -o "$4" -w '%{http_code}' \
+    -H "$auth_header: Bearer $1" -H "Idempotency-Key: $2" \
+    -H 'Content-Type: application/json' -d "$3" \
+    "http://localhost:$VERIFY_PORT/v1/provider/verification/documents$5"
+}
+
+# --- the URL, and what it is signed for --------------------------------------------------------
+
+status="$(prof_post "$prof_provider_token" "verify-prof-doc-$$" \
+  '{"content_type":"image/jpeg","content_length":52}' "$WORKDIR/prof-doc-url.json" "/uploads")"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/prof-doc-url.json"; fail "minting a document upload URL answered $status, want 200"; }
+
+doc_key="$(json "$WORKDIR/prof-doc-url.json" '["object_key"]')"
+doc_url="$(json "$WORKDIR/prof-doc-url.json" '["upload_url"]')"
+doc_method="$(json "$WORKDIR/prof-doc-url.json" '["method"]')"
+doc_type="$(json "$WORKDIR/prof-doc-url.json" '["content_type"]')"
+doc_expires="$(json "$WORKDIR/prof-doc-url.json" '["expires_at"]')"
+
+[[ "$doc_method" == "PUT" && "$doc_type" == "image/jpeg" ]] \
+  || fail "the response describes a $doc_method of $doc_type"
+[[ "$doc_key" == verification/$prof_provider_id/* ]] \
+  || fail "object_key is $doc_key, want it prefixed by verification/$prof_provider_id/"
+ok "the platform chose the key, prefixed with the provider it was issued to"
+
+# 200 rather than 201, because nothing was created. The request that creates something is the
+# submission below, and that one is a 201.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+      "select count(*) from provider_verification_documents where object_key = '$doc_key';")" == "0" ]] \
+  || fail "issuing an upload URL wrote a document row"
+ok "and issuing it wrote nothing — an object in a bucket is evidence of nothing until it is submitted"
+
+# The URL is the object store's and is not a route on this service. If SHIP-81b were ever
+# "simplified" into a proxy upload, this is the check that fails first.
+[[ "$doc_url" == "$STORAGE_ENDPOINT/"* ]] \
+  || fail "upload_url is $doc_url, which is not the object store at $STORAGE_ENDPOINT"
+[[ "$doc_url" != *"localhost:$VERIFY_PORT"* && "$doc_url" != *"/v1/"* ]] \
+  || fail "upload_url points back at this service: $doc_url"
+ok "the URL is the object store's, not this API's — the platform is not in the path of the bytes"
+
+doc_window="$(python3 - "$doc_url" "$doc_expires" <<'PY'
+import sys, urllib.parse, datetime
+query = urllib.parse.parse_qs(urllib.parse.urlsplit(sys.argv[1]).query)
+signed = int(query["X-Amz-Expires"][0])
+expires = datetime.datetime.fromisoformat(sys.argv[2].replace("Z", "+00:00"))
+ahead = (expires - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+print(signed, int(ahead))
+PY
+)"
+read -r doc_signed_seconds doc_seconds_ahead <<<"$doc_window"
+(( doc_signed_seconds > 0 && doc_signed_seconds <= 3600 )) \
+  || fail "the URL is signed to last $doc_signed_seconds seconds; internal/config caps the lifetime at an hour because nothing can revoke one"
+(( doc_seconds_ahead > 0 && doc_seconds_ahead <= doc_signed_seconds + 5 )) \
+  || fail "expires_at is $doc_seconds_ahead seconds away against a signed window of $doc_signed_seconds"
+ok "the URL is short-lived — $doc_signed_seconds seconds in the signature, and expires_at agrees with it"
+
+# --- the upload itself, with this service in neither direction ---------------------------------
+
+printf '%s' 'not a licence, but exactly fifty-two bytes of proof.' > "$WORKDIR/prof-doc.bin"
+[[ "$(wc -c < "$WORKDIR/prof-doc.bin" | tr -d ' ')" == "52" ]] || fail "the fixture is not 52 bytes"
+
+put_status="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H "Content-Type: $doc_type" --data-binary "@$WORKDIR/prof-doc.bin" "$doc_url")"
+[[ "$put_status" == "200" ]] \
+  || fail "the pre-signed PUT answered $put_status — the provider could not upload directly, which is the whole of this clause"
+ok "the provider uploaded the document straight to the object store with that URL and nothing else"
+
+stored_doc="$("${COMPOSE[@]}" exec -T minio sh -c \
+  'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null; \
+   mc cat "local/'"$STORAGE_BUCKET/$doc_key"'"' 2>/dev/null)"
+[[ "$stored_doc" == "not a licence, but exactly fifty-two bytes of proof." ]] \
+  || fail "the object in $STORAGE_BUCKET reads back as '$stored_doc'"
+ok "and the bytes are in $STORAGE_BUCKET under the key the API named, read back out of the store itself"
+
+# --- the record: which kind, and whose verification record --------------------------------------
+
+status="$(prof_post "$prof_provider_token" "verify-prof-doc-record-$$" \
+  "{\"kind\":\"licence\",\"object_key\":\"$doc_key\"}" "$WORKDIR/prof-doc-record.json" "")"
+[[ "$status" == "201" ]] \
+  || { cat "$WORKDIR/prof-doc-record.json"; fail "submitting the licence answered $status, want 201"; }
+
+doc_id="$(json "$WORKDIR/prof-doc-record.json" '["id"]')"
+[[ "$(json "$WORKDIR/prof-doc-record.json" '["kind"]')" == "licence" ]] \
+  || fail "the submission came back as something other than a licence"
+
+# What was stored is what the *store* reported, not what the client declared: the request asked for
+# 52 bytes and the object is 52 bytes, so this agrees — and the column is filled from the HEAD rather
+# than from the body, which is what a row with no object behind it could never have.
+recorded="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select kind || ' ' || provider_id || ' ' || content_type || ' ' || content_length || ' ' ||
+          (length(etag) > 0)::text
+     from provider_verification_documents where id = '$doc_id';")"
+[[ "$recorded" == "licence $prof_provider_id image/jpeg 52 true" ]] \
+  || fail "the recorded document is '$recorded', want 'licence $prof_provider_id image/jpeg 52 true'"
+ok "the row names its kind, the verification record it belongs to, and what the store reported"
+
+# --- the object is private, and reachable only by a fresh signed URL ---------------------------
+
+unsigned_status="$(curl -s -o /dev/null -w '%{http_code}' "$STORAGE_ENDPOINT/$STORAGE_BUCKET/$doc_key")"
+[[ "$unsigned_status" == "403" ]] \
+  || fail "an unsigned GET of the document answered $unsigned_status, want 403 — a licence is the most identifying object this platform holds"
+ok "the same object is refused without a signature: there is no public read path to a verification document"
+
+# **The two reads are a second apart, deliberately, and that is a property of SigV4 rather than
+# padding.** A pre-signed signature is a deterministic function of the key, the window and the
+# signing instant — which has one-second resolution — so two reads inside the same second produce
+# byte-identical URLs *even though each one was signed afresh*. String inequality is therefore the
+# wrong instrument for "nothing stores a URL"; what says it is that the signing instant moves with
+# the request, plus the schema having no column a URL could have come out of. Both are checked below.
+status="$(prof_get "$prof_provider_token" /v1/provider/verification/documents "$WORKDIR/prof-docs-1.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/prof-docs-1.json"; fail "reading the documents answered $status"; }
+sleep 1.1
+status="$(prof_get "$prof_provider_token" /v1/provider/verification/documents "$WORKDIR/prof-docs-2.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/prof-docs-2.json"; fail "the second read answered $status"; }
+
+doc_link_1="$(python3 -c "
+import json,sys
+for d in json.load(open(sys.argv[1]))['data']:
+    if d['id'] == sys.argv[2]: print(d['download_url']); break
+" "$WORKDIR/prof-docs-1.json" "$doc_id")"
+doc_link_2="$(python3 -c "
+import json,sys
+for d in json.load(open(sys.argv[1]))['data']:
+    if d['id'] == sys.argv[2]: print(d['download_url']); break
+" "$WORKDIR/prof-docs-2.json" "$doc_id")"
+
+[[ -n "$doc_link_1" && -n "$doc_link_2" ]] || fail "a submitted document came back with no download URL"
+
+doc_signed_at_1="$(python3 -c "
+import sys, urllib.parse
+print(urllib.parse.parse_qs(urllib.parse.urlsplit(sys.argv[1]).query)['X-Amz-Date'][0])" "$doc_link_1")"
+doc_signed_at_2="$(python3 -c "
+import sys, urllib.parse
+print(urllib.parse.parse_qs(urllib.parse.urlsplit(sys.argv[1]).query)['X-Amz-Date'][0])" "$doc_link_2")"
+[[ "$doc_signed_at_1" != "$doc_signed_at_2" ]] \
+  || fail "both reads carry the signing instant $doc_signed_at_1 — a stored URL would look exactly like this"
+[[ "$doc_link_1" != "$doc_link_2" ]] \
+  || fail "two reads a second apart produced the same URL, so the credential did not move with the request"
+
+# And there is no column a URL could have come out of, which is what makes the freshness above a
+# property of the schema rather than of one implementation.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+      "select count(*) from information_schema.columns
+        where table_name = 'provider_verification_documents'
+          and (column_name like '%url%' or column_name like '%link%');")" == "0" ]] \
+  || fail "provider_verification_documents holds a URL-shaped column, so a credential is stored at rest"
+
+signed_status="$(curl -s -o "$WORKDIR/prof-doc-fetched.bin" -w '%{http_code}' "$doc_link_1")"
+[[ "$signed_status" == "200" ]] || fail "the signed download answered $signed_status"
+[[ "$(cat "$WORKDIR/prof-doc-fetched.bin")" == "not a licence, but exactly fifty-two bytes of proof." ]] \
+  || fail "the signed download returned something other than the uploaded bytes"
+ok "each read mints a fresh signed URL, and it fetches the document the provider uploaded"
+
+# The key never crosses the wire on a read. It is a durable handle into the bucket holding identity
+# documents, and every read is answered with a short-lived credential instead.
+grep -q "$doc_key" "$WORKDIR/prof-doc-record.json" \
+  && { cat "$WORKDIR/prof-doc-record.json"; fail "the submission response carries the object key"; }
+grep -q '"download_url"' "$WORKDIR/prof-doc-record.json" \
+  && { cat "$WORKDIR/prof-doc-record.json"; fail "the 201 carries a download URL, which the idempotency middleware would then store and replay"; }
+ok "no object key on the wire and no credential on the 201 — the replayed body carries nothing at rest"
+
+# --- the four kinds, each captured independently ------------------------------------------------
+
+# prof_submit_kind <kind> — mint, upload and submit one document, leaving its key in
+# $prof_last_key.
+#
+# **It sets a global rather than printing the key, and it is called directly rather than in a
+# command substitution.** `fail` ends the run with `exit 1`, and inside `$( … )` that exits the
+# subshell — the harness would print the failure and carry on green. A helper that can fail has to
+# run in the caller's shell.
+#
+# **Every call draws a fresh idempotency key from $prof_submissions.** A retake is a *second
+# submission*, not a retry of the first, so re-using the key would have the middleware replay the
+# original response and write no row — which is the middleware working, and would have made the
+# append-only check below silently vacuous. It did, once, before the counter was added.
+prof_submissions=0
+prof_last_key=""
+prof_submit_kind() {
+  local kind="$1" url
+  prof_submissions=$((prof_submissions + 1))
+
+  status="$(prof_post "$prof_provider_token" "verify-prof-doc-$kind-$prof_submissions-$$" \
+    '{"content_type":"image/jpeg","content_length":52}' \
+    "$WORKDIR/prof-doc-$kind-$prof_submissions-url.json" "/uploads")"
+  [[ "$status" == "200" ]] \
+    || { cat "$WORKDIR/prof-doc-$kind-$prof_submissions-url.json"; fail "minting a URL for $kind answered $status"; }
+
+  prof_last_key="$(json "$WORKDIR/prof-doc-$kind-$prof_submissions-url.json" '["object_key"]')"
+  url="$(json "$WORKDIR/prof-doc-$kind-$prof_submissions-url.json" '["upload_url"]')"
+
+  put_status="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Content-Type: image/jpeg" \
+    --data-binary "@$WORKDIR/prof-doc.bin" "$url")"
+  [[ "$put_status" == "200" ]] || fail "uploading the $kind answered $put_status"
+
+  status="$(prof_post "$prof_provider_token" "verify-prof-doc-rec-$kind-$prof_submissions-$$" \
+    "{\"kind\":\"$kind\",\"object_key\":\"$prof_last_key\"}" \
+    "$WORKDIR/prof-doc-$kind-$prof_submissions.json" "")"
+  [[ "$status" == "201" ]] \
+    || { cat "$WORKDIR/prof-doc-$kind-$prof_submissions.json"; fail "submitting the $kind answered $status"; }
+}
+
+for kind in registration insurance abn_evidence; do
+  prof_submit_kind "$kind"
+done
+
+submitted_kinds="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select string_agg(distinct kind, ',' order by kind)
+     from provider_verification_documents where provider_id = '$prof_provider_id';")"
+[[ "$submitted_kinds" == "abn_evidence,insurance,licence,registration" ]] \
+  || fail "the provider's record holds '$submitted_kinds', want Docs/04 §3's four"
+ok "all four of Docs/04 §3's documents are captured independently — licence, registration, insurance, ABN evidence"
+
+# A retake is a new row rather than an edit: the replaced image is what an administrator already
+# looked at, and Docs/04 §4's Restricted covers "document renewal" explicitly.
+before_retake="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from provider_verification_documents where provider_id = '$prof_provider_id';")"
+prof_submit_kind insurance
+after_retake="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from provider_verification_documents where provider_id = '$prof_provider_id';")"
+(( after_retake == before_retake + 1 )) \
+  || fail "a retake moved the record from $before_retake documents to $after_retake — an image somebody reviewed was replaced"
+ok "and a retake appends rather than overwrites: the evidence trail keeps what was reviewed"
+
+# --- separation: one provider's key never lands on another's verification record ----------------
+
+other_before="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from provider_verification_documents where provider_id = '$prof_other_id';")"
+
+status="$(prof_post "$prof_other_token" "verify-prof-doc-steal-$$" \
+  "{\"kind\":\"licence\",\"object_key\":\"$doc_key\"}" "$WORKDIR/prof-doc-steal.json" "")"
+[[ "$status" == "422" ]] \
+  || { cat "$WORKDIR/prof-doc-steal.json"; fail "another provider submitted this provider's object: $status"; }
+[[ "$(json "$WORKDIR/prof-doc-steal.json" '["error"]["details"][0]["field"]')" == "object_key" ]] \
+  || { cat "$WORKDIR/prof-doc-steal.json"; fail "the refusal does not name object_key"; }
+
+other_after="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from provider_verification_documents where provider_id = '$prof_other_id';")"
+[[ "$other_after" == "$other_before" ]] \
+  || fail "the second provider's record moved from $other_before documents to $other_after"
+
+# The cross-table pair, over every row rather than the one just attempted: a document sits on the
+# verification record its object key was minted for, or the platform has mixed two people's evidence.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+      "select count(*) from provider_verification_documents
+        where object_key not like 'verification/' || provider_id::text || '/%';")" == "0" ]] \
+  || fail "some documents are recorded against a verification record their object key does not name"
+ok "a key issued to one provider cannot become another provider's evidence, and no stored row does"
+
+# --- the platform asks the store before it writes anything -------------------------------------
+
+status="$(prof_post "$prof_provider_token" "verify-prof-doc-ghost-$$" \
+  '{"content_type":"image/jpeg","content_length":52}' "$WORKDIR/prof-doc-ghost-url.json" "/uploads")"
+[[ "$status" == "200" ]] || fail "minting a URL for the unspent-key check answered $status"
+ghost_key="$(json "$WORKDIR/prof-doc-ghost-url.json" '["object_key"]')"
+
+status="$(prof_post "$prof_provider_token" "verify-prof-doc-ghost-rec-$$" \
+  "{\"kind\":\"licence\",\"object_key\":\"$ghost_key\"}" "$WORKDIR/prof-doc-ghost.json" "")"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/prof-doc-ghost.json"; fail "submitting an object nobody uploaded answered $status, want 409"; }
+[[ "$(json "$WORKDIR/prof-doc-ghost.json" '["error"]["code"]')" == "profiles_document_not_uploaded" ]] \
+  || { cat "$WORKDIR/prof-doc-ghost.json"; fail "expected code=profiles_document_not_uploaded"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+      "select count(*) from provider_verification_documents where object_key = '$ghost_key';")" == "0" ]] \
+  || fail "a row was written for an object the store does not hold"
+ok "a submission the store cannot confirm is refused — the platform never records evidence it has not looked at"
+
+# One object is evidence for at most one document, which is what stops a single photograph of a
+# licence standing in for an insurance certificate as well.
+status="$(prof_post "$prof_provider_token" "verify-prof-doc-twice-$$" \
+  "{\"kind\":\"insurance\",\"object_key\":\"$doc_key\"}" "$WORKDIR/prof-doc-twice.json" "")"
+[[ "$status" == "409" ]] \
+  || { cat "$WORKDIR/prof-doc-twice.json"; fail "one object became two documents: $status"; }
+[[ "$(json "$WORKDIR/prof-doc-twice.json" '["error"]["code"]')" == "profiles_document_already_recorded" ]] \
+  || { cat "$WORKDIR/prof-doc-twice.json"; fail "expected code=profiles_document_already_recorded"; }
+ok "and one uploaded image can be at most one document"
+
+# --- who may reach any of this ------------------------------------------------------------------
+
+status="$(prof_post "$prof_customer_token" "verify-prof-doc-cust-$$" \
+  '{"content_type":"image/jpeg","content_length":52}' "$WORKDIR/prof-doc-cust.json" "/uploads")"
+[[ "$status" == "403" ]] || { cat "$WORKDIR/prof-doc-cust.json"; fail "a customer was issued an upload URL: $status"; }
+[[ "$(json "$WORKDIR/prof-doc-cust.json" '["error"]["code"]')" == "profiles_provider_only" ]] \
+  || { cat "$WORKDIR/prof-doc-cust.json"; fail "expected code=profiles_provider_only"; }
+
+status="$(curl -s -o "$WORKDIR/prof-doc-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/provider/verification/documents")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/prof-doc-anon.json"; fail "an unauthenticated read returned $status, want 401"; }
+
+status="$(curl -s -X POST -o "$WORKDIR/prof-doc-nokey.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $prof_provider_token" -H 'Content-Type: application/json' \
+  -d '{"content_type":"image/jpeg","content_length":52}' \
+  "http://localhost:$VERIFY_PORT/v1/provider/verification/documents/uploads")"
+[[ "$status" == "400" ]] \
+  || { cat "$WORKDIR/prof-doc-nokey.json"; fail "a request with no Idempotency-Key answered $status, want 400"; }
+ok "a customer, an anonymous caller and a request with no Idempotency-Key are each refused"
+
+# --- the trail is append-only, and there is no expiry column ------------------------------------
+
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+     "update provider_verification_documents set kind = 'insurance' where id = '$doc_id';" \
+     >/dev/null 2>&1; then
+  fail "a submitted document was rewritten"
+fi
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+     "delete from provider_verification_documents where id = '$doc_id';" >/dev/null 2>&1; then
+  fail "a submitted document was deleted"
+fi
+ok "the evidence trail is append-only — an image cannot be swapped after a decision was taken on it"
+
+# The four, and only the four. Docs/04 §3 is the authority; a fifth would be a document no reviewer,
+# no client and no queue knows about.
+doc_accepted="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select pg_get_constraintdef(oid) from pg_constraint
+    where conname = 'ck_provider_verification_documents_kind';")"
+for kind in licence registration insurance abn_evidence; do
+  grep -q "'$kind'" <<<"$doc_accepted" || fail "the CHECK does not accept Docs/04 §3's document $kind"
+done
+[[ "$(grep -o "'" <<<"$doc_accepted" | wc -l | tr -d ' ')" == "8" ]] \
+  || fail "ck_provider_verification_documents_kind accepts something other than exactly four kinds: $doc_accepted"
+ok "the database accepts Docs/04 §3's four documents and no fifth"
+
+# **No expiry column, deliberately.** Docs/04 §3 gives the renewal cadence to legal and insurance
+# advisers (Track-X row X-4) and says it "remains genuinely outside engineering's competence to
+# settle". SHIP-159 is the ticket that adds it, with that answer in front of it.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+      "select count(*) from information_schema.columns
+        where table_name = 'provider_verification_documents'
+          and (column_name like '%expir%' or column_name like '%renew%');")" == "0" ]] \
+  || fail "provider_verification_documents carries an expiry column, which X-4 has not answered"
+ok "and no expiry column was invented — the renewal cadence is X-4's, and SHIP-159 is the ticket"

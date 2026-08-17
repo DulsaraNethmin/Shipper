@@ -26,7 +26,14 @@ import (
 func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 	t.Helper()
 
-	handler, err := NewHandler(newTestService(), pool,
+	return newTestRouterWith(t, pool, newFakeObjects())
+}
+
+// newTestRouterWith is [newTestRouter] with the object store the caller wants to drive.
+func newTestRouterWith(t *testing.T, pool *pgxpool.Pool, store *fakeObjects) http.Handler {
+	t.Helper()
+
+	handler, err := NewHandler(newTestService(), newTestDocuments(store), pool,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("building the handler: %v", err)
@@ -34,6 +41,9 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /v1/provider/verification", handler.Verification())
+	mux.Handle("POST /v1/provider/verification/documents/uploads", handler.PresignDocumentUpload())
+	mux.Handle("POST /v1/provider/verification/documents", handler.SubmitDocument())
+	mux.Handle("GET /v1/provider/verification/documents", handler.ProviderDocuments())
 	return mux
 }
 
