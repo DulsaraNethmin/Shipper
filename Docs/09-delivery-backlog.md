@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**231 tickets, 714 points.**
+**232 tickets, 717 points.**
 
 ## How to read this
 
@@ -44,12 +44,12 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 38 | 106 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 29 | 83 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 28 | 84 |
-| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 37 | 125 |
+| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 38 | 128 |
 | **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 33 | 112 |
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 14 | 48 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 22 | 69 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 20 | 58 |
-| | | **231** | **714** |
+| | | **232** | **717** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -223,7 +223,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M3 — Bidding and award
 
 **Goal:** Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one.  
-**Size:** 37 tickets, 125 points
+**Size:** 38 tickets, 128 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -234,7 +234,8 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-80 | bids table and status enum | 3 | Schema covers all eight bid statuses from Docs 02 §4 | SHIP-56 |
 | SHIP-81 | Job eligibility filter query | 5 | Filters by service area, vehicle capability, verification state, and job status | SHIP-79, SHIP-80 |
 | SHIP-81a | The provider verification record and its five states | 5 | Docs 04 §4's five outcomes — Pending, Verified, Restricted, Rejected and Suspended — exist as a provider's verification record in migration block 200–299 owned by `internal/profiles`; every transition passes one guarded function and records its actor and its reason, and no code sets the state directly; a provider reads their own state and no other provider's; and SHIP-81's eligibility predicate reads this record instead of its automated stand-in, so there is exactly one answer to who may bid | SHIP-79, SHIP-81 |
-| SHIP-81b | A provider submits their verification documents | 3 | A provider photographs each of Docs 04 §3's four documents — licence, registration, insurance and ABN evidence — in the app and uploads it directly through a short-lived pre-signed URL on SHIP-114's precedent, with the API never in the path of the bytes; each stored document names its kind and the verification record it belongs to, is private, and is reachable only by a fresh signed URL | SHIP-81a, SHIP-114 |
+| SHIP-81b | The verification document record and its upload | 3 | Each of Docs 04 §3's four documents — licence, registration, insurance and ABN evidence — uploads directly through a short-lived pre-signed URL on SHIP-114's precedent, with the API never in the path of the bytes; each stored document names its kind and the verification record it belongs to, is private, and is reachable only by a fresh signed URL | SHIP-81a, SHIP-114 |
+| SHIP-81c | A provider captures their verification documents in the app | 3 | A provider photographs each of the four kinds in the app and it reaches SHIP-81b's upload; the image is never written to the device photo library, is compressed on the device, and is cleared from app storage once uploaded; and a file-upload fallback exists because the camera permission may be declined (Docs 04 §3.1) | SHIP-81b |
 | SHIP-82 | Open jobs feed endpoint for providers | 3 | GET /v1/jobs/open returns only eligible jobs, paginated | SHIP-81 |
 | SHIP-83 | Provider job detail with budget stripped | 3 | Provider view omits budget entirely; verified by test | SHIP-82, SHIP-67 |
 | SHIP-83a | Move the open feed off the `{id}` slot | 3 | `GET /v1/jobs/{id}/<literal>` can be registered at four segments — demonstrated by registering one — and the provider feed answers on a path that no longer puts a literal where an identifier goes; routes_golden.txt, the contract fragment and the Dart client all move together and the old path is gone rather than aliased | SHIP-83 |
