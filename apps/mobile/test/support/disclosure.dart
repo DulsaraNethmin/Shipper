@@ -82,6 +82,19 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/shared/formatting/money.dart';
 
+/// A glyph from an icon font, which reading `RichText` collects and no person reads as a word.
+///
+/// `Icon` builds a `RichText` whose text is `String.fromCharCode(icon.codePoint)`, and every icon
+/// font — Material's and Cupertino's alike — allocates from the Unicode **Private Use Area**. Those
+/// code points are removed rather than the whole string being dropped, so an icon sitting inside a
+/// sentence loses the glyph and keeps the sentence.
+///
+/// **Removing them is safe in the direction that matters.** A private-use code point has no assigned
+/// meaning and no screen reader pronunciation, so nothing perceivable can hide in one; and this
+/// strips characters rather than skipping widgets, so a `RichText` that carries a glyph *and* a
+/// disclosure still yields the disclosure.
+final _iconGlyph = RegExp('[\uE000-\uF8FF]');
+
 /// A phone-shaped surface, and a tall one, so that a list is mounted rather than culled.
 ///
 /// See the note about the viewport at the top of this file: this raises the fold, it does not remove
@@ -122,13 +135,15 @@ Future<List<String>> perceivable(WidgetTester tester) async {
   try {
     await tester.pump();
 
-    final collected = <String>[
+    final strings = <String>[
       ..._rendered(tester),
       ..._seeded(tester),
       ..._announced(tester),
-    ].expand((data) => data.split('\n')).map((data) => data.trim()).where((d) => d.isNotEmpty);
-
-    final strings = collected.toList();
+    ]
+        .expand((data) => data.split('\n'))
+        .map((data) => data.replaceAll(_iconGlyph, '').trim())
+        .where((data) => data.isNotEmpty)
+        .toList();
     if (strings.isEmpty) {
       throw StateError(
         'Nothing was collected from a frame that is supposed to be showing a screen. An empty '
