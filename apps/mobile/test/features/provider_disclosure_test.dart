@@ -166,11 +166,13 @@ void main() {
       // envelope. On the Go side `httpx.NewError` builds it with `fmt.Sprintf(format, a...)`, so it
       // is a template a handler can interpolate anything into.
       //
-      // No provider-reachable message interpolates a budget today: every `NewError` in
-      // `internal/bidding/http.go` is a constant string. So this is an **open channel and not a live
-      // leak**, and what is provable from the client is that the channel is *covered* — a message
-      // that did disclose fails this screen's guard rather than passing through it. Recording that
-      // is worth more than a claim it cannot happen.
+      // No provider-reachable message interpolates a budget today, measured rather than taken on
+      // report: five `NewError` calls across `internal/bidding`, `internal/jobs` and
+      // `internal/delivery` take a format argument, and every one interpolates either the client's
+      // own `?status=` value or the literal `Idempotency-Key` header name. So this is an **open
+      // channel and not a live leak**, and what is provable from the client is that the channel is
+      // *covered* — a message that did disclose fails this screen's guard rather than passing
+      // through it. Recording that is worth more than a claim it cannot happen.
       final feed = FakeOpenJobsRepository()
         ..pages = [_jobs(<OpenJob>[anOpenJob(id: _sofa)])]
         ..jobFailure = const ApiErrorResponse(
