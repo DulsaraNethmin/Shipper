@@ -1641,16 +1641,238 @@ status="$(post_auth "verify-deletion-other-$$" "$(json "$WORKDIR/deletion-other-
   || fail "the second account does not hold exactly one request of its own"
 ok "another account's request is its own, and neither account can see the other's"
 
-# The scope boundary, stated as a check rather than as a comment. SHIP-170 defers a request made
-# during an active job and SHIP-171 executes one; both add a state, and neither exists yet. If a
-# later branch widens the constraint, this line is what makes that a decision somebody took.
+# The scope boundary, stated as a check rather than as a comment. **SHIP-170 widened it and this
+# line moved with it rather than being deleted**, which is what SHIP-169 wrote it for: "if a later
+# branch widens the constraint, this line is what makes that a decision somebody took."
+#
+# SHIP-171's 'completed' is still absent, and that is the boundary now. LC_ALL=C so the sort is by
+# bytes rather than by whatever locale the runner inherited.
 deletion_states="$("$PSQL" "$DATABASE_URL" -tAc \
   "select pg_get_constraintdef(oid) from pg_constraint
     where conname = 'ck_account_deletion_requests_state';" \
-  | grep -oE "'[a-z_]+'::text" | tr -d "'" | sed 's/::text//' | sort | tr '\n' ',' | sed 's/,$//')"
-[[ "$deletion_states" == "requested" ]] \
-  || fail "the deletion states are '$deletion_states', want only 'requested' — SHIP-170 and SHIP-171 are not built"
-ok "'requested' is the only state — the deferral is SHIP-170's and the execution SHIP-171's"
+  | grep -oE "'[a-z_]+'::text" | tr -d "'" | sed 's/::text//' | LC_ALL=C sort | tr '\n' ',' | sed 's/,$//')"
+[[ "$deletion_states" == "deferred,requested" ]] \
+  || fail "the deletion states are '$deletion_states', want 'deferred,requested' — SHIP-170 is built and SHIP-171 is not"
+ok "'requested' and 'deferred' are the states — the execution is still SHIP-171's"
+
+# The index widened with the CHECK, which is the half of 000106 that is easy to leave out. An index
+# still partial on 'requested' alone would let one account hold a deferred request and a live one.
+deletion_open_predicate="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select indexdef from pg_indexes where indexname = 'uq_account_deletion_requests_open';" \
+  | sed 's/.* WHERE //' | grep -oE "'[a-z_]+'::text" | tr -d "'" | sed 's/::text//' | LC_ALL=C sort | tr '\n' ',' | sed 's/,$//')"
+[[ "$deletion_open_predicate" == "deferred,requested" ]] \
+  || fail "uq_account_deletion_requests_open covers '$deletion_open_predicate', want 'deferred,requested' — a deferred request is an open request"
+ok "one open request per account covers both open states, so a deferral cannot become a second promise"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-170  a request during a delivery queues until the job closes, and explains why"
+
+# Two accounts and one awarded job, because the ticket is about **both** parties. Docs/05 §3.1:
+# "Erasing a party mid-delivery would strand the counterparty" — the customer whose goods are
+# moving and the provider carrying them are each the other's counterparty, and the deletion route
+# is RequireUser with no role predicate, so both reach it. A section that checked the customer
+# alone would pass against a lookup that deletes drivers mid-delivery.
+
+# move_job_for_deferral <job> <from> <to> <actor> — a status change through the guard.
+#
+# `jobs.status` is not a settable field (000402): an UPDATE has to be accompanied, in the same
+# transaction, by a job_status_history row describing it and named to the trigger through a
+# transaction-local setting. This is that protocol, which is 000402's own intention — that a
+# fixture and the domain be the same caller rather than the fixture having a private way in. It is
+# `move_job` from 50-jobs.sh, local here because that file's copy is not this file's to call.
+move_job_for_deferral() {
+  "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
+    -v job="$1" -v from_status="$2" -v to_status="$3" -v actor="$4" \
+    >/dev/null <<'SQL'
+BEGIN;
+INSERT INTO job_status_history
+    (id, job_id, from_status, to_status, actor_type, actor_id, actor_recorded_at)
+VALUES (gen_random_uuid(), :'job', :'from_status', :'to_status', 'customer', :'actor', now());
+SELECT set_config('shipper.job_status_transition',
+                  (SELECT id::text FROM job_status_history
+                    WHERE job_id = :'job' AND to_status = :'to_status'), true);
+UPDATE jobs SET status = :'to_status' WHERE id = :'job';
+COMMIT;
+SQL
+}
+
+defer_customer_email="deferral-c-$$@example.com"
+status="$(post_json "verify-deferral-c-register-$$" /v1/auth/register \
+  "{\"name\":\"Verify Deferral Customer\",\"email\":\"$defer_customer_email\",\"phone\":\"04922$$\",\"password\":\"$login_password\",\"role\":\"customer\"}" \
+  "$WORKDIR/deferral-c-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/deferral-c-register.json"; fail "could not register the deferral customer ($status)"; }
+defer_customer_id="$(json "$WORKDIR/deferral-c-register.json" '["id"]')"
+
+status="$(post_json "verify-deferral-c-login-$$" /v1/auth/login \
+  "{\"email\":\"$defer_customer_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Deferral C\"}" \
+  "$WORKDIR/deferral-c-login.json")"
+[[ "$status" == "200" ]] || fail "could not sign the deferral customer in ($status)"
+defer_customer_token="$(json "$WORKDIR/deferral-c-login.json" '["access_token"]')"
+
+defer_provider_email="deferral-p-$$@example.com"
+status="$(post_json "verify-deferral-p-register-$$" /v1/auth/register \
+  "{\"name\":\"Verify Deferral Provider\",\"email\":\"$defer_provider_email\",\"phone\":\"04923$$\",\"password\":\"$login_password\",\"role\":\"provider\"}" \
+  "$WORKDIR/deferral-p-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/deferral-p-register.json"; fail "could not register the deferral provider ($status)"; }
+defer_provider_id="$(json "$WORKDIR/deferral-p-register.json" '["id"]')"
+
+status="$(post_json "verify-deferral-p-login-$$" /v1/auth/login \
+  "{\"email\":\"$defer_provider_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Deferral P\"}" \
+  "$WORKDIR/deferral-p-login.json")"
+[[ "$status" == "200" ]] || fail "could not sign the deferral provider in ($status)"
+defer_provider_token="$(json "$WORKDIR/deferral-p-login.json" '["access_token"]')"
+
+# A third provider who bid on the same job and lost, so that "a provider" is not the same claim as
+# "the awarded provider". Without it, a lookup joining `bids` with no status predicate would pass
+# every check below.
+defer_loser_email="deferral-l-$$@example.com"
+status="$(post_json "verify-deferral-l-register-$$" /v1/auth/register \
+  "{\"name\":\"Verify Deferral Loser\",\"email\":\"$defer_loser_email\",\"phone\":\"04924$$\",\"password\":\"$login_password\",\"role\":\"provider\"}" \
+  "$WORKDIR/deferral-l-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/deferral-l-register.json"; fail "could not register the losing bidder ($status)"; }
+defer_loser_id="$(json "$WORKDIR/deferral-l-register.json" '["id"]')"
+
+status="$(post_json "verify-deferral-l-login-$$" /v1/auth/login \
+  "{\"email\":\"$defer_loser_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Deferral L\"}" \
+  "$WORKDIR/deferral-l-login.json")"
+[[ "$status" == "200" ]] || fail "could not sign the losing bidder in ($status)"
+defer_loser_token="$(json "$WORKDIR/deferral-l-login.json" '["access_token"]')"
+
+# The job. Inserted at Draft — 000402 refuses any other creation status — and then walked to
+# Awarded through the guard. The bids are direct inserts because `bids` has no status trigger
+# (000500 declined to give it the one `jobs` has), which is the same fixture 60-fleet.sh writes.
+# -q as well as -tA: without it psql prints the `INSERT 0 1` command tag after the returned id,
+# and the variable becomes two lines that the next statement interpolates as a malformed uuid.
+defer_job="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into jobs (id, customer_id) values (gen_random_uuid(), '$defer_customer_id') returning id;" | tr -d ' ')"
+[[ -n "$defer_job" ]] || fail "could not create the job the deferral waits on"
+
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "insert into bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+   values (gen_random_uuid(), '$defer_job', '$defer_provider_id', 'Accepted', 45000,
+           now() + interval '2 days', now() + interval '3 days'),
+          (gen_random_uuid(), '$defer_job', '$defer_loser_id', 'Rejected', 52000,
+           now() + interval '2 days', now() + interval '3 days');" >/dev/null \
+  || fail "could not place the accepted and rejected bids"
+
+move_job_for_deferral "$defer_job" Draft Open "$defer_customer_id"
+move_job_for_deferral "$defer_job" Open Awarded "$defer_customer_id"
+
+# The fixture, verified rather than assumed: a deferral check against a job that never reached
+# Awarded passes forever and proves nothing.
+read -r defer_job_status defer_accepted <<<"$("$PSQL" "$DATABASE_URL" -tAc \
+  "select j.status, (select count(*) from bids where job_id = j.id and status = 'Accepted')
+     from jobs j where j.id = '$defer_job';" | tr '|' ' ')"
+[[ "$defer_job_status" == "Awarded" && "$defer_accepted" == "1" ]] \
+  || fail "the fixture job is '$defer_job_status' with $defer_accepted accepted bids, want Awarded with 1"
+ok "the fixture is a job at Awarded with one accepted bid and one rejected one"
+
+# The customer's half of the criterion.
+status="$(post_auth "verify-deferral-c-delete-$$" "$defer_customer_token" /v1/account/deletion \
+  "$WORKDIR/deferral-c-delete.json")"
+[[ "$status" == "202" ]] || { cat "$WORKDIR/deferral-c-delete.json"; fail "the customer's request returned $status, want 202 — Docs/05 §3.1 defers rather than refuses"; }
+[[ "$(json "$WORKDIR/deferral-c-delete.json" '["state"]')" == "deferred" ]] \
+  || { cat "$WORKDIR/deferral-c-delete.json"; fail "the customer's request is not deferred while their delivery is in flight"; }
+ok "a customer mid-delivery is deferred rather than refused, and still answered 202"
+
+# **The provider's half, which is the one a customer-only lookup would fail.**
+status="$(post_auth "verify-deferral-p-delete-$$" "$defer_provider_token" /v1/account/deletion \
+  "$WORKDIR/deferral-p-delete.json")"
+[[ "$status" == "202" ]] || { cat "$WORKDIR/deferral-p-delete.json"; fail "the provider's request returned $status, want 202"; }
+[[ "$(json "$WORKDIR/deferral-p-delete.json" '["state"]')" == "deferred" ]] \
+  || { cat "$WORKDIR/deferral-p-delete.json"; fail "the awarded provider's request is not deferred; erasing them mid-delivery would strand the customer"; }
+ok "the provider carrying the delivery is deferred too — a party is either side of the job"
+
+# The row rather than the answer, for both. A state decorated onto the response would satisfy
+# everything above and leave SHIP-171 nothing to read before it executes.
+defer_states="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select state from account_deletion_requests
+    where user_id in ('$defer_customer_id', '$defer_provider_id') order by state;" | tr '\n' ',' | sed 's/,$//')"
+[[ "$defer_states" == "deferred,deferred" ]] \
+  || fail "the stored states are '$defer_states', want both deferred"
+ok "both deferrals are in the rows, not only in the responses"
+
+# And explains why — the clause the *Done when* names second, on the wire rather than in a comment.
+defer_reason="$(json "$WORKDIR/deferral-p-delete.json" '["deferral_reason"]')"
+[[ -n "$defer_reason" ]] || { cat "$WORKDIR/deferral-p-delete.json"; fail "a deferred request carries no deferral_reason, so nothing explains why"; }
+grep -qi 'delivery' <<<"$defer_reason" || fail "the explanation does not mention the delivery: $defer_reason"
+if ! python3 - "$WORKDIR/deferral-p-delete.json" "$defer_job" <<'PYTHON'
+import json, sys
+
+body = json.load(open(sys.argv[1]))
+reason = body["deferral_reason"]
+# The explanation must not carry the job. Both halves of the marketplace reach this endpoint, and
+# Docs/01 §4.3 is easiest to keep on a sentence that never had a job to describe.
+for forbidden in (sys.argv[2], "$", "job"):
+    if forbidden in reason:
+        sys.exit(f"the deferral explanation contains {forbidden!r}: {reason}")
+PYTHON
+then
+  fail "the deferral explanation says more than it should"
+fi
+ok "the explanation says why, names no job and carries no amount"
+
+# A bystander with no job at all is not deferred, which is what makes the two checks above about
+# the delivery rather than about the endpoint.
+status="$(post_auth "verify-deferral-l-delete-$$" "$defer_loser_token" /v1/account/deletion \
+  "$WORKDIR/deferral-l-delete.json")"
+[[ "$status" == "202" ]] || { cat "$WORKDIR/deferral-l-delete.json"; fail "the losing bidder's request returned $status, want 202"; }
+[[ "$(json "$WORKDIR/deferral-l-delete.json" '["state"]')" == "requested" ]] \
+  || { cat "$WORKDIR/deferral-l-delete.json"; fail "a provider whose offer was rejected was deferred; they are carrying nothing"; }
+python3 -c "
+import json, sys
+body = json.load(open(sys.argv[1]))
+sys.exit('a live request carries a deferral_reason' if 'deferral_reason' in body else 0)
+" "$WORKDIR/deferral-l-delete.json" || fail "a request that is not deferred still explains a deferral"
+ok "a provider whose offer was rejected is not deferred, and carries no explanation"
+
+# "…until the job closes." The delivery finishes, and the same person asks again.
+move_job_for_deferral "$defer_job" Awarded Delivered "$defer_customer_id"
+
+# Delivered is still in flight — Docs/02 §6.1 has the job auto-complete 72 hours later, and it can
+# still go to Disputed — so the deferral must hold here. This is the boundary of Docs/05 §3.1's
+# range and the one an off-by-one would get wrong.
+status="$(post_auth "verify-deferral-p-delivered-$$" "$defer_provider_token" /v1/account/deletion \
+  "$WORKDIR/deferral-p-delivered.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/deferral-p-delivered.json"; fail "asking again returned $status, want 200"; }
+[[ "$(json "$WORKDIR/deferral-p-delivered.json" '["state"]')" == "deferred" ]] \
+  || fail "the deferral lifted at Delivered; Docs/05 §3.1's range is Awarded *to Delivered* inclusive"
+ok "a job at Delivered still defers — the range is inclusive at both ends"
+
+defer_promised_before="$(json "$WORKDIR/deferral-p-delivered.json" '["completes_by"]')"
+
+move_job_for_deferral "$defer_job" Delivered Completed "$defer_customer_id"
+
+status="$(post_auth "verify-deferral-p-closed-$$" "$defer_provider_token" /v1/account/deletion \
+  "$WORKDIR/deferral-p-closed.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/deferral-p-closed.json"; fail "asking after the job closed returned $status, want 200"; }
+[[ "$(json "$WORKDIR/deferral-p-closed.json" '["state"]')" == "requested" ]] \
+  || { cat "$WORKDIR/deferral-p-closed.json"; fail "the deferral did not lift once the job completed, so the request queues forever"; }
+[[ "$(json "$WORKDIR/deferral-p-closed.json" '["id"]')" == "$(json "$WORKDIR/deferral-p-delete.json" '["id"]')" ]] \
+  || fail "lifting the deferral named a different request"
+python3 -c "
+import json, sys
+body = json.load(open(sys.argv[1]))
+sys.exit('a lifted request still carries a deferral_reason' if 'deferral_reason' in body else 0)
+" "$WORKDIR/deferral-p-closed.json" || fail "the explanation survived the deferral lifting"
+ok "the request becomes live once the job closes, keeping its identity and dropping its explanation"
+
+# The thirty days start when the deferral lifts, so the date moved. A date that had not moved would
+# mean the platform promised a window it spent waiting.
+defer_promised_after="$(json "$WORKDIR/deferral-p-closed.json" '["completes_by"]')"
+[[ "$defer_promised_after" > "$defer_promised_before" ]] \
+  || fail "the completion date is still $defer_promised_after after the deferral lifted; the thirty days ran while the request was on hold"
+ok "the thirty days start when the deferral lifts — $defer_promised_after, not $defer_promised_before"
+
+# One row throughout. Two would be two promises about one account, and the count is what separates
+# "the state moved" from "a second request was made".
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from account_deletion_requests where user_id = '$defer_provider_id';")" == "1" ]] \
+  || fail "the provider holds more than one deletion request after a deferral lifted"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select state from account_deletion_requests where user_id = '$defer_provider_id';")" == "requested" ]] \
+  || fail "the stored state did not move with the answer"
+ok "one row across the whole lifecycle, and the row holds the state the person was told"
 
 # Nothing here charged a sign-in bucket, so SHIP-47's clean-up above is still the last word on
 # them. Asserted rather than assumed: the whole file's rate-limit hygiene depends on it, and a

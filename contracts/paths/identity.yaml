@@ -896,11 +896,28 @@ AccountDeletion:
       what keeps a counterparty's own record of who carried their goods coherent after the other
       party leaves.
 
+      ## A request made during a delivery waits (SHIP-170)
+
+      **It is deferred, not refused.** If the account is party to a job between `Awarded` and
+      `Delivered` — either as the customer whose goods are moving or as the provider carrying
+      them — the request is still recorded and still answers `202`, with `state` set to
+      `deferred` and a `deferral_reason` explaining it. Erasing a party mid-delivery would strand
+      the counterparty.
+
+      **Branch on `state`, never on the status code.** A deferred request's thirty days have not
+      started, so its `completes_by` is the earliest the platform could finish rather than a
+      commitment; the state is what says which of the two it is. Show `deferral_reason` when it
+      is present — it is the platform's own words and it changes without an app release.
+
+      The deferral is re-evaluated every time the endpoint is called. Asking again after the
+      delivery has closed moves the request to `requested` and records a fresh thirty days from
+      that moment, answering `200` — so **a `200` does not mean nothing changed.**
+
       ## Asking twice
 
       A repeat is not an error and does not create a second request. The first call answers
-      `202`; every call after it answers `200` carrying the same `id` and the same
-      `completes_by`. Neither answer moves the date.
+      `202`; every call after it answers `200` carrying the same `id`. The date does not move
+      unless the state does.
 
       A retry of a *dropped* request — the same `Idempotency-Key` — replays the original response
       byte for byte, so a client that lost the connection sees the `202` it did not receive.
@@ -919,7 +936,10 @@ AccountDeletion:
             schema:
               $ref: '#/DeletionRequest'
       '202':
-        description: The request has been recorded and will be executed by `completes_by`.
+        description: |
+          The request has been recorded. It will be executed by `completes_by` unless `state` is
+          `deferred`, in which case it is waiting on a delivery and the window starts when that
+          closes.
         headers:
           X-Request-Id:
             $ref: '../openapi.yaml#/components/headers/RequestID'
@@ -964,25 +984,51 @@ DeletionRequest:
       example: 0198f2c1-6d3b-7a41-9e2f-1c4b7d8a5e60
     state:
       type: string
-      enum: [requested]
+      enum: [requested, deferred]
       description: |
-        Where the request has got to. `requested` is the only value today; a request made during
-        an active delivery will report a deferred state once SHIP-170 exists, so branch on this
-        rather than assuming it.
+        Where the request has got to.
+
+        `requested` — accepted, and the thirty days are running.
+
+        `deferred` — accepted, and waiting on a delivery this account is party to (SHIP-170).
+        The thirty days have not started. It becomes `requested` once the delivery closes, which
+        is re-evaluated whenever this endpoint is called.
       example: requested
     requested_at:
       type: string
       format: date-time
-      description: When the person asked, UTC.
+      description: |
+        When the person asked, UTC. It does not move — a deferral changes what the request is
+        waiting on, never when it was made.
       example: '2026-08-16T09:30:00.000Z'
     completes_by:
       type: string
       format: date-time
       description: |
-        The date the platform committed to, UTC — thirty days after the request. Recorded when the
+        Thirty days from the moment the request last entered its current `state`, UTC.
+
+        On a `requested` request that is the date the platform committed to: recorded when the
         request was made and returned unchanged on every later read, so it is safe to show a
         person as a promise rather than as an estimate.
+
+        On a `deferred` one it is the **earliest** the platform could complete, because the
+        window starts when the delivery closes and nobody knows yet when that is. It is
+        re-recorded at that moment. Present it as a promise only when `state` is `requested`.
       example: '2026-09-15T09:30:00.000Z'
+    deferral_reason:
+      type: string
+      description: |
+        Why the request is waiting, in the platform's own words — present **only** when `state`
+        is `deferred` (SHIP-170).
+
+        It is served rather than shipped in the app because it is policy copy: `Docs/05` §3.1 is
+        a legal position, and a sentence built into a mobile release cannot be corrected without
+        another one. It names no job, no address and no amount, and a client should render it as
+        given rather than parse it.
+      example: >-
+        Your account will be deleted once your current delivery is finished. Deleting it now
+        would leave the other party without the person carrying or receiving their goods, so the
+        request is held until the delivery closes and the thirty days start then.
 
 TokenPair:
   type: object
