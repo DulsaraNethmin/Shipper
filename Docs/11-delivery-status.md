@@ -14604,6 +14604,138 @@ What was done instead is leave the room without building the thing. `state` is a
 
 One new migration (`000105`, identity's block, highest there now `000105`), one new domain file, one handler, one route, one contract fragment block and one `$ref` line, one new migration test file, one new domain test file (seven tests, one of them written because the mutation exposed an uncovered layer), three route tests appended, and one `make verify` section appended. **No new error code**, so `Docs/10-api-error-codes.md` is untouched: every failure this endpoint can produce is already registered — `unauthenticated`, `idempotency_key_required`, `unavailable`. **No `internal/config` entry**: thirty days is a published commitment in a privacy policy and a store listing rather than a lever to pull under pressure, so moving it is a deploy *and* a document change, which is the correct amount of friction.
 
+### Provider disclosure channels — the enumeration, and one collector over it (wave 14, no ticket)
+
+**This is a surface rather than a ticket.** There is no `Docs/09` row and there must not be one: the
+branch is `ship-15z-provider-disclosure-channels` and nothing is added to `Docs/11-done.txt`.
+
+`Docs/01` §4.3 — *a customer's budget is never exposed to a provider, not as an amount, not as a
+band, and not as a "budget supplied" indicator* — is the invariant this repository keeps almost
+holding. **Four waves each built a better guard and each was beaten by a different mechanism, never
+by a better word**, and the reason is recorded in wave 13's own §3 entry: nobody had enumerated the
+channels by which a string reaches a provider. Every guard was built against the instance that beat
+the last one.
+
+This entry is that enumeration, plus one reusable collector over the channels a widget test can
+reach, applied to four screens.
+
+#### The gate is a widget, not a route, which is why "the provider surface" has no directory
+
+`lib/core/auth/provider_only.dart:96` decides what a provider sees, and
+`lib/core/routing/app_router.dart:302` says the router is *"deliberately blind to the role"* — for a
+good reason, since the role is null for the first round trip of a restored cold start. There is no
+`CustomerOnly` counterpart, no route prefix and no directory convention. **So the provider surface is
+a set of screens spanning three feature packages and `shared/design_system`, and the only thing they
+have in common is the invariant.** That is why the new test sits at
+`apps/mobile/test/features/provider_disclosure_test.dart`, beside the feature directories rather than
+inside one, and why the collector is at `apps/mobile/test/support/disclosure.dart` — a helper root
+that did not exist before this branch.
+
+#### The channels, each with a verdict
+
+| Channel | Verdict | Evidence |
+|---|---|---|
+| `Text.data` | **Guarded** | `test/support/disclosure.dart:169` |
+| `Text.rich` / `RichText` / `TextSpan` children | **Guarded (new)** | `disclosure.dart:169` reads `RichText.text.toPlainText()`; every `Text` builds a `RichText`, so this subsumes both |
+| `TextSpan(semanticsLabel:)` | **Guarded (new)** | `toPlainText` is called **both ways** — `includeSemanticsLabels` true *and* false — because each way loses the other half |
+| `Text(semanticsLabel:)` | **Guarded** | `disclosure.dart:198`, via the semantics walk |
+| `Text(semanticsIdentifier:)` | **Guarded (new)** | `SemanticsData.identifier`, which the wave-13 walk did not read |
+| `EditableText` — what a field is seeded with | **Guarded** | `disclosure.dart:192` |
+| `InputDecoration` label, helper, hint, prefix, counter, **`errorText`** | **Guarded** | all build `Text` widgets; `errorText` is a `liveRegion` and is spoken |
+| Semantics `label`, `value`, `hint`, `tooltip` | **Guarded** | `disclosure.dart:198` |
+| Semantics `increasedValue`, `decreasedValue`, `maxValue`, `minValue` | **Guarded (new)** | same walk; all are announced and none was read before |
+| Semantics `linkUrl`, `controlsNodes` | **Guarded (new)** | same walk |
+| `SemanticsHintOverrides(onTapHint:, onLongPressHint:)` and `customSemanticsActions` | **Guarded (new)** | **not a field at all** — converted to integer ids before reaching `SemanticsData`, so reading more fields would never have found them. Recovered through `CustomSemanticsAction.getAction(id)`, whose `.label` and `.hint` TalkBack speaks as "double tap to …" |
+| Icon-font glyphs collected as a side effect of reading `RichText` | **Filtered, not dropped** | `disclosure.dart:96` strips Unicode private-use code points from each string rather than skipping the widget, so a `RichText` carrying a glyph *and* a sentence still yields the sentence |
+| The platform's own free text — `ApiErrorResponse.message` | **Covered, and open** | `failure_banner.dart:49` and `place_bid_panel.dart:403` render it verbatim; `httpx.NewError` builds it with `fmt.Sprintf`. **No provider-reachable message interpolates a budget today** — every `NewError` in `internal/bidding/http.go` is a constant string — so this is an open channel and not a live leak. The test drives one that *would* disclose and asserts the screen's guard refuses it |
+| Anything below the fold of a `ListView(children:)` | **Unguarded, structurally** | all three provider lists mount nothing off-screen, in either tree. `tallPhone` raises the fold to 2600 logical pixels; **that is a constant, not a guarantee** |
+| Any state the test did not drive the screen into | **Unguarded, structurally** | the collector reads **one frame**. Dialogs, dropdown menus, snackbars and every error state are collected only if a test opened them |
+| `SemanticsService.announce` | **Out of tree** | not reachable from a `WidgetTester` frame. Unused in `lib/` today (grep) |
+| `Clipboard.setData` | **Out of tree** | unused in `lib/` today |
+| `launchUrl` query strings | **Out of tree** | one call site, `version_gate.dart:165`, a store link on the update-required screen |
+| `SystemChrome.setApplicationSwitcherDescription` | **Out of tree** | unused in `lib/` today |
+| Push-notification copy | **Out of tree — guarded in Go** | composed server-side; `internal/notifications`' own tests are the only guard, and wave 11 found a street address in one |
+
+#### The three reported holes, measured
+
+**Confirmed, and the sharpest of the three:** the wave-13 allow-set let money through **by shape**.
+`RegExp(r'^\$-?[\d,]+\.\d{2}$')` and `RegExp(r'^\d+\.\d{2}$')` were in its computed set, and between
+them they permitted *any* bare amount. **A lone `Text('$1,500.00')` in the provider's counter form
+passed all 1075 tests in this repository** — the closed-world assertion and the fourteen-phrase
+ban-list both live — because a shape cannot tell the provider's own price from the customer's
+maximum. As strings they are the same kind of thing.
+
+**Closed, and the closure is structural rather than a reminder.** Money now goes through
+`amounts:` — a set of **cent values the test can say where it got**, expanded into every rendering
+`audFromCents` produces. Two argument checks keep the door shut: a `computed` shape matching any of
+six money probes is refused with an `ArgumentError` naming `amounts:`
+(`disclosure.dart:362`), and a `copy` literal that `readsAsAnAmount` is refused the same way. So
+there is exactly one door for money on a provider surface and going through it means stating the
+provenance. The line between a count and an amount is drawn at a currency symbol, a two-place
+fraction, or three digits — `my_bids_screen.dart:243` draws a bare per-group count and must not have
+to declare it.
+
+**Confirmed:** `SemanticsData` carries string fields the wave-13 walk never read — `identifier`,
+`increasedValue`, `decreasedValue`, `maxValue`, `minValue`, `linkUrl`, `controlsNodes` — and
+`Text` has a `semanticsIdentifier:` parameter that writes straight into one. The hint overrides are
+a **different fix from reading more fields**, as reported: they are action ids by the time they reach
+`SemanticsData`. All are now collected, each with its own test.
+
+**Confirmed as a collector gap and refuted as a live one:** `Text.rich` and `RichText` slipped both
+branches — `data` is null for a `textSpan` `Text`, so the old collector yielded `''` and filtered it
+away — and `apps/mobile/test/support/disclosure_test.dart` fails without the fix, including the
+`ExcludeSemantics(child: Text.rich(…))` form that is visible on screen and in neither old branch.
+**But `grep -rn 'Text\.rich\|RichText\|TextSpan' apps/mobile/lib/` matches nothing.** No screen uses
+rich text today, so this was a gap in the instrument and never an open door. Worth closing before one
+appears, and worth not overstating.
+
+#### The wave-13 correction holds, and is now a test rather than a memory
+
+`Semantics(label: …, child: const SizedBox.shrink())` produces **no semantics node at all** — a
+zero-size node is culled — so it discloses to nobody and *should* survive a guard. The previous
+orchestrator reported it as a live hole and the lane refuted it. Both halves are now pinned in
+`disclosure_test.dart`: the `shrink()` form is asserted **absent** from the collection and the
+one-pixel form asserted **present**. "Your mutation survived" and "there is a hole of that shape" are
+different claims, and the difference is now a test.
+
+#### Mutations — three, all run on two screens
+
+| Mutation | Wave-13 collector, negotiation | This collector, open job | The four pre-existing provider guards |
+|---|---|---|---|
+| A bare unlabelled `$1,500.00` / `$520.00` amount chip | **Survived** — 1075/1075 green | **Killed** — 2 tests, reported as a money-provenance failure naming §4.3 | **Survived** — 84/84 green |
+| `Text('The customer cannot go higher than this.')` | Killed | **Killed** | **Survived** — 84/84 green |
+| The same sentence in `Text(…, semanticsLabel: …)` | Killed | **Killed** | **Survived** — 84/84 green |
+
+**The first row is the finding.** With the bare chip on `open_job_screen.dart`, the whole Flutter
+suite ran 1073 passed / 2 failed and **both failures were in the new file** — nothing else in the
+repository sees it.
+
+**The negotiation screen was then unified onto the shared collector**, which is a widening in both
+directions: it reads four channels more, and its money shapes are replaced by the two cent values the
+fixture itself wrote. All three mutations now die there where one used to survive, and **the allow-set
+needed no new entries** — the wider collector found nothing on that screen it was not already
+recording.
+
+#### What is covered, and what is not
+
+| Screen | Guard |
+|---|---|
+| `open_job_screen.dart` + `place_bid_panel.dart` | Closed world, three states — first paint, offer placed, platform refusal |
+| `provider_job_feed.dart` | Closed world, plus a taint check over a decoded payload carrying four budget-shaped keys |
+| `my_bids_screen.dart` | Closed world, plus the same taint check |
+| `negotiation_screen.dart` | Closed world, unified onto the shared collector, money by provenance |
+| `delivery_screen.dart`, `proof_capture_screen.dart` | **Not covered.** Provider-reachable, and they carry customer-originated milestone and proof text |
+| `compare_offers_screen.dart`, `job_detail_screen.dart`, `customer_job_list.dart` | Customer surfaces. Out of scope by design — they draw the budget, correctly |
+
+Every closed-world assertion is preceded by a **presence** assertion, so an empty collection can never
+read as a clean screen; and `perceivable` **throws** rather than returning nothing, both when the
+semantics root is null and when the whole collection is empty. Each screen also has a staleness test,
+so an allow-list cannot outlive the copy it records.
+
+| Surface | What |
+|---|---|
+| Provider disclosure channels | The enumeration above; `test/support/disclosure.dart`, the first shared Flutter test helper root; closed-world guards on the open job screen and bid panel, the provider feed, the provider's own bids, and the negotiation screen; the money-by-shape hole closed and proved by mutation |
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
