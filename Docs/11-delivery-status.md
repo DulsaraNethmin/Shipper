@@ -14802,8 +14802,37 @@ pool, which satisfies `jobs`' assertion while genuinely committing separately.
 connection the job is `Cancelled` and the dispute is open — a delivery unfrozen by a resolution that
 was rolled back, plus a `job_status_history` row telling the customer an administrator cancelled it.
 **Everything else was green under the mutation, measured rather than assumed**: `cmd/api` ok,
-`migrations` ok, and `internal/admin` ok with that one test excluded. Nine other tests in
-`resolution_test.go` drive the same code path and not one can see the difference.
+`migrations` ok, and `internal/admin` ok with that one test excluded.
+
+**This entry first said "nine other tests drive the same code path", and that figure was wrong.** It
+was a count of test functions in `resolution_test.go`, which is not the same question — most of them
+never reach the statement at all. The measured figure is **five**:
+`TestResolvingADisputeUnfreezesTheJob`, `TestTheOutcomeAndTheJobDestinationAreIndependent`,
+`TestASecondResolutionIsRefused`, `TestTheQueueServesBothHalvesAndAResolvedDisputeLeavesTheOpenOne`
+and `TestEveryAdminMutationWritesAnAuditEntry` all execute the identical statement and not one can
+see the difference. The substance is unchanged and slightly sharper; the arithmetic was not measured
+until it was asked for.
+
+**The method is the durable part of this, because the next claim of this shape needs settling the
+same way.** *Per-test statement coverage*, in three steps:
+
+ 1. **Find the call sites, not the files.**
+    `grep -rn "handler.ResolveDispute()\|workflow.Resolve(\|unwritable.Resolve("` over
+    `internal/admin/*_test.go` gives `resolution_test.go` and `audit_test.go` and nothing else.
+    **A naive `\.Resolve(` grep also matches `adminauth_test.go` and that is a false positive** —
+    it is `auth.Resolve`, session resolution, an unrelated method on an unrelated type. Candidate
+    set: the 13 test functions in `resolution_test.go` plus `TestEveryAdminMutationWritesAnAuditEntry`.
+ 2. **Pick a statement only the path under test can reach.** `resolution.go:633`, the
+    `w.auditor.Record` call: every non-`JobMoved` arm of the switch above it returns, so reaching 633
+    means the transition succeeded.
+ 3. **Run each candidate alone with coverage** — `go test ./internal/admin -run '^Name$'
+    -coverprofile=…` — and read the block spanning 633 for a count above zero.
+
+**The instrument validates itself**, which is what makes the answer trustworthy: the 404 test, the
+vocabulary test, the two queue-only tests, the support-403 test and
+`TestAJobThatHasMovedOnCannotBeResolved` all come back *not reached*, exactly as they must. Six of
+the fourteen reach it — the five above, plus the killing test itself, which reaches it because
+`Auditor.Record` checks its nil receiver **inside** the method, so the call executes.
 
 **Which layer holds it, stated for whoever comes next.** Not the database — no constraint can express
 "these two writes are one act", because `disputes` and `jobs` are different tables and PostgreSQL has
@@ -14834,8 +14863,26 @@ with the mutation inline.
 So the harness has a **false pass** as well as the known false failure. `Docs/11` §3's guard exits 1
 on a stale count line even when every check passed, and this exits 0 when the run never finished.
 **Read the "N checks passed across M sections" line; its absence is the signal.** Not fixed here —
-`scripts/verify-foundation.sh` is a shared file no lane edits — and reported for whoever owns it. One
-line in `cleanup` (`local status=$?; …; return $status`) would close it.
+`scripts/verify-foundation.sh` is a shared file no lane edits — and recorded for whoever owns it.
+
+**This entry first proposed a one-line fix — `local status=$?; …; return $status` in `cleanup` — and
+that fix was then measured and does not work.** It is recorded as tried rather than quietly replaced,
+because the reason it fails is the whole finding restated: **`$?` is already `0` at trap entry**, so
+the status is lost *before* `cleanup` runs and nothing that reads it can recover it. An `ERR` trap
+does not fire on a `set -u` abort either. Both probed directly rather than reasoned about.
+
+The status cannot be recovered, so the fix has to be a **completion sentinel**. Three added lines,
+verified across every path the harness can exit by:
+
+```
+VERIFY_FINISHED=0                                  # beside SERVER_PID=""
+  [[ "$VERIFY_FINISHED" == 1 ]] || exit 1          # as cleanup()'s last line
+VERIFY_FINISHED=1                                  # as the script's last line
+```
+
+`set -u` abort → **1**; `fail()`'s `exit 1` → 1; `set -e` abort → 1; the stale-count `exit 1` → 1;
+a clean run → **0**. So it closes the false pass without disturbing either intended non-zero path.
+**Proposed, not applied** — the file belongs to the owner.
 
 #### What it touched, and what it deliberately did not
 
