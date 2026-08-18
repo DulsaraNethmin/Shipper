@@ -231,66 +231,6 @@ func TestPathsBlockIsSortedAndComplete(t *testing.T) {
 	}
 }
 
-// exercisable reports whether this test can drive the route without knowing anything the
-// manifest does not tell it.
-//
-// Today that is every route. It will stop being every route the moment SHIP-30 adds a POST and
-// SHIP-44 adds authentication, and the deliberate choice here is to *name* what is skipped
-// rather than silently narrow the check — a test that quietly stops covering half the surface
-// reads exactly like one that covers all of it.
-func exercisable(r Route) (bool, string) {
-	switch {
-	case r.Method != http.MethodGet:
-		return false, "not a GET — needs a request body and an Idempotency-Key"
-	case r.Auth != Public:
-		return false, "needs a credential (SHIP-44)"
-	case strings.Contains(r.Pattern, "{") && !strings.Contains(r.Pattern, "{$}"):
-		return false, "has a path parameter, so it needs a fixture to address"
-	default:
-		return true, ""
-	}
-}
-
-// TestResponsesMatchTheContract drives the real router and validates what comes back.
-//
-// This is SHIP-17a's acceptance criterion: not that the YAML parses, but that the bytes the
-// handlers actually write satisfy the schemas published to clients. The schemas are
-// additionalProperties: false, so a handler that grows an undocumented field fails here.
-func TestResponsesMatchTheContract(t *testing.T) {
-	doc := loadContract(t)
-
-	router, err := gorillamux.NewRouter(doc)
-	if err != nil {
-		t.Fatalf("building a router from the contract: %v", err)
-	}
-
-	handler := testRouter()
-
-	var skipped []string
-	for _, r := range routes() {
-		if ok, why := exercisable(r); !ok {
-			skipped = append(skipped, r.Method+" "+r.fullPath()+" — "+why)
-			continue
-		}
-
-		t.Run(r.Method+" "+contractPathFor(r), func(t *testing.T) {
-			req := httptest.NewRequest(r.Method, serverBase+contractPathFor(r), nil)
-
-			rec := httptest.NewRecorder()
-			handler.ServeHTTP(rec, req)
-
-			validateAgainstContract(t, router, req, rec)
-		})
-	}
-
-	// Not silent: whatever this test could not reach is reported every run, so the gap is
-	// visible in CI output rather than discovered when something breaks.
-	if len(skipped) > 0 {
-		sort.Strings(skipped)
-		t.Logf("not exercised by this test (%d):\n  %s", len(skipped), strings.Join(skipped, "\n  "))
-	}
-}
-
 // TestErrorResponsesMatchTheContract checks the failures, which are the responses a client is
 // most likely to mishandle and the least likely to be exercised by a happy-path test.
 //
@@ -430,20 +370,23 @@ func validateAgainstContract(t *testing.T, router routers.Router, req *http.Requ
 // # Why this is written by hand when TestResponsesMatchTheContract exists
 //
 // That test is SHIP-17a's criterion and it does the real thing — it drives the router and validates
-// the bytes. Its exercisable() filter skips every non-GET, every authenticated route and every
-// parameterised path, which on today's manifest is **82 of 86 routes**: it reaches /health,
-// /v1/app/minimum-version, /v1/app/policy and /v1/{$}, and nothing else. It says so in its own log
-// output every run rather than narrowing silently, which is the right behaviour and is also why
-// nobody noticed that SHIP-159 added expires_at to the Go structs and to admin.yaml and not to this
-// fragment. The service accepted a field the contract forbade, and answered with one, for a wave.
+// the bytes. **When this was written it reached 4 of the 86 routes**, because its exercisable()
+// filter skipped every non-GET, every authenticated route and every parameterised path. It named
+// what it skipped in its own log output every run rather than narrowing silently, which was the
+// right behaviour and is also why nobody noticed that SHIP-159 added expires_at to the Go structs
+// and to admin.yaml and not to this fragment. The service accepted a field the contract forbade,
+// and answered with one, for a wave.
 //
-// Closing that hole generally is SHIP-17b. This is not that. This validates two literal bodies
-// against the two schemas that drifted, which is narrow, and it is deliberately narrow: the general
-// fix needs a fixture per authenticated route and that is a ticket, not a repair.
+// **SHIP-17b closed that hole**: exercisable() is gone, contract_surface_test.go drives the routes
+// it used to skip from a seeded world, and TestEveryRouteIsDrivenOrNamed fails the build on a route
+// that is neither driven nor written down. This test is kept rather than folded into that one
+// because it is the **regression pin** for the pair that actually drifted, and because it checks
+// something the surface sweep does not: a body the contract must *refuse*.
 //
-// **The bodies are literals rather than marshalled structs, and that is the limitation rather than a
+// **The bodies are literals rather than marshalled structs, and that is deliberate rather than a
 // shortcut.** profiles.documentSubmission and profiles.documentResponse are unexported, so no test
-// in this package can reflect over them — which is the same wall SHIP-17b has to get over.
+// in this package can reflect over them — and reflecting over them would be the wrong instrument
+// anyway, because the contract is a statement about bytes rather than about Go types.
 //
 // # The rejection cases are the part that matters
 //

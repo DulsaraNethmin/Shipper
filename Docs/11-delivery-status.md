@@ -16343,6 +16343,93 @@ A refused permission is the case the document names and the case where this is t
 |---|---|
 | SHIP-81d | `file_selector ^1.1.0` with its argument in `pubspec.yaml`, and `file_picker` added to the gallery guard's forbidden list by name; `features/profile/document_file_source.dart` — the `DocumentFileSource` port, the `UIDocumentPickerViewController`/`ACTION_OPEN_DOCUMENT` implementation restricted to the platform's accepted image types, and `DocumentFileUnavailable`; the fallback offered from both the refused panel and the working camera; `PermissionCopy.verificationCameraDeclined` rewritten to name it; 9 Dart tests, four of which walk all four kinds through a refused camera |
 
+### SHIP-17b took the contract check from 4 routes to 63, and the mutation that survived is the finding
+
+**The response check now drives 63 of the 86 routes on the manifest and names the other 23.** SHIP-17a's
+`exercisable()` reached **4** — `/health`, `/v1/app/minimum-version`, `/v1/app/policy` and `/v1/{$}` —
+because it skipped every non-GET, every authenticated route and every parameterised path. That filter
+is deleted. In its place is a fixture world in `cmd/api/contract_surface_test.go` holding a credential
+of each of the three kinds, the rows the parameterised paths address, and a request body per operation.
+
+**`TestEveryRouteIsDrivenOrNamed` is the part that will still be working in a year.** A route must be
+either driven by a fixture or carry a written exemption; a route in neither **fails the build**. The
+old arrangement put a new endpoint into an 82-line log message that nobody reads. It also refuses a
+*stale* exemption — an excuse outliving the route it excused is how a coverage figure stops meaning
+anything.
+
+#### Two vacuity traps, one predicted and one that had to be demonstrated
+
+**The predicted one: every one of the 86 operations declares a `500`.** So a route driven against an
+empty world answers 500, `openapi3filter.ValidateResponse` finds a declared response that matches, and
+the check passes having proved nothing. Every fixture therefore states the status it expects and **the
+status is asserted before the body is validated**. It is the argument
+`TestDocumentExpiryIsInTheContract` already makes about rejection cases, applied to the sweep.
+
+**The demonstrated one is better, because it was written into this file's own header and then walked
+into anyway.** The first `TestRequestBodiesAreClosed` sent a body consisting of one undeclared field
+and required the contract to refuse it. Mutation: open `additionalProperties` on the login request
+schema. **It survived.** A body of nothing but the undeclared field is also missing every required
+field, so it is refused whether the schema is closed or open — the test passed, for a reason that had
+nothing to do with what it claimed to check, on **every schema with a required field**, which is most
+of them.
+
+The rewrite is two assertions rather than one:
+
+1. **Structural** — every request schema states `additionalProperties: false` explicitly, read off the
+   declaration rather than inferred from a consequence.
+2. **Behavioural** — for every operation a fixture supplies a valid body for, that body **plus** one
+   undeclared field must be refused. Valid-but-for-the-extra-field is the only probe that isolates the
+   property.
+
+Re-run against the same mutation, **both halves fail independently**. 38 schemas are declared closed;
+20 are additionally proved closed against a valid body.
+
+**The general lesson, because it is not about this test.** A negative assertion needs a positive
+control: *"the contract refuses X"* is worth nothing until something establishes that the contract
+would have accepted X-without-the-defect. This repository has recorded the same shape three times now
+— a schema check fed only bodies it likes, a guard reachable only through another guard, and this.
+
+#### What the sweep found on the way
+
+- **A `Draft` bid with no timing renders `deliver_by` as `""`, which is not a `date-time`.** The first
+  fixture inserted exactly that row and `GET /v1/fleet/bids` failed the contract. **It is the
+  fixture's fault and it is worth keeping**: no client can create such a bid, because
+  `POST /v1/jobs/{id}/bids` requires both instants — but the *database* still permits the row, since
+  `ck_bids_offer_has_timing` was removed in `000501`. That is `Docs/09`'s **SHIP-87a**, and this is a
+  second argument for it that does not depend on anybody's judgement about tidiness. The fixture now
+  seeds the timing.
+- **A validly signed access token whose `device_sessions` row does not exist gets a 500 from
+  `POST /v1/notifications/device-tokens`.** The world now signs the customer in for real rather than
+  minting, so the fixture is honest; whether that 500 should be a typed error is not this ticket's
+  question, and it is recorded in §9.
+- **Recording a verification document against a well-formed key that names no stored object answers
+  500.** `internal/profiles` has `ErrDocumentRejected` for the neighbouring case — an object that
+  exists and is wrong. §9 has it.
+
+#### What this does not build
+
+**23 routes are named rather than driven, and each names the state that would lift it** rather than
+saying "needs a fixture". They fall into four groups, and the grouping is the useful part because each
+group lifts as a unit:
+
+- **Nine job-lifecycle routes** need the job past `Draft` — Open to bid on, Awarded to assign a driver,
+  under way to record a milestone or proof. One job-state builder lifts all nine.
+- **Three bid routes** act on a `Submitted` offer; the seeded bid is a `Draft`.
+- **Four driver routes** need an assignment row. The token is accepted and answers 404, which is the
+  seam working — there is no delivery behind it.
+- **Five administration routes** act on a subject that must exist first: a dispute, a verification id
+  no driven response returns, and a suspension requested by a *second* administrator, because the
+  two-person rule refuses the requester's own approval.
+- **Two one-time secrets** — the emailed verification token and the SMS OTP — plus **one** that needs
+  bytes in the object store.
+
+**None of these is blocked.** They are a fixture each, on top of a world that now exists, and the
+exemption list is the work item.
+
+| Surface | What |
+|---|---|
+| SHIP-17b | `cmd/api/contract_surface_test.go` — the fixture world (customer, provider, administrator and driver credentials; job, bid, two vehicles, a signed-in device and a signed upload key, seeded through the API wherever the API can do it), `contractCases` at 63 routes, `contractUnreached` at 23 with a reason each, `TestEveryRouteIsDrivenOrNamed`, `TestResponsesMatchTheContract` rewritten to drive the registry, and `TestRequestBodiesAreClosed` in its two-assertion form. `exercisable()` deleted from `contract_test.go`, and that file's history paragraph corrected to describe what replaced it |
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
