@@ -157,7 +157,52 @@ func (s *Service) SignIn(ctx context.Context, cmd SignInCommand) (TokenPair, err
 		}
 		return TokenPair{}, err
 	}
+
+	s.clearSignInAccount(ctx, buckets)
 	return pair, nil
+}
+
+// clearSignInAccount returns the account's allowance after a sign-in that worked (SHIP-183a).
+//
+// # What this is worth, quantified, because it is less than it looks
+//
+// The per-account bucket keys on the submitted address whether or not it has an account — it must,
+// or never being throttled would itself disclose that an address is unknown. So one caller can
+// spend somebody else's allowance, and Docs/11 §9 parked that on SHIP-183, which decided this
+// (Docs/12 §6).
+//
+// A success can only clear a bucket that still had a token in it, because [admitSignIn] runs first.
+// So the benefit is exactly this: the worst-case lockout falls from capacity × interval to
+// **interval** — ten minutes to two — because the victim needs one token rather than a full refill.
+// Under sustained attack they get a two-minute window every two minutes instead of a ten-minute
+// cycle. **Better, not fixed**, and the thing that does fix it — a per-account limit counting
+// distinct addresses — is declined on cost with a named trigger in Docs/12 §10.
+//
+// # The change that would destroy the limit, which is the tempting one
+//
+// **Do not move the admission check behind the password check** so that a correct password is
+// honoured even while throttled, on the reasoning that a victim would then never be locked out. It
+// makes every wrong guess answer 429 and the right one answer 200, which is an oracle: the attacker
+// guesses indefinitely and the split tells them the moment they have won. The bucket stays in
+// front, and that is what bounds what this function can be worth.
+//
+// # Only the account bucket
+//
+// Clearing the address bucket on success would hand a caller who holds one valid credential an
+// unlimited supply of attempts against every other account from that address — a reset lever on the
+// exact control that exists to bound working through a list. The address bucket is left alone.
+//
+// # Why a failure is logged rather than returned
+//
+// The sign-in has already succeeded and the caller is already holding tokens. Turning a Redis blip
+// into a failed sign-in would refuse somebody who presented the right password, which is a worse
+// answer than an allowance that empties on its own two minutes later.
+func (s *Service) clearSignInAccount(ctx context.Context, buckets signInLimits) {
+	if err := s.limiter.Clear(ctx, buckets.accountKey); err != nil {
+		httpx.LoggerFrom(ctx).LogAttrs(ctx, slog.LevelWarn,
+			"a successful sign-in could not clear its account rate limit",
+			slog.String("error", err.Error()))
+	}
 }
 
 // signIn is the body of a sign-in, inside the caller's transaction.

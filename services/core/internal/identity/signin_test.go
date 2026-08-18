@@ -535,6 +535,110 @@ func throttledAfter(t *testing.T, svc *Service, cmd SignInCommand, limit int) in
 	return limit
 }
 
+// TestASuccessfulSignInClearsTheAccountBucket is Docs/12 §6's decision (SHIP-183a).
+//
+// # What it is worth, and why the test is shaped this way
+//
+// The account bucket keys on the submitted address whether or not it has an account — it must, or
+// never being throttled would itself disclose that an address is unknown — so a caller can spend
+// somebody else's allowance. Clearing on success does not fix that. What it does is bound it: the
+// victim needs **one token** to get back in rather than a full refill, so the worst-case lockout
+// falls from capacity × interval to interval, ten minutes to two.
+//
+// One token left is therefore the only state a success can start from, and it is the state this
+// test sets up: spend capacity − 1, sign in, and require the *whole* allowance back rather than
+// the single token the sign-in was admitted on. Waiting for a real refill would be the other way
+// to reach that state and would cost two minutes of wall clock per run.
+func TestASuccessfulSignInClearsTheAccountBucket(t *testing.T) {
+	svc, _, _ := signInService(t, testProfile)
+
+	// Down to one token. A successful sign-in charges nothing, so without the clear this is
+	// also the state the assertion at the end would find.
+	for range signInAccountCapacity - 1 {
+		if errors.As(failSignIn(t, svc, validSignIn()), new(*ThrottledError)) {
+			t.Fatal("throttled before the capacity was spent")
+		}
+	}
+
+	if _, err := svc.SignIn(t.Context(), validSignIn()); err != nil {
+		t.Fatalf("signing in with one token left: %v", err)
+	}
+
+	if admitted := throttledAfter(t, svc, validSignIn(), signInAccountCapacity+2); admitted != signInAccountCapacity {
+		t.Errorf("%d failures admitted after a successful sign-in, want the full capacity of %d. "+
+			"A success returns the whole allowance, which is what takes the worst-case lockout "+
+			"from capacity × interval down to interval", admitted, signInAccountCapacity)
+	}
+}
+
+// TestAnEmptyAccountBucketRefusesEvenTheRightPassword guards the change that would destroy the
+// limit, and it is the reason the clear above is worth so little.
+//
+// The tempting next step is to honour a correct password even while throttled, so that a victim is
+// never locked out at all. It makes every wrong guess answer 429 and the right one answer 200 —
+// which is an oracle: the attacker guesses indefinitely and the split tells them the moment they
+// have won. The admission check stays in front of the password check, and this is what says so.
+func TestAnEmptyAccountBucketRefusesEvenTheRightPassword(t *testing.T) {
+	svc, _, _ := signInService(t, testProfile)
+
+	if admitted := throttledAfter(t, svc, validSignIn(), signInAccountCapacity+2); admitted != signInAccountCapacity {
+		t.Fatalf("%d failures admitted, want %d", admitted, signInAccountCapacity)
+	}
+
+	_, err := svc.SignIn(t.Context(), validSignIn())
+	if !errors.As(err, new(*ThrottledError)) {
+		t.Fatalf("an empty bucket admitted the real password and answered %v. The 429/200 split "+
+			"that produces is an oracle an attacker guesses against indefinitely", err)
+	}
+}
+
+// TestASuccessfulSignInLeavesTheAddressBucketAlone is the other half of the decision, and it is
+// the half that would be a defect rather than a missing feature.
+//
+// The address bucket exists to bound one caller working through a list of accounts. Clearing it on
+// success would hand anybody holding **one** valid credential an unlimited supply of attempts
+// against every other account from that address — a reset lever on the exact control it is there
+// to be.
+func TestASuccessfulSignInLeavesTheAddressBucketAlone(t *testing.T) {
+	svc, _, _ := signInService(t, testProfile)
+
+	// Spend the address bucket down to one token without touching this account's, by failing
+	// against addresses that have no account: each charges its own account bucket, and all of
+	// them charge the one address bucket they share.
+	walk := func(from int, limit int) int {
+		t.Helper()
+
+		spent := 0
+		for i := range limit {
+			cmd := validSignIn()
+			cmd.Email = fmt.Sprintf("stranger-%d@example.com", from+i)
+			cmd.Password = "not-the-password-either"
+			if errors.As(failSignIn(t, svc, cmd), new(*ThrottledError)) {
+				return spent
+			}
+			spent++
+		}
+		return spent
+	}
+
+	if spent := walk(0, signInAddressCapacity-1); spent != signInAddressCapacity-1 {
+		t.Fatalf("%d strangers were admitted, want %d", spent, signInAddressCapacity-1)
+	}
+
+	// A success from the same address, admitted on the one token left.
+	if _, err := svc.SignIn(t.Context(), validSignIn()); err != nil {
+		t.Fatalf("signing in: %v", err)
+	}
+
+	// The walk must resume where it stopped rather than starting again.
+	if resumed := walk(signInAddressCapacity, signInAddressCapacity); resumed > 1 {
+		t.Errorf("%d further attempts were admitted from the same address after a successful "+
+			"sign-in, want at most the one token that was left. A success has reset the address "+
+			"bucket, which gives anybody holding one valid credential an unlimited walk through "+
+			"every other account from that address", resumed)
+	}
+}
+
 // TestRepeatedFailuresAreThrottledPerAccount is the first half of SHIP-47's criterion.
 func TestRepeatedFailuresAreThrottledPerAccount(t *testing.T) {
 	svc, _, _ := signInService(t, testProfile)
