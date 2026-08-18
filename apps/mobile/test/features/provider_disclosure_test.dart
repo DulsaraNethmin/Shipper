@@ -43,6 +43,7 @@ import 'package:shipper/features/bidding/bid.dart';
 import 'package:shipper/features/bidding/bid_status.dart';
 import 'package:shipper/features/jobs/job_status.dart';
 import 'package:shipper/features/jobs/open_job.dart';
+import 'package:shipper/shared/formatting/dates.dart';
 
 import '../core/auth/session_fixtures.dart';
 import '../support/disclosure.dart';
@@ -50,6 +51,12 @@ import 'bidding/fake_bidding_repository.dart';
 import 'identity/fake_identity_repository.dart';
 import 'identity/signup_app.dart';
 import 'jobs/fake_open_jobs_repository.dart';
+
+/// The instant `anOpenJob` closes bidding at, and it must stay equal to that fake's default —
+/// `fake_open_jobs_repository.dart`'s `expiresAt`. Held here so the expectation above is computed
+/// from the same instant the fixture renders rather than from a transcription of one machine's
+/// clock.
+const _biddingClosesAt = '2026-08-25T03:30:00.000Z';
 
 const _sofa = '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0';
 const _pallet = '0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1';
@@ -121,7 +128,13 @@ void main() {
       // thirteen Dart tests that passed while asserting over empty lists.
       expect(perceived, contains('Offer to carry this job'));
       expect(perceived, contains('Newtown NSW 2042'));
-      expect(perceived, contains('Bidding closes 25 Aug 2026, 9:00 am'));
+      // **Derived, not written down.** `dayFirstDateTime` renders in the device's zone
+      // (`dates.dart` calls `toLocal()`), so a literal here asserts the timezone of whichever
+      // machine last ran the suite. This one was written as '9:00 am', which is 03:30Z seen from
+      // UTC+05:30, and it passed locally and failed on CI — where the runner is UTC and the same
+      // instant reads '3:30 am'. The closed-world shapes below were never affected: they match
+      // the clock with a regex. Only the anti-vacuity assertion hard-coded a rendering.
+      expect(perceived, contains('Bidding closes ${dayFirstDateTime(_biddingClosesAt)}'));
 
       expectOnlyRecordedStrings(
         perceived,
