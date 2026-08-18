@@ -14944,7 +14944,12 @@ VERIFY_FINISHED=1                                  # as the script's last line
 
 `set -u` abort → **1**; `fail()`'s `exit 1` → 1; `set -e` abort → 1; the stale-count `exit 1` → 1;
 a clean run → **0**. So it closes the false pass without disturbing either intended non-zero path.
-**Proposed, not applied** — the file belongs to the owner.
+**Applied at wave 15's opening**, on `ship-15ae-verify-false-pass`, by the owner's decision and
+before any wave-15 lane branch was cut — so every lane of that wave gates on a harness that cannot
+report success without running. One correction to the paragraph above came out of re-measuring it
+first: **`set -e` is required for the abort to be swallowed.** With `set -uo pipefail` and no `-e`
+the same unbound-variable abort exits 1 correctly, so the flag to reach for is not `-u`. The script
+carries `set -euo pipefail`, which is why it was live.
 
 #### What it touched, and what it deliberately did not
 
@@ -18829,11 +18834,20 @@ checks, whatever it exited with. `Docs/11` §3's count line and every wave plan'
 already quoted from that line rather than from the status, so the habit is half-established; what was
 missing is anybody saying that the status is the unreliable half.
 
-**Not fixed here, deliberately.** `scripts/verify-foundation.sh` is on `CLAUDE.md`'s shared-file list
-and this is the owner's call. The obvious repairs — capturing `$?` at the head of `cleanup` and
-re-exiting with it, or making the last statement of `cleanup` not swallow the status — are one line
-each and both change the exit behaviour of the gate every branch is measured by, which is not
-something a reconciliation pass may alter under four concurrent lanes.
+**Not fixed in wave 14, deliberately** — `scripts/verify-foundation.sh` is on `CLAUDE.md`'s
+shared-file list, it was the owner's call, and changing the exit behaviour of the gate every branch
+is measured by is not something a reconciliation pass may do under four concurrent lanes. **It was
+fixed at wave 15's opening instead**, on `ship-15ae-verify-false-pass`, with the owner's decision and
+with no lane branch yet cut — which is the only moment in a wave when that file can be changed
+without moving the ground under somebody's gate.
+
+**Both obvious repairs were measured and both are wrong**, which is the part worth keeping. Capturing
+`$?` at the head of `cleanup` and re-exiting with it **cannot work**: `$?` is already 0 at trap entry,
+probed directly. An `ERR` trap does not fire on a `set -u` abort either. The status is destroyed
+before any handler runs, so the only thing left is to record positively that the end was reached —
+a completion sentinel. Proven on the real script rather than on a model of it: the same
+unbound-variable abort injected into a copy of the pre-fix file exits **0**, and into a copy of the
+post-fix file exits **1**.
 
 ### `Docs/09`'s SHIP-81b bundles a platform half and a client half, and closing it would close M3 falsely
 
