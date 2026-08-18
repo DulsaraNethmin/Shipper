@@ -186,13 +186,22 @@ type adminMutation struct {
 	run func(t *testing.T, f auditFixture, ready func()) (actor, target uuid.UUID)
 }
 
-// adminMutations is every state-changing administrative action the service serves today.
+// adminMutations is every administrative action this service records an audit entry for.
 //
 // One row per mutating route in `cmd/api/routes_golden.txt` under `/v1/admin/`, plus sign-in, which
 // is `Public` and has to be. The pairing between this list and the served surface is checked from
 // the other side by TestEveryMutatingAdminRouteIsAudited in cmd/api, which is the only place the
 // route table is visible — so the count is checked rather than stated, and this comment deliberately
 // no longer carries a number. It said "six" while the list held nine.
+//
+// **It said "every state-changing action" while the list held one read, which is why this sentence
+// is here.** SHIP-155's document viewer is a GET that writes an audit entry, because its *Done
+// when* asks for one by name and because a signed URL to somebody's identity documents cannot be
+// revoked — [AuditActionVerificationEvidenceViewed] argues it. It is deliberately **not** in
+// cmd/api's `auditedAdminMutations`, which is the mutating half of the served surface and whose
+// reverse check would fail on a read; `auditedAdminReads` is the tripwire on that side. So the
+// pairing this file enforces is with the *catalogue* rather than with the mutating routes: an action
+// declared in [AuditActions] with nothing here exercising it fails, whichever verb writes it.
 func adminMutations() []adminMutation {
 	return []adminMutation{
 		{
@@ -483,6 +492,49 @@ func adminMutations() []adminMutation {
 			},
 		},
 		{
+			name:       "opening a provider's verification evidence",
+			action:     AuditActionVerificationEvidenceViewed,
+			targetType: AuditTargetUser,
+			run: func(t *testing.T, f auditFixture, ready func()) (uuid.UUID, uuid.UUID) {
+				t.Helper()
+
+				// **The one read in this table.** Every other row changes something; this one
+				// hands somebody a short-lived link to a photograph of another person's driver
+				// licence, and nothing can revoke one once it is issued. The entry is the only
+				// durable record that it happened.
+				//
+				// A `support` administrator, because every role holds `verifications.read` —
+				// Docs/01 §4.6 gives "review provider verification status" to the
+				// least-privileged role, and the access entry is what makes that defensible.
+				support, token := f.signedIn(t, "evidence-viewer@example.com", RoleSupport, "10.0.59.1")
+
+				// A provider with an empty file, which is deliberate: opening a file is the
+				// access whether or not there is anything in it, and a fixture that had to
+				// upload something would be testing the reader rather than the record.
+				// evidence_test.go drives the populated case.
+				providerID := newAccount(t, f.pool, "evidence-subject@example.com", "+61400590", "provider")
+				ready()
+
+				req := httptest.NewRequest(http.MethodGet,
+					"/v1/admin/verifications/"+providerID.String()+"/documents", nil)
+				req.SetPathValue("id", providerID.String())
+				req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+
+				rec := httptest.NewRecorder()
+				RequireAdmin(f.auth)(f.handler.VerificationEvidence()).ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("opening a provider's evidence: status = %d, want 200 (%s)",
+						rec.Code, rec.Body)
+				}
+
+				// The entry names the **provider's account**, on
+				// AuditActionVerificationDecided's reading: a support query asking
+				// "everything that happened to this account" should return who looked at
+				// their documents beside the decisions taken about them.
+				return support.ID, providerID
+			},
+		},
+		{
 			name:       "resolving a dispute",
 			action:     AuditActionDisputeResolved,
 			targetType: AuditTargetJob,
@@ -659,6 +711,7 @@ func TestEveryAuditActionConstantIsInTheCatalogue(t *testing.T) {
 		AuditActionUserSuspensionRequested,
 		AuditActionUserSuspensionApproved,
 		AuditActionVerificationDecided,
+		AuditActionVerificationEvidenceViewed,
 		AuditActionDisputeResolved,
 	}
 

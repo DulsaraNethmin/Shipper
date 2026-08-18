@@ -82,6 +82,11 @@ var auditedAdminMutations = map[string]admin.AuditAction{
 	// `GET /v1/admin/verifications` is not here and does not need to be: it is a read, and
 	// Docs/01 §5.1 asks for audit logs of **privileged actions**. An entry per queue load would
 	// bury the decisions in the reads.
+	//
+	// `GET /v1/admin/verifications/{id}/documents` is a read that *does* write an entry
+	// (SHIP-155), and it is in [auditedAdminReads] rather than here — this table is the mutating
+	// half of the surface and its reverse check would report a read listed here as unserved. The
+	// two tables are checked against each other for a shared action.
 	"POST /v1/admin/verifications/{id}/decision": admin.AuditActionVerificationDecided,
 
 	// SHIP-164. One action for all five of Docs/04 §7's outcomes, which is what this table's
@@ -101,6 +106,86 @@ var auditedAdminMutations = map[string]admin.AuditAction{
 	// [administrativeMutation]. Intake is a party reporting a problem with their own delivery;
 	// this is an administrator deciding what happens to it.
 	"POST /v1/admin/disputes/{id}/resolution": admin.AuditActionDisputeResolved,
+}
+
+// auditedAdminReads is every administrative *read* that writes an audit entry, with the entry.
+//
+// **There is one, and the list exists so that there goes on being a reason for each.** Docs/01 §5.1
+// asks for audit logs of privileged actions; reading a queue or a history is not one, and an entry
+// per read would bury the actions in the reads. `admin.AuditActions`' own header states that rule
+// and states the exception, and both halves matter — a reader who takes "mutations only" as the
+// whole rule will delete the exception, and a reader who takes the exception as permission will
+// audit every GET the console serves.
+//
+// It is a **separate table from [auditedAdminMutations] rather than a row in it**, and that is
+// forced rather than tidy: [TestEveryMutatingAdminRouteIsAudited] checks its table in both
+// directions, and its reverse direction only ever marks *mutating* routes as served — so a read
+// listed there would fail as "listed as an audited administrative mutation and is not served", on a
+// tree where nothing is wrong.
+var auditedAdminReads = map[string]admin.AuditAction{
+	// SHIP-155. Docs/04 §3's document images, rendered for the administrator who reviews them
+	// "by eye for obvious validity".
+	//
+	// **What makes this different from every other read here is what the response contains.**
+	// `GET /v1/admin/verifications` discloses that somebody is waiting; this hands the caller
+	// short-lived signed URLs to photographs of that person's driver licence, vehicle
+	// registration and insurance certificate. Nothing revokes a pre-signed URL, so the entry
+	// written on this request is the only durable record that a particular administrator was
+	// given those links — and Docs/04 §9 requires private storage of verification evidence as an
+	// internal control, which a store private to everyone except an unlogged console is not.
+	//
+	// The entry is written in the transaction that performs the read, so a viewer whose entry
+	// cannot be written renders nothing. `admin.Evidence.For` records the argument and the
+	// domain's own suite takes the branch.
+	"GET /v1/admin/verifications/{id}/documents": admin.AuditActionVerificationEvidenceViewed,
+}
+
+// TestEveryAuditedAdminReadIsServedAndDistinct.
+//
+// The same pairing [TestEveryMutatingAdminRouteIsAudited] puts on the mutating half, in the one
+// direction that is checkable here: a read listed above must be on the served surface, must declare
+// an action the catalogue knows, and must not share that action with anything else.
+//
+// **The other direction — "no unlisted administrative read writes an entry" — is not checkable from
+// the route table**, and pretending otherwise would be worse than saying so: a route's declaration
+// carries its method, its path and its auth class, and nothing about whether the handler behind it
+// writes. What closes that side is `admin.AuditActions` paired with the domain's own
+// `adminMutations` table, which drives every handler that writes an entry and reads the row back.
+func TestEveryAuditedAdminReadIsServedAndDistinct(t *testing.T) {
+	served := map[string]bool{}
+	for _, r := range routes() {
+		if r.mutating() {
+			continue
+		}
+		served[r.Method+" "+r.fullPath()] = true
+	}
+
+	seen := map[admin.AuditAction]string{}
+	for key, action := range auditedAdminReads {
+		if !served[key] {
+			t.Errorf("%s is listed as an audited administrative read and is not served as a "+
+				"read.\nRemove the row, or restore the route.", key)
+		}
+		if !action.Valid() {
+			t.Errorf("%s is recorded as writing %q, which is not in admin.AuditActions",
+				key, action)
+		}
+		if first, ok := seen[action]; ok {
+			t.Errorf("%s and %s both write %q; a reader cannot tell which happened", first, key, action)
+		}
+		seen[action] = key
+
+		if mutation, ok := auditedAdminMutations[key]; ok {
+			t.Errorf("%s is listed as both an audited read and an audited mutation (%q); it is "+
+				"one or the other", key, mutation)
+		}
+	}
+
+	for key, action := range auditedAdminMutations {
+		if read, ok := seen[action]; ok {
+			t.Errorf("%s and %s both write %q; one action per route", read, key, action)
+		}
+	}
 }
 
 // administrativeMutation reports whether this route is a state change an administrator makes.

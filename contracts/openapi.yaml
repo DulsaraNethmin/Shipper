@@ -200,6 +200,8 @@ paths:
     $ref: './paths/admin.yaml#/AdminCancellationQueue'
   /v1/admin/moderation/exceptions:
     $ref: './paths/admin.yaml#/AdminExceptionQueue'
+  /v1/admin/moderation/expiring-documents:
+    $ref: './paths/admin.yaml#/AdminExpiringDocuments'
   /v1/admin/notes:
     $ref: './paths/admin.yaml#/AdminNotes'
   /v1/admin/sessions:
@@ -220,6 +222,8 @@ paths:
     $ref: './paths/admin.yaml#/AdminVerifications'
   /v1/admin/verifications/{id}/decision:
     $ref: './paths/admin.yaml#/AdminVerificationDecision'
+  /v1/admin/verifications/{id}/documents:
+    $ref: './paths/admin.yaml#/AdminVerificationEvidence'
   /v1/app/minimum-version:
     $ref: './paths/app.yaml#/MinimumVersion'
   /v1/app/policy:

@@ -68,6 +68,8 @@ type Handler struct {
 	notes         *Notes
 	suspensions   *Suspensions
 	verifications *Verifications
+	evidence      *Evidence
+	expiry        *ExpiryQueue
 	disputes      *DisputeWorkflow
 	pool          *pgxpool.Pool
 	log           *slog.Logger
@@ -118,6 +120,19 @@ type HandlerServices struct {
 	// Verifications is Docs/04 §5's first queue and Docs/04 §6's decision (SHIP-153,
 	// SHIP-154).
 	Verifications *Verifications
+
+	// Evidence is Docs/04 §3's document images and the record of who was shown them
+	// (SHIP-155).
+	//
+	// **Beside [Verifications] rather than folded into it**, and the split is the one
+	// `internal/profiles` already makes between moving a state and reaching an object: a
+	// console that can open somebody's licence must not thereby be able to decide their
+	// standing, and the reason it cannot is that they are two services taking two ports.
+	Evidence *Evidence
+
+	// Expiry is Docs/04 §5's seventh queue — provider documents that have lapsed or are
+	// about to (SHIP-159).
+	Expiry *ExpiryQueue
 
 	// DisputeWorkflow is Docs/04 §7's investigation and outcome stages (SHIP-164).
 	//
@@ -202,6 +217,21 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// provider and no way to make one.
 		return nil, errors.New("admin: a handler needs the verification console")
 	}
+	if s.Evidence == nil {
+		// SHIP-155. The same argument once more, and here it guards a *record* rather than an
+		// endpoint: a nil discovered at the first request is an administrator opening a
+		// photograph of somebody's driver licence and the console answering 500 — or, if this
+		// were softened later, showing it with nothing written down. Refused at startup,
+		// where the cause is visible.
+		return nil, errors.New("admin: a handler needs the verification document viewer")
+	}
+	if s.Expiry == nil {
+		// SHIP-159. The same argument once more, and here it guards a queue of things running
+		// out: a nil discovered at the first request is a console reporting that nobody's
+		// paperwork is expiring, which is indistinguishable from a supply side whose paperwork
+		// is all current and silent for exactly as long as nobody checks.
+		return nil, errors.New("admin: a handler needs the document expiry queue")
+	}
 	if s.DisputeWorkflow == nil {
 		// SHIP-164. The same argument once more, and here it guards the endpoints that unfreeze
 		// a job: a nil discovered at the first request is a delivery frozen by a complaint with
@@ -223,6 +253,8 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		notes:         s.Notes,
 		suspensions:   s.Suspensions,
 		verifications: s.Verifications,
+		evidence:      s.Evidence,
+		expiry:        s.Expiry,
 		disputes:      s.DisputeWorkflow,
 		pool:          pool,
 		log:           log,
@@ -2995,6 +3027,324 @@ func decodeVerificationCursor(raw string) (VerificationCursor, error) {
 	}
 
 	return VerificationCursor{SubmittedAt: submittedAt, ProviderID: providerID}, nil
+}
+
+// --- SHIP-155: the document viewer for private evidence ------------------------------------------
+
+// evidenceDocumentResponse is one of Docs/04 §3's four images, with permission to look at it.
+//
+// # There is no object key here, and that is the same narrowing the provider's own endpoint makes
+//
+// `internal/profiles`' response shape declines one and says why: the key is a durable handle into
+// the bucket holding identity documents, a client has no operation that takes one, and every read is
+// answered with a short-lived credential instead. Sending a permanent handle beside a temporary one
+// would be handing out the thing the credential exists to make temporary. An administrator's console
+// has less business with one than a provider's app does, not more.
+//
+// # The download URL is required rather than omitted-when-empty
+//
+// The provider's shape makes it `omitempty`, because that struct serves the 201 that records a
+// submission as well as the reads. This one serves a read and nothing else, so an entry with no URL
+// is a defect rather than a state — and a field that disappears when it is empty is one a console
+// cannot tell from a field the platform stopped sending.
+type evidenceDocumentResponse struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
+
+	// ContentType and ContentLength are what the object store reported when the platform asked,
+	// after the upload — not what the client said it would send.
+	ContentType   string `json:"content_type"`
+	ContentLength int64  `json:"content_length"`
+
+	// ETag is the store's entity tag for the bytes at the moment they became evidence.
+	//
+	// Here so a viewer can tell that it is looking at the recorded bytes: a signed GET returns
+	// the store's current tag in its own response header, and a mismatch means the object was
+	// overwritten inside a pre-signed PUT's window. `000201` stores this column for exactly this
+	// endpoint and [EvidenceDocument.ETag] records why the platform does not do the comparison
+	// itself.
+	ETag string `json:"etag"`
+
+	SubmittedAt time.Time `json:"submitted_at"`
+
+	// DownloadURL is a freshly signed URL to the image, and DownloadExpiresAt is when it stops
+	// working. Nothing stores either — see [ProviderEvidence].
+	DownloadURL       string    `json:"download_url"`
+	DownloadExpiresAt time.Time `json:"download_expires_at"`
+}
+
+func evidenceDocumentFrom(d EvidenceDocument) evidenceDocumentResponse {
+	return evidenceDocumentResponse{
+		ID:                d.ID.String(),
+		Kind:              d.Kind,
+		ContentType:       d.ContentType,
+		ContentLength:     d.ContentLength,
+		ETag:              d.ETag,
+		SubmittedAt:       d.SubmittedAt,
+		DownloadURL:       d.URL,
+		DownloadExpiresAt: d.ExpiresAt,
+	}
+}
+
+// VerificationEvidence handles GET /v1/admin/verifications/{id}/documents (SHIP-155).
+//
+// Docs/04 §3's "document image collected and reviewed by an administrator", from the reviewer's
+// side. It is the screen between SHIP-153's queue and SHIP-154's decision, and until this endpoint
+// existed a reviewer had a row, a state and a reason and nothing to look at.
+//
+// # The permission is `verifications.read` rather than a narrower one, and that was a choice
+//
+// A `verifications.evidence` held by `moderator` and `owner` alone was the alternative, and it is
+// not obviously wrong: an identity document is the most sensitive object this platform holds, and
+// Docs/04 §9's controls open with least privilege. It is refused for two reasons. **Docs/01 §4.6
+// gives "review provider verification status" to support**, and Docs/04 §3 defines that review as
+// looking at the images — so a support administrator who could see the queue and not the evidence
+// could not perform the review the document assigns them. And Docs/04 §9's control over evidence is
+// *"private storage of verification evidence"*, which is a statement about the bucket and the
+// signed-URL lifetime rather than about which console role may look.
+//
+// **The compensating control is the access entry, and it is why a broad read permission is
+// defensible here at all**: every one of these reads names the administrator who made it, in a table
+// nobody can rewrite. A narrower permission would move the question from "who looked" to "who could
+// have looked", and only the first is answerable afterwards.
+//
+// # The path identifier is the provider's account, not a document's
+//
+// The same reading `POST /v1/admin/verifications/{id}/decision` takes: there is one verification
+// record per provider and `provider_verifications.provider_id` is its primary key, so a provider's
+// file is addressed by the provider. A document identifier in the path would make the console fetch
+// a list to learn what to ask for, and the list is this.
+//
+// # No pagination, deliberately
+//
+// Four kinds, each re-photographed a handful of times at most; `profiles.postgresStore.documentsFor`
+// records the same bound for the provider's own read. The collection envelope is here anyway,
+// because a client tells a collection from a single resource by its shape rather than by knowing
+// which endpoint it called.
+func (h *Handler) VerificationEvidence() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		grant, err := h.permitted(r, PermissionVerificationsRead)
+		if err != nil {
+			return err
+		}
+
+		providerID, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			return httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+				"The provider id in the path is not a valid identifier.").WithCause(err)
+		}
+
+		documents, err := h.evidence.For(r.Context(), providerID, grant.Administrator.ID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		// Logged as well as audited, and the two are not the same record. This line is
+		// bound to the request id (SHIP-14) and ages out with the logs; the `audit_log`
+		// entry is the durable one Docs/04 §9 requires and outlives them. **No URL is
+		// logged, in either** — it is the credential.
+		httpx.LoggerFrom(r.Context()).Info("an administrator opened a provider's verification evidence",
+			slog.String("administrator_id", grant.Administrator.ID.String()),
+			slog.String("provider_id", providerID.String()),
+			slog.Int("document_count", len(documents)))
+
+		out := make([]evidenceDocumentResponse, 0, len(documents))
+		for _, d := range documents {
+			out = append(out, evidenceDocumentFrom(d))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, ""))
+		return nil
+	})
+}
+
+// --- SHIP-159: Docs/04 §5's expiry queue ---------------------------------------------------------
+
+// expiringDocumentResponse is one current document that has lapsed or is about to.
+//
+// **No download URL and no object key.** This is a list of dates, not of images: a reviewer who
+// wants to look opens SHIP-155's viewer, which writes an access entry. A credential here would make
+// every load of this queue an unlogged read of everybody's identity documents at once.
+type expiringDocumentResponse struct {
+	DocumentID string `json:"document_id"`
+	ProviderID string `json:"provider_id"`
+
+	// Name is what the account holder is called (SHIP-30a). Empty for an account created before
+	// `000006` — a name cannot be backfilled, so the console shows the absence.
+	Name  string `json:"name"`
+	Email string `json:"email"`
+	Phone string `json:"phone"`
+
+	// VerificationState is where the provider stands, one of Docs/04 §4's five.
+	//
+	// Carried and **not** filtered on: a suspended provider's lapsed insurance is not worth
+	// chasing and a verified provider's is urgent, and which of the five deserves attention is a
+	// triage decision an administrator makes rather than one this platform makes for them.
+	VerificationState string `json:"verification_state"`
+
+	Kind string `json:"kind"`
+
+	// ExpiresAt is the date the document itself states, and Expired is whether it has passed.
+	//
+	// Both, rather than leaving the console to compare: the boundary is decided once for the
+	// whole page against the platform's clock, so a page cannot be rendered with the line moving
+	// through it. It is also the difference between the two halves of Docs/04 §5's queue — the
+	// expired ones and the expiring ones — in one field a client can group on.
+	ExpiresAt time.Time `json:"expires_at"`
+	Expired   bool      `json:"expired"`
+
+	SubmittedAt time.Time `json:"submitted_at"`
+}
+
+func expiringDocumentFrom(e ExpiringDocumentEntry) expiringDocumentResponse {
+	return expiringDocumentResponse{
+		DocumentID:        e.DocumentID.String(),
+		ProviderID:        e.ProviderID.String(),
+		Name:              e.Name,
+		Email:             e.Email,
+		Phone:             e.Phone,
+		VerificationState: e.VerificationState,
+		Kind:              e.Kind,
+		ExpiresAt:         e.ExpiresAt,
+		Expired:           e.Expired,
+		SubmittedAt:       e.SubmittedAt,
+	}
+}
+
+// ExpiringDocumentsQueue handles GET /v1/admin/moderation/expiring-documents (SHIP-159).
+//
+// Docs/04 §5's **seventh** queue — "expiring or expired provider verification records" — and the
+// last of the seven to be built. Under `/admin/moderation/` beside the delivery exceptions and the
+// post-award cancellations, on `moderation.read`, which permissions.go already names SHIP-159 for.
+//
+// # What the `lead_times` field is for, and why an empty page is ambiguous without it
+//
+// Docs/04 §3 gives "how often each must be renewed" to legal and insurance advisers (Track-X row
+// X-4) and it is unanswered. The lead time that makes a document *expiring* rather than merely
+// *expired* is therefore configuration with no default — and with none configured, the "expiring"
+// half of this queue is empty by construction.
+//
+// **That empty half means two different things and only one of them is a problem.** "Nothing is due"
+// and "nobody has configured a lead time for insurance certificates yet" render identically, and
+// only the second is a reason to go and ask legal. So the response says which horizons the platform
+// used, in seconds, keyed by document kind — a kind absent from that object has no configured lead
+// time and surfaces only once it has actually lapsed.
+//
+// # No filter, unlike the verification queue
+//
+// [VerificationQuery] requires a `state` because every provider has a record and "no state" would be
+// the whole supply side wearing a queue's name. This queue is already narrow: only current documents
+// that state an expiry and have reached their horizon. There is no unfiltered answer to refuse.
+func (h *Handler) ExpiringDocumentsQueue() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionModerationRead); err != nil {
+			return err
+		}
+
+		query, err := documentExpiryQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so that "is there another page" is answered by the rows
+		// rather than by a second COUNT — the same arrangement every other queue here uses.
+		query.Limit++
+
+		entries, err := h.expiry.Due(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(entries) == query.Limit {
+			last := entries[len(entries)-2]
+			next = pagination.Cursor{
+				timestamp(last.ExpiresAt),
+				last.DocumentID.String(),
+			}.Encode()
+			entries = entries[:len(entries)-1]
+		}
+
+		out := make([]expiringDocumentResponse, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, expiringDocumentFrom(e))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, expiringDocumentsPage{
+			Page:      pagination.NewPage(out, next),
+			LeadTimes: leadTimeSeconds(h.expiry.LeadTimes()),
+		})
+		return nil
+	})
+}
+
+// expiringDocumentsPage is the collection envelope with the horizons that produced it.
+//
+// The envelope is embedded rather than copied, so `data`, `next_cursor` and `has_more` keep the
+// shape Docs/10 §4.5 gives every collection and a client's paging code is unchanged. The extra field
+// is beside them because it describes the *query*, not an entry — repeating it on every row would be
+// the same fact once per document.
+type expiringDocumentsPage struct {
+	pagination.Page[expiringDocumentResponse]
+
+	// LeadTimes is how far ahead of its expiry each kind of document surfaces, in seconds.
+	//
+	// Seconds rather than a Go duration string, because `720h` is a Go spelling and a contract
+	// should not oblige a TypeScript console to parse one. Never null: an empty object is the
+	// honest report that no lead time is configured, and it is the shipping default.
+	LeadTimes map[string]int64 `json:"lead_times"`
+}
+
+// leadTimeSeconds renders the configured horizons for the wire.
+func leadTimeSeconds(lead map[string]time.Duration) map[string]int64 {
+	out := make(map[string]int64, len(lead))
+	for kind, ahead := range lead {
+		out[kind] = int64(ahead / time.Second)
+	}
+	return out
+}
+
+// documentExpiryQueryFrom reads the page parameters.
+func documentExpiryQueryFrom(r *http.Request) (DocumentExpiryQuery, error) {
+	values := r.URL.Query()
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return DocumentExpiryQuery{}, err
+	}
+
+	after, err := decodeDocumentExpiryCursor(values.Get("cursor"))
+	if err != nil {
+		return DocumentExpiryQuery{}, err
+	}
+
+	return DocumentExpiryQuery{Limit: limit, After: after}, nil
+}
+
+// decodeDocumentExpiryCursor reads the two fields the queue's ordering is total on.
+func decodeDocumentExpiryCursor(raw string) (DocumentExpiryCursor, error) {
+	if raw == "" {
+		return DocumentExpiryCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return DocumentExpiryCursor{}, err
+	}
+
+	expiresAt, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return DocumentExpiryCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	documentID, err := uuid.Parse(fields[1])
+	if err != nil {
+		return DocumentExpiryCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return DocumentExpiryCursor{ExpiresAt: expiresAt, DocumentID: documentID}, nil
 }
 
 // decideVerificationRequest is the body of POST /v1/admin/verifications/{id}/decision.

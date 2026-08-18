@@ -92,20 +92,43 @@ func init() {
 // not checked — it may be nil because the database was unreachable at startup, which is a transient
 // condition the service is built to survive.
 func profilesHandler(d Deps) *profiles.Handler {
+	handler, err := profiles.NewHandler(
+		profiles.NewService(d.Clock), verificationDocuments(d), d.Pool, d.Logger)
+	if err != nil {
+		panic("cmd/api: profiles handler: " + err.Error())
+	}
+	return handler
+}
+
+// verificationDocuments builds the evidence service over the signer below (SHIP-81b, SHIP-155).
+//
+// # It is a function rather than a line inside profilesHandler, because there are two callers
+//
+// SHIP-155's administrator viewer constructs one of these from `cmd/api/routes_admin.go` — which is
+// what `internal/profiles`' documents.go asked for in advance, so that `profiles.NewService` never
+// widens to carry a signer the queue and the decision endpoints have no business holding. Two call
+// sites building the policy out of `d.Config` separately is the drift Docs/06 §5.3 is written about:
+// the accepted media types and the two lifetimes would be one configuration read twice, and the copy
+// nobody updated would refuse a photograph the other half had just accepted.
+//
+// **Each caller gets its own value, and that is deliberate rather than wasteful.** It holds
+// configuration and a signer and no connection, so a second is a struct rather than a resource —
+// `profileDocuments` records the same argument for the `*storage.S3` underneath it. Sharing one
+// would mean a field on `Deps` that two route files then both have to agree about.
+//
+// The same `*storage.S3` satisfies both ports, which is the pair the compile-time assertions at the
+// foot of this file establish: `profiles` declares upload signing and object reading separately so
+// that a caller reading somebody's licence cannot thereby mint permission to write one, and this is
+// where one value is shown to satisfy both.
+func verificationDocuments(d Deps) *profiles.Documents {
 	store := profileDocuments(d)
 
-	documents := profiles.NewDocuments(d.Clock, store, store, profiles.DocumentPolicy{
+	return profiles.NewDocuments(d.Clock, store, store, profiles.DocumentPolicy{
 		MaxBytes:             d.Config.Storage.MaxUploadBytes,
 		AcceptedContentTypes: d.Config.Storage.AcceptedContentTypes,
 		UploadTTL:            d.Config.Storage.PresignTTL,
 		DownloadTTL:          d.Config.Storage.DownloadTTL,
 	})
-
-	handler, err := profiles.NewHandler(profiles.NewService(d.Clock), documents, d.Pool, d.Logger)
-	if err != nil {
-		panic("cmd/api: profiles handler: " + err.Error())
-	}
-	return handler
 }
 
 // profileDocuments builds the signer behind the verification-document endpoints (SHIP-81b).

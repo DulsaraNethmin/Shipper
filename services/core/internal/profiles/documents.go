@@ -285,6 +285,17 @@ type Document struct {
 	ETag          string
 
 	SubmittedAt time.Time
+
+	// ExpiresAt is when this document lapses, as stated at submission (SHIP-159).
+	//
+	// A pointer, because nil is a distinct and ordinary answer: **the platform was never told**,
+	// which is not the same as "does not expire" and is not the same as an expiry in the past.
+	// A document with none never appears on Docs/04 §5's expiry queue under any configuration.
+	//
+	// **It can only be written at INSERT.** `provider_verification_documents_no_update` refuses
+	// every UPDATE, so a provider whose renewal date was mistyped re-photographs the document —
+	// which is a second row, which is what this table already says a correction is.
+	ExpiresAt *time.Time
 }
 
 // DocumentLink is a document and a fresh, short-lived URL to read it at.
@@ -298,8 +309,16 @@ type Document struct {
 type DocumentLink struct {
 	Document
 
-	URL       string
-	ExpiresAt time.Time
+	URL string
+
+	// URLExpiresAt is when the signed link stops working — minutes, not years.
+	//
+	// **Named for the URL rather than for the document, and the rename is not cosmetic.** It was
+	// `ExpiresAt` until SHIP-159 put an `ExpiresAt` on [Document]; embedding then made one shadow
+	// the other, and the two are a credential's lifetime and a licence's renewal date. A caller
+	// reading the shadowed field would have shown a provider their insurance expiring five
+	// minutes from now. The compiler caught it once; the name is what stops it arriving again.
+	URLExpiresAt time.Time
 }
 
 // Documents is the evidence half of this domain (SHIP-81b).
@@ -539,6 +558,7 @@ func (d *Documents) Submit(
 	providerID uuid.UUID,
 	kind Kind,
 	objectKey string,
+	expiresAt *time.Time,
 ) (Document, error) {
 
 	var problems validate.Errors
@@ -551,6 +571,7 @@ func (d *Documents) Submit(
 	if problems.Required("object_key", key) {
 		problems.Length("object_key", key, 1, maxDocumentObjectKey)
 	}
+	checkExpiry(&problems, expiresAt)
 	if err := problems.Err(); err != nil {
 		return Document{}, err
 	}
@@ -582,6 +603,7 @@ func (d *Documents) Submit(
 		ContentType:   stored.contentType,
 		ContentLength: stored.contentLength,
 		ETag:          stored.etag,
+		ExpiresAt:     expiresAt,
 	}
 
 	submitted, err := d.store.recordDocument(ctx, r, document)
@@ -589,6 +611,35 @@ func (d *Documents) Submit(
 		return Document{}, err
 	}
 	return submitted, nil
+}
+
+// checkExpiry adds a field error when the stated expiry is not a date at all (SHIP-159).
+//
+// # It bounds what a timestamp *is*, and deliberately not how long a document may last
+//
+// Docs/04 §3 gives the renewal cadence to legal and insurance advisers (Track-X row X-4) and it is
+// unanswered, so a rule like "no more than five years out" would be the platform enforcing a number
+// nobody decided — exactly what `000201` and `000202` both decline to write. **A date in the past is
+// accepted for the same reason it has no CHECK in the schema**: Docs/04 §3 has an administrator
+// refusing an image that is "visibly expired", which means the platform has to be able to hold one
+// long enough for somebody to look at it.
+//
+// What is refused is a value PostgreSQL cannot store, and the two ways a client produces one. The
+// zero time is what `{"expires_at": null}` decodes to if a caller sends the literal
+// `0001-01-01T00:00:00Z`, and it would otherwise be recorded as a document that lapsed two thousand
+// years ago. The year bound is the encoder's rather than a policy's: `timestamptz` runs to 294276 AD
+// and Go's `time.Time` runs a great deal further, so an absurd value would arrive as an opaque 500
+// rather than as a field a client can correct. It is the same kind of bound as
+// [maxDocumentContentType] — "a media type is not four kilobytes long" — and not the same kind as
+// [DocumentPolicy].
+func checkExpiry(problems *validate.Errors, expiresAt *time.Time) {
+	if expiresAt == nil {
+		return
+	}
+	if expiresAt.IsZero() || expiresAt.Year() < 1 || expiresAt.Year() > 9999 {
+		problems.Add("expires_at", validate.CodeInvalid,
+			"Send the date this document expires, or leave it out if it does not expire.")
+	}
 }
 
 // maxDocumentObjectKey is the same 1024 as `ck_provider_verification_documents_object_key`, and the
@@ -698,7 +749,7 @@ func (d *Documents) For(ctx context.Context, r db.Runner, providerID uuid.UUID) 
 		if err != nil {
 			return nil, fmt.Errorf("profiles: signing a download for %s: %w", document.ObjectKey, err)
 		}
-		links = append(links, DocumentLink{Document: document, URL: url, ExpiresAt: expiresAt})
+		links = append(links, DocumentLink{Document: document, URL: url, URLExpiresAt: expiresAt})
 	}
 	return links, nil
 }

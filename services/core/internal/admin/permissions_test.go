@@ -14,6 +14,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/profiles"
 )
 
 // testDisputeService is a [Service] the administrator handlers do not use.
@@ -128,6 +129,31 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		t.Fatalf("building the verification console: %v", err)
 	}
 
+	// SHIP-155. The real `internal/profiles` reader over a fake object store, which is
+	// evidence_test.go's split and its reasoning: the records are the schema's to enforce and a
+	// double would accept every one of them, while the signature itself is exercised against
+	// MinIO by the harness. A suite whose subject is a *different* endpoint still needs this
+	// wired, because NewHandler refuses a nil — a console that could not show a reviewer the
+	// documents is one that cannot perform Docs/04 §3's review at all.
+	evidenceStore := newFakeEvidenceStore()
+	evidence, err := NewEvidence(
+		testEvidence{documents: profiles.NewDocuments(
+			clock.System{}, evidenceStore, evidenceStore, testDocumentPolicy())},
+		auditor, pool)
+	if err != nil {
+		t.Fatalf("building the document viewer: %v", err)
+	}
+
+	// SHIP-159. The real `internal/profiles` reader again, over a **configured** lead time
+	// rather than an empty one: an empty map is the shipping default and would make every
+	// "expiring" assertion vacuous, and expiry_test.go is where both configurations are driven
+	// deliberately. The clock is the fixture's, because the boundary between expired and
+	// expiring is measured against it.
+	expiry, err := NewExpiryQueue(testExpiringDocuments(clk), pool)
+	if err != nil {
+		t.Fatalf("building the expiry queue: %v", err)
+	}
+
 	// SHIP-164. The real lifecycle adapter over the real guard, like enforcement above: the
 	// resolution moves a job out of `Disputed` through `jobs.Transition`, so a stub here would
 	// prove that `admin` writes an outcome and nothing about whether the job unfroze.
@@ -149,6 +175,8 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		Notes:         notes,
 		Suspensions:   suspensions,
 		Verifications: verifications,
+		Evidence:      evidence,
+		Expiry:        expiry,
 
 		DisputeWorkflow: disputeWorkflow,
 	}
