@@ -306,22 +306,138 @@ func TestScopesAreSeparate(t *testing.T) {
 	}
 }
 
-// A 4xx is a settled outcome. Replaying it is what stops a retry loop turning one
-// rejected bid into ten log entries and ten notifications.
+// A 4xx that describes the request is a settled outcome. Replaying it is what stops a
+// retry loop turning one rejected bid into ten log entries and ten notifications.
+//
+// This is the half of the settle rule that 429 is deliberately not in, and the two tests
+// are next to each other so that a change to one is read against the other. A fix for
+// TestARateLimitedResponseReleasesTheKey that released the key for every 4xx would pass
+// that test and fail this one, which is the only thing separating them.
 func TestAClientErrorIsReplayed(t *testing.T) {
-	handler := &countingHandler{status: http.StatusUnprocessableEntity, body: `{"error":{"code":"validation_failed"}}`}
-	h := Idempotent(idempotency.NewMemoryStore(), nil)(handler)
-
-	h.ServeHTTP(httptest.NewRecorder(), bidRequest("key-1", `{}`))
-
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, bidRequest("key-1", `{}`))
-
-	if handler.callCount() != 1 {
-		t.Errorf("the handler ran %d times, want 1", handler.callCount())
+	tests := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"a malformed request", http.StatusBadRequest, `{"error":{"code":"bad_request"}}`},
+		{"a conflict", http.StatusConflict, `{"error":{"code":"job_not_open"}}`},
+		{"a validation failure", http.StatusUnprocessableEntity, `{"error":{"code":"validation_failed"}}`},
 	}
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Errorf("status = %d, want the original 422", rec.Code)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := idempotency.NewMemoryStore()
+			handler := &countingHandler{status: tc.status, body: tc.body}
+			h := Idempotent(store, nil)(handler)
+
+			h.ServeHTTP(httptest.NewRecorder(), bidRequest("key-1", `{}`))
+
+			if !store.Held(idempotencyKeyPrefix + "anonymous:key-1") {
+				t.Fatalf("the key was released after a %d, so the refusal will be re-run rather than replayed", tc.status)
+			}
+
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, bidRequest("key-1", `{}`))
+
+			if handler.callCount() != 1 {
+				t.Errorf("the handler ran %d times, want 1", handler.callCount())
+			}
+			if rec.Code != tc.status {
+				t.Errorf("status = %d, want the original %d", rec.Code, tc.status)
+			}
+			if rec.Body.String() != tc.body {
+				t.Errorf("body = %s, want the stored %s", rec.Body, tc.body)
+			}
+			if rec.Header().Get(HeaderIdempotencyReplayed) != "true" {
+				t.Error("the retry was not marked as a replay, so it was not answered from the store")
+			}
+		})
+	}
+}
+
+// A 429 is the one 4xx that does not describe the request, and it is why the settle rule
+// is not simply "5xx goes back and everything else is the answer".
+//
+// It says *not yet*. The action did not happen, so there is nothing to replay — and
+// storing it makes the Retry-After the platform has just sent useless: the client waits
+// exactly as long as it was told to, retries with the key it was told to reuse, and is
+// handed the same refusal for the life of the entry. Twice over, because
+// idempotency.Response carries Status, ContentType, Location and Body and no other header,
+// so the replayed refusal does not even say how long to wait the second time.
+//
+// Both live 429s sit behind this middleware: POST /v1/auth/login and POST /v1/admin/sessions.
+func TestARateLimitedResponseReleasesTheKey(t *testing.T) {
+	store := idempotency.NewMemoryStore()
+
+	calls := 0
+	limited := true
+	h := Idempotent(store, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if limited {
+			// What internal/identity's sign-in handler does: the wait goes in a
+			// header, because httpx.Error carries a status, a code and a message
+			// and no headers of its own.
+			w.Header().Set("Retry-After", "20")
+			WriteError(w, r, NewError(http.StatusTooManyRequests, CodeRateLimited,
+				"Too many sign-in attempts. Wait a moment and try again."))
+			return
+		}
+		WriteJSON(w, http.StatusOK, map[string]string{"access_token": "a-token"})
+	}))
+
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, bidRequest("key-1", `{"email":"a@example.com"}`))
+
+	if first.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", first.Code)
+	}
+	if first.Header().Get("Retry-After") == "" {
+		t.Fatal("the first refusal carried no Retry-After, so this test proves nothing about losing it")
+	}
+	if store.Held(idempotencyKeyPrefix + "anonymous:key-1") {
+		t.Error("the key is still held after a 429, so the retry it invited is answered from the store")
+	}
+
+	// Still throttled, so the retry is refused again — but it has to be refused by the
+	// limiter rather than by the store, and it has to carry a wait of its own.
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, bidRequest("key-1", `{"email":"a@example.com"}`))
+
+	if calls != 2 {
+		t.Errorf("the handler ran %d times, want the retry to re-execute", calls)
+	}
+	if got := second.Header().Get(HeaderIdempotencyReplayed); got == "true" {
+		t.Error("the retry was answered from the store rather than re-executed")
+	}
+	if got := second.Header().Get("Retry-After"); got == "" {
+		t.Error("the retry carries no Retry-After, so the client is told to wait and not told how long")
+	}
+
+	// And the client that waits gets through, which is the whole point of the header.
+	limited = false
+	third := httptest.NewRecorder()
+	h.ServeHTTP(third, bidRequest("key-1", `{"email":"a@example.com"}`))
+
+	if calls != 3 {
+		t.Errorf("the handler ran %d times, want the wait to be honoured", calls)
+	}
+	if third.Code != http.StatusOK {
+		t.Errorf("status = %d, want the retry's own 200 after the allowance returned", third.Code)
+	}
+
+	// The 200 settles, so the key is held again and an ordinary retry replays it. The
+	// release is for the refusal, not for the endpoint.
+	if !store.Held(idempotencyKeyPrefix + "anonymous:key-1") {
+		t.Error("the successful retry did not store its response")
+	}
+	fourth := httptest.NewRecorder()
+	h.ServeHTTP(fourth, bidRequest("key-1", `{"email":"a@example.com"}`))
+
+	if calls != 3 {
+		t.Errorf("the handler ran %d times, want the fourth request replayed", calls)
+	}
+	if fourth.Header().Get(HeaderIdempotencyReplayed) != "true" {
+		t.Error("the request after the successful one was not replayed")
 	}
 }
 

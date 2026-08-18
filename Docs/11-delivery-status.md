@@ -15850,6 +15850,141 @@ The section starts its worker with `KAFKA_BROKERS=localhost:1`, `61-bidding.sh`'
 - **Notifications to a pseudonymised account are not suppressed.** A person who is still party to a retained job can be a recipient of a later `job.status_changed`; the row would be written with the pseudonym as its address and would fail to dispatch, legibly, climbing `attempts`. It has no ticket. `internal/notifications` is nobody's this wave and the fix is that domain's, not a statement in `cmd/worker`.
 - **The retention period for the pseudonymised transaction records is still X-4's.** `Docs/05` §3.1 calls it *"the one genuinely open element"* and it does not block this ticket: the **split** — what is deleted and what is retained under a pseudonym — is settled in that document as a design decision, and how long the retained side persists is the open question. Nothing here shortens or lengthens anything.
 
+### The 429 the idempotency middleware stored, and the two endpoints it reached
+
+**This closes no backlog row.** The branch names a surface — `ship-15aj-idempotent-429` — because
+there is no ticket for it, and there is deliberately no `Docs/11-done.txt` row and no summary-table
+row: the guard requires a row for every *declared done ticket*, and inventing one here would put an
+identifier in the board that `Docs/09` does not carry.
+
+`internal/httpx/idempotency.go` released the held key on a `5xx` and stored everything else. The
+comment above it blessed the rest on the reasoning that a settled outcome — *"including a 4xx the
+client caused"* — is the answer, and that replaying it is what stops a retry loop turning one
+rejected bid into ten. **That is right about every 4xx that describes the request, and incomplete
+about the one that does not.**
+
+A 429 says *not yet*. Nothing happened, so there is nothing to replay, and the response itself
+invites the retry that storing it then refuses. **Twice over**, and the second half is the one that
+was never argued: `idempotency.Response` persists a status, a content type, a location and a body
+and **no other header**, so the replayed refusal could not say how long to wait even once.
+
+**Both live 429s sit behind this middleware.** `POST /v1/auth/login` (`internal/identity/http.go`)
+and `POST /v1/admin/sessions` (`internal/admin/http.go`), each refused by SHIP-47's token bucket
+before the credential is looked at. They are the only two: `grep -rn StatusTooManyRequests` over
+non-test Go outside `internal/httpx` and `internal/platform` returns those two lines and nothing
+else. **Forty-seven of the eighty-six routes on the manifest are non-`GET`/`HEAD`, and all
+forty-seven are under `/v1` and therefore behind this middleware** — so the settle rule is a
+statement about all of them, and only two can reach the branch that changed.
+
+#### Measured before it was changed, rather than argued
+
+Nothing covered it. `grep -n '429\|TooManyRequests\|Retry-After'` over `internal/httpx/idempotency_test.go`
+returned one unrelated pair of lines — the `Retry-After: 1` on an in-progress conflict — and the
+same grep over `cmd/api/*_test.go` returned nothing at all. `grep -rn TooManyRequests` over every
+`*_test.go` in the service returned four lines, none of which is about replay: two fake upstreams in
+the push and email adapters, and two status-to-code table entries in `internal/httpx/errors_test.go`.
+
+With the rule at `>= 500`, the new middleware test failed in seven places at once: the handler ran
+**once** across three attempts; the second response carried `Idempotency-Replayed: true`; **it
+carried no `Retry-After` at all**; and a client that waited exactly as long as it had been told
+still got the refusal back. The header loss is therefore measured rather than inferred from reading
+`Complete`.
+
+#### What changed, and what deliberately did not
+
+One condition — `buffered.status >= 500 || buffered.status == http.StatusTooManyRequests` — and the
+comment above it rewritten so that the next reader meets the exception rather than the rule alone.
+The original paragraph is kept and marked **incomplete rather than wrong**, because it is right
+about the case it was written for.
+
+**The 4xx that should still replay, still replays**, and that is the clause a wrong fix would fail.
+Releasing the key for every 4xx would satisfy every check about 429 and would be the regression the
+original comment exists to prevent. The two tests are next to each other in the file for that
+reason: `TestAClientErrorIsReplayed` now runs over **400, 409 and 422** and asserts the key is still
+*held* after each, and `TestARateLimitedResponseReleasesTheKey` asserts it is not.
+
+#### The end-to-end check, and why it is in `30-http.sh`
+
+`scripts/verify/30-http.sh`, the SHIP-15 section — not `40-identity.sh`, which drives sign-in and
+was the obvious home. Three reasons, in order of weight. **The rule belongs to the middleware**:
+sign-in is only the surface that reaches it first, and admin sign-in reaches the same line, so a
+check filed under identity would be filed under the wrong owner. **The contrast lives there
+already** — the section's existing "the retry returns the stored response byte for byte" is the
+other half of the settle rule, and the two now sit in one file where a change to either is read
+against the other. And **it adds no section**, so the count line moves in one dimension rather than
+two.
+
+Eight checks. The sign-in is driven past its **per-address** allowance rather than its per-account
+one, against accounts that do not exist so that every account bucket stays full — because the
+address limit refills one unit every twenty seconds and the account limit one every two minutes,
+and the section waits out whichever it provoked. **The wait is read off the response and never
+transcribed**: `Retry-After` came back as 19 seconds on the run that measured this, and a
+hard-coded 20 would assert a limiter's constants from outside and stop being true the moment they
+move.
+
+The strongest two checks are not about headers. **Redis holds no entry for the key** after the 429
+— which is the fix, observed directly rather than through the behaviour it produces — and
+`device_sessions` holds exactly **one** row for the label after the wait and still one after the
+replay, which is what separates two executions from one execution answered twice.
+
+#### The sweep, and what it found
+
+A settle-rule change alters behaviour for every mutating route, so the sweep was every
+`scripts/verify/*.sh` rather than the one file this branch edits. **Nothing outside the new section
+depends on a 429 being replayed.** Three greps say so:
+
+| Sweep | Result |
+|---|---|
+| Every idempotency key literal in every section, counted for reuse | Seven reuses. `verify-login-retry-$$` is a 200 replayed, `verify-adm-signout-$$` a 204, `$idem_key` in `30-http.sh` a 4xx replayed then a 409, and the rest are helper parameters |
+| Every call site that can return 429 — `POST /v1/auth/login` and `POST /v1/admin/sessions`, 39 sites across three files — with the key each uses | **No key is reused at any of them.** The whole SHIP-47 block uses `verify-throttle-<suffix>-$$`, one per attempt |
+| Every `idem:v1` presence assertion outside the new section | Three, in `90-admin.sh`, following requests asserted at **201, 201 and 401**. None is a 429 |
+
+#### The mutation, and the two layers that killed it
+
+Reverting the condition to `>= 500` — the deliberate revert rather than an invented literal.
+Snapshotted with `cp` and a `SHASUMS` written beside it in the same command, applied with a
+`python3` heredoc asserting a single occurrence, and the mutated line printed rather than assumed.
+
+**Both layers killed it, and they killed it on different evidence**, which is the part worth
+keeping. The middleware test failed on seven assertions including the handler call count. The
+harness failed one check earlier than that and on a stronger observation — the Redis entry itself:
+
+```
+✗ the 429 was stored under verify-i429-shared-50313:
+  idem:v1:anonymous:verify-i429-shared-50313
+```
+
+Restored by `cp` from the snapshot, confirmed with `git diff` **and** an explicit hash comparison
+with both sides printed against the worktree path — `2ec359fb…`, equal — because `shasum -c` run
+from the snapshot directory verifies the snapshot against itself.
+
+#### The finding this leaves open, which has no ticket
+
+**A replay drops every header a handler set except `Content-Type` and `Location`**, and `Retry-After`
+on a 429 was one instance of a general shape rather than the whole of it. Two others survive this
+branch, both found by `grep -rn 'w\.Header()\.Set('` over the domains:
+
+- **`WWW-Authenticate` on a 401**, six sites across `internal/admin/adminauth.go` and
+  `internal/delivery/driverauth.go`. Those guards sit inside the version group and therefore inside
+  `Idempotent`, so a 401 is a settled 4xx: stored, and replayed **without the challenge header
+  RFC 9110 requires on one**. Correctly still replayed — a 401 does describe the request — so the
+  fix is to carry the header, not to release the key.
+- **`Retry-After` on the two 202s**, `RequestOTP` and `ResendVerification`. Materially harmless
+  because the body carries `retry_after_seconds` as well, which those handlers do deliberately and
+  say so; it is recorded because the reason it is harmless is a second copy of the value, not the
+  mechanism working.
+
+The narrow fix is a header allow-list on `idempotency.Response`. **It was not taken here**: it
+changes the stored shape, `idempotencyKeyPrefix` carries a version precisely so that shape can
+change, and doing it inside a defect repair with two live endpoints would put a schema decision
+inside a one-condition change. It needs a row.
+
+**And one sentence in another lane's file is now stale.** `scripts/verify/40-identity.sh`, at the
+`rl:v1:signin:*` clear that opens SHIP-41, says *"Nothing above this line signs in."* This section
+does. The mechanism is unharmed — the clear is right there, it already anticipates leftovers from a
+previous run, and this section clears the same keys at both of its own ends and asserts the result
+— but the sentence wants a word. `40-identity.sh` is not this branch's to edit.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

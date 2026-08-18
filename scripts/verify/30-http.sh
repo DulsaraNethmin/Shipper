@@ -156,3 +156,204 @@ status="$(curl -s -o /dev/null -w '%{http_code}' \
   -H "$auth_header: Bearer $alice_token" "http://localhost:$VERIFY_PORT/v1/")"
 [[ "$status" == "200" ]] || fail "a public endpoint returned $status for a valid token"
 ok "and answers with a valid one, which is what puts the subject on the context"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-15  a refusal that says *not yet* releases the key rather than storing it"
+
+# The settle rule's other half, and the one that had no check at all until this file grew one.
+#
+# `internal/httpx/idempotency.go` gives the key back on a 5xx and stores everything else, on the
+# reasoning that a settled outcome — including a 4xx the client caused — is the answer, and that
+# replaying it is what stops a retry loop turning one rejected bid into ten. That is right about
+# every 4xx that describes the request and wrong about the one that does not. **A 429 says *not
+# yet*.** Nothing happened, so there is nothing to replay, and the response itself invites the
+# retry that storing it would then refuse — without the wait, because a stored response carries a
+# status, a content type, a location and a body and no other header, so the replay cannot even say
+# how long to wait the second time.
+#
+# It is checked here rather than in 40-identity.sh because the rule belongs to the middleware
+# rather than to sign-in: `POST /v1/auth/login` is only the surface that reaches it first, and
+# `POST /v1/admin/sessions` reaches the same line. Sign-in is what the harness can drive past a
+# limit end to end, which is why the demonstration is a sign-in and the claim is not.
+#
+# **Every request in this run arrives from 127.0.0.1**, so SHIP-47's per-address bucket is shared
+# with every section below and with every previous run. It is cleared at both ends of this block
+# for the reason 40-identity.sh clears it at both ends of SHIP-47's: a later section that got a
+# 429 would look like a broken endpoint rather than like this one's leftovers.
+redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
+  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+
+# idem429_login <key> <email> <password> <label> <name> — one sign-in, keeping the headers.
+#
+# The headers are the whole point here. `Idempotency-Replayed` is how a check says *which*
+# mechanism answered — the limiter or the store — and `Retry-After` is the half a replay drops.
+idem429_login() {
+  curl -s -X POST -o "$WORKDIR/i429-$5.json" -D "$WORKDIR/i429-$5.headers" -w '%{http_code}' \
+    -H "Idempotency-Key: $1" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$2\",\"password\":\"$3\",\"device_label\":\"$4\"}" \
+    "http://localhost:$VERIFY_PORT/v1/auth/login"
+}
+
+# idem429_header <name> <lower-case header name> — one response header, or nothing.
+idem429_header() {
+  tr -d '\r' <"$WORKDIR/i429-$1.headers" \
+    | awk -F': ' -v want="$2" 'tolower($1) == want { print $2 }' | tail -1
+}
+
+# idem429_stored <key> — the idempotency entries Redis holds for a key, one per line.
+idem429_stored() { redis-cli -u "$REDIS_URL" --scan --pattern "idem:v1:*:$1"; }
+
+# The address bucket is emptied against accounts that do not exist, so that every *account*
+# bucket stays full and the refusal below can only have come from the network-wide limit. That
+# matters for more than tidiness: the account limit refills one unit every two minutes and the
+# address limit one every twenty seconds, and this check waits out whichever it provoked.
+idem429_drained=""
+for attempt in $(seq 1 80); do
+  status="$(idem429_login "verify-i429-drain-$attempt-$$" "nobody-i429-$attempt-$$@example.com" \
+    "not-the-registered-password" "Verify 429 Drain" drain)"
+  if [[ "$status" == "429" ]]; then
+    idem429_drained="$attempt"
+    break
+  fi
+  [[ "$status" == "400" ]] || { cat "$WORKDIR/i429-drain.json"; fail "drain attempt $attempt returned $status, want 400"; }
+done
+[[ -n "$idem429_drained" ]] \
+  || fail "eighty failed sign-ins from one address were never throttled, so there is no 429 to check"
+ok "the per-address sign-in allowance is spent, which is the only 429 this API can be driven to"
+
+# The account this waits on. Registered here rather than reused, so its own per-account bucket is
+# untouched and the 429 below is the address limit rather than its own.
+idem429_email="idem429-$$@example.com"
+idem429_password="correct-horse-battery-staple"
+idem429_phone="04$(printf '%08d' "$(( $$ % 100000000 ))")"
+status="$(post_json "verify-i429-register-$$" /v1/auth/register \
+  "{\"name\":\"Verify Harness\",\"email\":\"$idem429_email\",\"phone\":\"$idem429_phone\",\"password\":\"$idem429_password\",\"role\":\"customer\"}" \
+  "$WORKDIR/i429-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/i429-register.json"; fail "could not register the 429 account ($status)"; }
+idem429_user="$(json "$WORKDIR/i429-register.json" '["id"]')"
+
+# One key, reused for every attempt below, because that is what a client does: the key identifies
+# the action, and a retry of that action carries the key it was issued under.
+idem429_key="verify-i429-shared-$$"
+
+status="$(idem429_login "$idem429_key" "$idem429_email" "$idem429_password" "Verify 429 Retry" first)"
+[[ "$status" == "429" ]] || { cat "$WORKDIR/i429-first.json"; fail "the sign-in behind an empty bucket returned $status, want 429"; }
+[[ "$(json "$WORKDIR/i429-first.json" '["error"]["code"]')" == "rate_limited" ]] \
+  || { cat "$WORKDIR/i429-first.json"; fail "expected code=rate_limited"; }
+[[ -z "$(idem429_header first idempotency-replayed)" ]] || fail "the first request was marked as a replay"
+
+idem429_wait="$(idem429_header first retry-after)"
+[[ "$idem429_wait" =~ ^[0-9]+$ && "$idem429_wait" -gt 0 && "$idem429_wait" -le 30 ]] \
+  || fail "Retry-After is '$idem429_wait'. A figure near 120 means the per-account bucket refused
+     rather than the per-address one, so the drain above spent the wrong allowance"
+ok "a correct password is refused 429 with a wait of ${idem429_wait}s — the limit is checked before the credential"
+
+# **The observation the fix is.** A stored response under this key would be visible here, and
+# under the settle rule this file was written against it was: the key was completed with the
+# refusal against it, and every retry for the life of the entry got that refusal back.
+[[ -z "$(idem429_stored "$idem429_key")" ]] \
+  || fail "the 429 was stored under $idem429_key:
+$(idem429_stored "$idem429_key")
+     A refusal that invites a retry cannot also be the answer that retry gets."
+ok "the key is released rather than completed — Redis holds no entry for it"
+
+# The retry a client makes while still throttled has to be refused by the limiter rather than by
+# the store, and it has to carry a wait of its own. **This is the half that proves the header loss
+# is closed rather than argued**: idempotency.Response persists a status, a content type, a
+# location and a body, so a replayed 429 arrives with no Retry-After at all.
+status="$(idem429_login "$idem429_key" "$idem429_email" "$idem429_password" "Verify 429 Retry" second)"
+[[ "$status" == "429" ]] || { cat "$WORKDIR/i429-second.json"; fail "the retry returned $status, want a fresh 429"; }
+[[ -z "$(idem429_header second idempotency-replayed)" ]] \
+  || fail "the retry was answered from the store, so the client is holding a refusal it can never get past"
+
+idem429_wait="$(idem429_header second retry-after)"
+[[ "$idem429_wait" =~ ^[0-9]+$ && "$idem429_wait" -gt 0 && "$idem429_wait" -le 30 ]] \
+  || fail "the retried refusal carries Retry-After '$idem429_wait' — told to wait, and not told how long"
+ok "the retry is refused by the limiter again, carrying a live Retry-After of ${idem429_wait}s rather than none"
+
+# Waited out rather than guessed, and read off the response rather than transcribed: a hard-coded
+# figure asserts a limiter's constants from the outside and stops being true the moment they move.
+# One second of slack for the round trip, on top of a figure the platform already rounded up.
+sleep "$((idem429_wait + 1))"
+
+status="$(idem429_login "$idem429_key" "$idem429_email" "$idem429_password" "Verify 429 Retry" third)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/i429-third.json"; fail "the sign-in after the stated wait returned $status, want 200"; }
+[[ -z "$(idem429_header third idempotency-replayed)" ]] \
+  || fail "the sign-in after the wait was answered from the store rather than run"
+[[ -n "$(json "$WORKDIR/i429-third.json" '["access_token"]')" ]] \
+  || { cat "$WORKDIR/i429-third.json"; fail "the sign-in returned no access token"; }
+
+# The row, not the response. A replay answers without the handler running, so a session that
+# exists is what separates an execution from an execution answered twice.
+idem429_sessions="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_sessions where user_id = '$idem429_user' and device_label = 'Verify 429 Retry';")"
+[[ "$idem429_sessions" == "1" ]] \
+  || fail "waiting exactly as long as Retry-After said produced $idem429_sessions sessions, want 1"
+ok "a client that waits the stated time and retries under the same key is signed in — the wait means something"
+
+# And the successful outcome settles, so the key is held again. The release is for the refusal,
+# not for the endpoint: without this the check above would be satisfied by a change that disabled
+# replay for sign-in rather than one that released a deferral.
+status="$(idem429_login "$idem429_key" "$idem429_email" "$idem429_password" "Verify 429 Retry" fourth)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/i429-fourth.json"; fail "the retry after the successful sign-in returned $status"; }
+[[ "$(idem429_header fourth idempotency-replayed)" == "true" ]] \
+  || { cat "$WORKDIR/i429-fourth.headers"; fail "the retry after a successful sign-in was not replayed"; }
+diff -q "$WORKDIR/i429-third.json" "$WORKDIR/i429-fourth.json" >/dev/null \
+  || fail "the replayed pair differs from the one the sign-in issued"
+idem429_sessions="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from device_sessions where user_id = '$idem429_user' and device_label = 'Verify 429 Retry';")"
+[[ "$idem429_sessions" == "1" ]] || fail "the replay created a second device session ($idem429_sessions)"
+ok "and the sign-in it did issue is replayed byte for byte, still one device — the settle rule still settles"
+
+# --- the 4xx that must still replay, which is what separates a fix from a regression -----------
+#
+# A change that released the key for *every* 4xx would pass every check above and would be wrong:
+# it would turn one rejected bid into ten. The contrast is run against the same endpoint, under
+# the same middleware, with the buckets refilled so that both attempts would be admitted and the
+# only thing that can stop the second is the store.
+redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
+  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+
+idem429_wrong_key="verify-i429-wrong-$$"
+status="$(idem429_login "$idem429_wrong_key" "$idem429_email" "not-the-registered-password" "Verify 429 Wrong" wrong1)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/i429-wrong1.json"; fail "a wrong password returned $status, want 400"; }
+[[ -n "$(idem429_stored "$idem429_wrong_key")" ]] \
+  || fail "the 400 was not stored, so a retry loop would re-run a refusal the client cannot fix"
+
+# The tokens left in the address bucket are the side effect that says whether the handler ran: a
+# refused credential charges one unit, and a reply from the store charges nothing. Compared with
+# half a unit of slack because the bucket refills continuously.
+#
+# **The key is read out of Redis rather than spelled here.** SHIP-47 keys the address bucket on
+# the address the transport reports, and `localhost` resolves to `127.0.0.1` or to `::1` depending
+# on the machine — so a literal key name is a check that silently reads nothing and then compares
+# two empty strings. It did exactly that on the first run of this section.
+idem429_bucket="$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' | head -1)"
+[[ -n "$idem429_bucket" ]] \
+  || fail "the refused credential charged no per-address bucket, so nothing here can tell a replay from a re-run"
+idem429_tokens_before="$(redis-cli -u "$REDIS_URL" hget "$idem429_bucket" tokens)"
+[[ -n "$idem429_tokens_before" ]] || fail "$idem429_bucket holds no token count"
+
+status="$(idem429_login "$idem429_wrong_key" "$idem429_email" "not-the-registered-password" "Verify 429 Wrong" wrong2)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/i429-wrong2.json"; fail "the retried refusal returned $status, want the stored 400"; }
+[[ "$(idem429_header wrong2 idempotency-replayed)" == "true" ]] \
+  || { cat "$WORKDIR/i429-wrong2.headers"; fail "a 400 under a reused key was re-run rather than replayed"; }
+diff -q "$WORKDIR/i429-wrong1.json" "$WORKDIR/i429-wrong2.json" >/dev/null \
+  || fail "the replayed refusal differs from the original"
+
+idem429_tokens_after="$(redis-cli -u "$REDIS_URL" hget "$idem429_bucket" tokens)"
+[[ -n "$idem429_tokens_after" ]] || fail "$idem429_bucket holds no token count after the retry"
+awk -v before="$idem429_tokens_before" -v after="$idem429_tokens_after" \
+  'BEGIN { exit !(after > before - 0.5) }' \
+  || fail "$idem429_bucket went from $idem429_tokens_before to $idem429_tokens_after, so the replayed 400 ran the handler again"
+ok "a 400 under the same key is still answered from the store, byte for byte, without the handler running"
+
+# The bucket is shared with every section below. Cleared where it was spent, and asserted rather
+# than assumed, because a later track's 429 would read as its own endpoint being broken.
+redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
+  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' | wc -l | tr -d ' ')" == "0" ]] \
+  || fail "this section left sign-in buckets behind, which a later track would be throttled by"
+status="$(idem429_login "verify-i429-cleared-$$" "$idem429_email" "$idem429_password" "Verify 429 Cleared" cleared)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/i429-cleared.json"; fail "sign-in is still refused after the buckets were cleared ($status)"; }
+ok "the sign-in buckets are empty at the end of this section, and a sign-in still succeeds"
