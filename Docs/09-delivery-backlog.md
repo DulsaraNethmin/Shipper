@@ -6,7 +6,7 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**232 tickets, 717 points.**
+**237 tickets, 738 points.**
 
 ## How to read this
 
@@ -41,15 +41,15 @@ Built for a **solo developer**, so this is a single ordered queue rather than pa
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 10 | 29 |
-| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 38 | 106 |
+| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 39 | 111 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 29 | 83 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 28 | 84 |
-| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 38 | 128 |
+| **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 39 | 133 |
 | **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 33 | 112 |
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 14 | 48 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 22 | 69 |
-| **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 20 | 58 |
-| | | **232** | **717** |
+| **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 23 | 69 |
+| | | **237** | **738** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -111,6 +111,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-16 | Flutter project scaffold for iOS and Android | 2 | App builds and runs on both simulators | SHIP-1 |
 | SHIP-17 | Flutter feature-folder structure and state management choice | 3 | Structure matches Docs 07 §2 and the state approach is documented | SHIP-16 |
 | SHIP-17a | Published API contract | 3 | contracts/openapi.yaml exists and a Go test validates real handler responses against it | SHIP-13 |
+| SHIP-17b | Contract validation that reaches the authenticated surface | 5 | The response check covers the routes its exercisable() filter skips today — every non-GET, every authenticated and every parameterised route, which is 82 of the 86 on the manifest — by driving them with fixtures rather than naming them as skipped; a request body carrying a field the contract does not declare fails a gate, which is the half that has no check at all; and whatever is still unreached is named in the output rather than counted | SHIP-17a |
 | SHIP-18 | Flutter API client with environment-based base URL | 3 | Client targets local, staging, and production by build flavour | SHIP-17 |
 | SHIP-19 | Flutter health round trip proving connectivity | 1 | App displays the API version fetched from /health | SHIP-18, SHIP-6 |
 | SHIP-20 | CI: Go build, vet, and test | 2 | Workflow runs on every push and fails on a broken build or test | SHIP-5 |
@@ -235,7 +236,8 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-81 | Job eligibility filter query | 5 | Filters by service area, vehicle capability, verification state, and job status | SHIP-79, SHIP-80 |
 | SHIP-81a | The provider verification record and its five states | 5 | Docs 04 §4's five outcomes — Pending, Verified, Restricted, Rejected and Suspended — exist as a provider's verification record in migration block 200–299 owned by `internal/profiles`; every transition passes one guarded function and records its actor and its reason, and no code sets the state directly; a provider reads their own state and no other provider's; and SHIP-81's eligibility predicate reads this record instead of its automated stand-in, so there is exactly one answer to who may bid | SHIP-79, SHIP-81 |
 | SHIP-81b | The verification document record and its upload | 3 | Each of Docs 04 §3's four documents — licence, registration, insurance and ABN evidence — uploads directly through a short-lived pre-signed URL on SHIP-114's precedent, with the API never in the path of the bytes; each stored document names its kind and the verification record it belongs to, is private, and is reachable only by a fresh signed URL | SHIP-81a, SHIP-114 |
-| SHIP-81c | A provider captures their verification documents in the app | 3 | A provider photographs each of the four kinds in the app and it reaches SHIP-81b's upload; the image is never written to the device photo library, is compressed on the device, and is cleared from app storage once uploaded; and a file-upload fallback exists because the camera permission may be declined (Docs 04 §3.1) | SHIP-81b |
+| SHIP-81c | A provider captures their verification documents in the app | 5 | A provider photographs each of Docs 04 §3's four kinds in features/profile/ and it reaches SHIP-81b's upload; the image is never written to the device photo library, is compressed on the device, and is cleared from app storage once uploaded; the capture helpers move to core/ under a name and a doc comment that no longer say proof, and land under a directory that is not proof/; and the camera purpose string covers this use in both the Dart constant and Info.plist | SHIP-81b |
+| SHIP-81d | The verification fallback for a declined camera permission | 3 | A provider who refuses the camera permission still submits all four documents, through a picker that reaches no photo library — the file-upload fallback Docs 04 §3.1 requires so that a refused permission never blocks verification outright — and the package it depends on carries the written argument the gallery guard demands of anything in that space | SHIP-81c |
 | SHIP-82 | Open jobs feed endpoint for providers | 3 | GET /v1/jobs/open returns only eligible jobs, paginated | SHIP-81 |
 | SHIP-83 | Provider job detail with budget stripped | 3 | Provider view omits budget entirely; verified by test | SHIP-82, SHIP-67 |
 | SHIP-83a | Move the open feed off the `{id}` slot | 3 | `GET /v1/jobs/{id}/<literal>` can be registered at four segments — demonstrated by registering one — and the provider feed answers on a path that no longer puts a literal where an identifier goes; routes_golden.txt, the contract fragment and the Dart client all move together and the old path is gone rather than aliased | SHIP-83 |
@@ -442,6 +444,8 @@ Five segments or more are safe, because the literal route has only three after `
 | SHIP-169 | Account deletion request endpoint | 3 | A signed-in user can request deletion and receives a completion date | SHIP-44 |
 | SHIP-170 | Deletion deferral during an active job | 3 | A request during Awarded to Delivered queues until the job closes and explains why | SHIP-169, SHIP-57 |
 | SHIP-171 | User record pseudonymisation | 5 | Profile and contact data are irreversibly replaced by a stable pseudonym | SHIP-170 |
+| SHIP-171a | The platform can delete an object it stored | 3 | internal/platform/storage issues a delete for a key the platform named, demonstrated against the real object store rather than a fake, and the three places stating that this package has no delete say what changed and why; nothing belonging to a person is deleted by this row — it builds the call SHIP-172 makes | SHIP-171 |
+| SHIP-171b | A pseudonymised account stops being a notification recipient | 3 | No notification is written addressed to a pseudonymised account and none already queued dispatches to one, so the attempts counter stops climbing on a person the platform has deleted | SHIP-171 |
 | SHIP-172 | Cascade deletion of personal artefacts | 5 | Verification documents, message bodies, device tokens, and attributable images are removed | SHIP-171 |
 | SHIP-173 | Flutter account deletion UI | 3 | Deletion is initiated in-app with clear consequences and confirmation | SHIP-169, SHIP-49 |
 | SHIP-174 | Datadog APM and log ingestion | 3 | Traces and structured logs arrive from the Go service and are searchable | SHIP-9 |
@@ -453,7 +457,8 @@ Five segments or more are safe, because the literal route has only three after `
 | SHIP-180 | Apple privacy labels submission | 2 | Labels submitted and consistent with the published privacy policy | SHIP-25, X-7 |
 | SHIP-181 | Google Play data safety declaration | 2 | Declaration submitted and consistent with the published privacy policy | SHIP-27, X-7 |
 | SHIP-182 | Backup and restore rehearsal | 5 | A production-shaped database is restored from backup and verified | SHIP-2 |
-| SHIP-183 | API-wide rate limiting review | 3 | Every public endpoint has a considered limit and returns a typed error when exceeded | SHIP-47 |
+| SHIP-183 | API-wide rate limiting review | 5 | Every endpoint on the manifest has a limit chosen and written down with the reason, including the ones deliberately left unlimited; Docs 01 states no rate-limiting requirement anywhere, so these numbers are decided here rather than derived from one; and the questions Docs 11 §9 parks on this row are answered rather than parked again | SHIP-47 |
+| SHIP-183a | Apply the chosen limits across the surface | 3 | Every endpoint enforces the limit SHIP-183 chose for it and answers the typed error with an honest Retry-After when it is exceeded; a route registered without a limit fails a gate rather than defaulting to unlimited | SHIP-183, SHIP-47 |
 | SHIP-184 | Pilot-scale load smoke test | 3 | The stack handles expected pilot concurrency without error-rate degradation | SHIP-174 |
 | SHIP-185 | Release gate run-through | 3 | Every condition in Docs 01 §8 is evidenced and signed off | SHIP-180, SHIP-181 |
 
@@ -513,7 +518,7 @@ Two things move this number more than working faster does: cutting scope (below)
 ## Open questions that touch the backlog
 
 - ~~**X-6** must be answered before SHIP-119 (the 72-hour auto-complete task) can be written correctly.~~ **Answered on 14 August 2026 — an exception-completed job auto-completes on §6.1's ordinary 72-hour rule.** The decision and its reasoning are in `Docs/02` §6.1. SHIP-119 is unblocked, and it needs no column that does not already exist.
-- **X-4** must be answered before SHIP-171 and SHIP-172 (pseudonymisation) can define what is retained.
+- **X-4** must be answered before SHIP-172 (cascade deletion) can define what is retained. **SHIP-171 shipped without it**, and deliberately: replacing contact data with a pseudonym implicates no retention rule. Deleting verification evidence does — X-4's row is titled *retention period and verification documents*, and Docs 04 §3 has it deciding retention obligations — so the reasoning that let SHIP-171 proceed does not transfer to SHIP-172.
 - **X-9** must be answered before SHIP-58 (goods categories) can load real reference data.
 
 None of these blocks the start of its milestone; each blocks one specific ticket inside it.
