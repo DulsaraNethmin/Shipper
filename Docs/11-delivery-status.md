@@ -16005,7 +16005,7 @@ finding that goes quiet.
 | **X-1** D-U-N-S number | X-2, and through it SHIP-24, 25 |
 | **X-2** Apple Developer Program | SHIP-24 (iOS signing), SHIP-25 (TestFlight) — and X-10's iOS leg, which needs an APNs key |
 | **X-3** Google Play Console | SHIP-26 (Android signing), SHIP-27 (Play internal) |
-| **X-4** Legal brief | X-7, X-8, X-9 — and SHIP-171, 172, and **SHIP-159**, which nothing in this file connected to it before this pass. See below |
+| **X-4** Legal brief | X-7, X-8, X-9 — and **SHIP-172**. SHIP-171 and SHIP-159 both shipped without it and neither did so by oversight; see below |
 | **X-5** Pilot metro area | Provider recruitment. No code |
 | ~~**X-6**~~ Proof-exception auto-complete | **Closed** in wave 9 — the rule is in `Docs/02` §6.1. It gated SHIP-119, which shipped in the same wave |
 | **X-7** Privacy policy URL | SHIP-180, 181 |
@@ -16054,15 +16054,86 @@ rather than guessing them.
 whole of its story: there is no expiry column anywhere on the verification tables and no document
 table to hang one on. §6 has that half.
 
-**One more piece of work is blocked on a decision rather than on a ticket, and it is deliberately not
-a row in the table above.** The in-app capture half of `Docs/04` §3.1 — photograph, no photo-library
-write, on-device compression, clear-after-upload, file-upload fallback — is blocked on an **owner
-decision about `Docs/07` §2's feature list**, which a closed-set test enforces, and on a proposed
-`Docs/09` row that does not yet exist. **§5's table is keyed on Track-X rows and lists real tickets;
-adding a row for a ticket nobody has written would be this file describing its own proposal as
-fact.** §9 has the entry, the two measured blockers and the proposed backlog rows in full.
+**Both halves closed in wave 15, and the design rule above is the thing to check rather than the
+ticket.** SHIP-81b built the document table in wave 14 and SHIP-159 shipped the queue in wave 15, so
+the internal precondition is gone. **The external one was honoured rather than worked around**, which
+is the outcome this entry was written to force: `admin.ExpiryQueue.LeadTimes` is *"the configured
+horizon per document kind, as `cmd/api` supplied it"* — server-side configuration, not a compiled-in
+cadence — and the queue **returns the lead times in its own response** so that a reviewer can tell
+"nothing is due" from "no lead time is configured for that kind", which are the same empty page and
+different facts. `NewExpiryQueue` refuses to construct without a document source for the same reason.
+**Nobody invented a number.** The submission field is optional for the same reason, and the contract
+now says so in the same words the handler does — see wave 16's Phase 0.
+
+**So the edge `SHIP-159 → X-4` is discharged and `SHIP-171 → X-4` never bound.** Replacing contact
+data with a pseudonym implicates no retention rule, which is why wave 15 could ship it. **That
+reasoning does not transfer to SHIP-172** — X-4's row is titled *retention period **and verification
+documents*** and `Docs/04` §3 has it deciding retention obligations, so deleting verification
+evidence is the exact act a retention obligation constrains. **X-4 now gates one code row rather than
+three, and that row is SHIP-172.**
+
+**~~One more piece of work is blocked on a decision rather than on a ticket.~~ Both blockers are
+gone, and this paragraph is kept because the shape of it recurs.** The in-app capture half of
+`Docs/04` §3.1 — photograph, no photo-library write, on-device compression, clear-after-upload,
+file-upload fallback — was blocked on an **owner decision about `Docs/07` §2's feature list**, which
+a closed-set test enforces, and on a proposed `Docs/09` row that did not exist. **Wave 15 took the
+decision** — capture lives in `features/profile/`, which §2 had already assigned it to — and
+**`Docs/09` carries the rows**: SHIP-81c for the capture and SHIP-81d for the fallback, split in wave
+16 because the honest size was an 8 and that file's legend says nothing in it is an 8. **The original
+sentence below is why this was not simply written into the table when it was first noticed**, and it
+still governs the next proposal: §9 has the entry, the two measured blockers and the proposed backlog rows in full.
 
 ## 6. Ready to start now
+
+**Recomputed after wave 16's Phase 0 re-sizing, on the tree that carries it, by parsing `Docs/09`'s
+dependency column against `Docs/11-done.txt`.** Strict build order says the next ticket is the
+lowest-numbered open one, which is still **SHIP-24**, still blocked on X-2 along with the other three
+M0 stragglers. **Fifteen tickets have every dependency met: 10 code tickets worth 40 points, plus
+five Track-X tickets worth 12.** The lowest startable ticket of any kind is **X-1**; the lowest
+startable *code* ticket is **SHIP-17b**.
+
+**The set went 22 → 16 → 16 → 14 → 12 → 15, and this is the first pass where it grew without any work
+finishing.** Phase 0 created five rows, three of them by splitting or re-sizing rows the last pass
+had already called startable. **That is the finding of this pass and it is worth more than the
+count**: of the three code rows wave 15 handed forward as ready, **none was buildable as written**.
+
+| Row | The board said | Measured |
+|---|---|---|
+| SHIP-172 | 5 points, startable | **Not buildable.** Nothing in production code can delete an object; `internal/platform/storage` states in three places that it has no delete. That capability is now SHIP-171a |
+| SHIP-183 | 3 points | **Mis-sized and mis-shaped.** `Docs/01` states no rate-limiting requirement anywhere, so 84 of the 86 routes need a number nobody has decided. Now 5, with the application split out as SHIP-183a |
+| SHIP-81c | 3 points | **Under-sized.** `features/profile/` holds one stub file where the smallest comparable feature holds seven. Now 5, with the fallback split out as SHIP-81d |
+
+**The check that found all three is the one wave 14 added and it is now the point of this section.**
+A dependency column says a row *may* start; it says nothing about whether the thing it builds on
+exists. **Read every row here as "dependencies met", never as "ready", and measure before scheduling.**
+
+| Ticket | Pts | Area | Held? |
+|---|---|---|---|
+| SHIP-17b | 5 | Contract validation that reaches the authenticated surface. **New this pass, and it is the general form of a defect wave 16 opened with**: `TestResponsesMatchTheContract` is SHIP-17a's criterion and works, but its `exercisable()` filter reaches **4 of the 86 routes** on the manifest and there is no request-body check at all. SHIP-159's `expires_at` drifted through that gap for a wave | — |
+| SHIP-81c | 5 | A provider captures their four verification documents in the app. **Unblocked by an owner decision in wave 15**, re-sized in wave 16. The three proof classes move to `core/` first | **Lane C, wave 16** |
+| SHIP-171a | 3 | The platform can delete an object it stored. **New this pass.** It is what SHIP-172 was missing, and it deletes nothing belonging to anybody | **Lane B, wave 16** |
+| SHIP-171b | 3 | A pseudonymised account stops being a notification recipient. **New this pass, and not a re-size but a defect**: SHIP-171 left notifications addressed to the pseudonym, failing to dispatch and climbing `attempts` for ever | **Lane B, wave 16** |
+| SHIP-183 | 5 | Choose and justify a limit for every endpoint. **The contention strike is lifted by the split** — deciding 86 numbers touches no code, and it is the applying that touches every domain. That half is SHIP-183a, which is not startable until this lands | — |
+| ~~SHIP-172~~ | 5 | **Struck, and struck by something no parser can see.** Every declared dependency is met and **X-4 gates it** — §5 has the reasoning, which is that deleting verification evidence is precisely what a retention obligation constrains. This is the X-6 shape exactly: a block that lives in prose and in no dependency column | — |
+| ~~SHIP-156~~ | 3 | **Strike carried, seventh consecutive pass.** The conversation exists; **the report mechanism does not**, and no `Docs/09` row describes it. What would lift it is a row, and what is reportable, by whom, with what outcome and against what policy is `Docs/04` §5's territory | — |
+| ~~SHIP-174~~ | 3 | Struck — needs a Datadog account (external) | — |
+| ~~SHIP-178~~ | 3 | Struck — needs store-console access (external) | — |
+| ~~SHIP-182~~ | 5 | Struck — needs a deployed environment (external) | — |
+
+Plus **X-1, X-3, X-4, X-5 and X-10**, none of which is code and none of which has started. **X-5 and
+X-10 need no third party at all**, and **X-4 is now the only external answer standing in front of a
+code row somebody could otherwise start tomorrow.**
+
+**The startable-and-sensible set is five tickets and 21 points** — SHIP-17b, SHIP-81c, SHIP-171a,
+SHIP-171b and SHIP-183 — against two tickets and 8 points a pass ago. **Three of the five are wave
+16's lanes.** The board widened because rows were measured and split, not because anything shipped,
+and that is the honest reading of it.
+
+**Track X remains the binding constraint on the whole board**, as §5 has said for five passes. What
+changed is that it now blocks a smaller, better-named set: X-4 gates SHIP-172 alone rather than three
+code rows, because two of the three shipped without needing it.
+
+### What this section said before wave 16, kept for its reasoning
 
 **Recomputed on `develop` at `81e52f2`, after wave 15 merged.** Strict build order says the next
 ticket is the lowest-numbered open one, which is **SHIP-24** — and it is blocked on X-2, as are the
@@ -19266,6 +19337,37 @@ Nothing to fix; the habit is to re-read it at each reconciliation, which this pa
 is the most consequential instrument finding of the wave and the second is an owner edit this branch
 was refused permission to make.**
 
+### The contract gate reaches 4 of 86 routes, and it says so on every run
+
+**A published contract is checked against the service by `TestResponsesMatchTheContract`, and that
+test is not the problem — its coverage is.** `exercisable()` skips every non-GET, every authenticated
+route and every parameterised path, which on today's manifest leaves **4 of 86**: `/health`,
+`/v1/app/minimum-version`, `/v1/app/policy` and `/v1/{$}`. Everything a client actually posts to is
+outside it, including all 47 mutating routes. **There is no request-body check at any coverage.**
+
+**This is not a hidden gap and that is the interesting part.** The test logs the full skipped list on
+every run, and its own comment says the choice was *"to **name** what is skipped rather than silently
+narrow the check — a test that quietly stops covering half the surface reads exactly like one that
+covers all of it."* That was the right call. **It still did not stop the drift**, because a named gap
+in CI output is not a failing gate, and nobody reads a passing test's log.
+
+**What went through it:** SHIP-159 added `expires_at` to the submission handler and the response
+struct and to `contracts/paths/admin.yaml`, and not to `contracts/paths/profiles.yaml`, whose two
+document schemas both declare `additionalProperties: false`. For a wave the published contract
+**forbade a field the service accepted on the way in and returned on the way out**. A client
+generated from the document rejected a valid response. Wave 16's Phase 0 fixed the two schemas and
+added a narrow guard for that pair; **the general fix is `Docs/09`'s SHIP-17b**, written in the same
+change.
+
+**The recommendation this entry carries is about the shape of the fix, not whether to make it.**
+`kin-openapi` and a `gorillamux` router are already in `go.mod` and already used by this test, so the
+machinery exists. What does not exist is a way to drive an authenticated POST without a fixture per
+route — and the request half has a second wall: the handler request structs are **unexported in their
+domain packages**, so no test in `cmd/api` can reflect over them. Whoever takes SHIP-17b decides
+between a fixture per route in `cmd/api`, a parity helper each domain calls on its own structs, or
+validating live traffic in the harness. **All three are real; none is a small edit, which is why the
+row is 5 and not 2.**
+
 ### `make verify` can exit 0 having run no checks at all
 
 **Found by wave 14's Lane A, reproduced by the orchestrator in three runs, and reproduced again here
@@ -19371,6 +19473,33 @@ picker rather than a second recording path, which is narrower. What SHIP-81c add
 four document kinds rather than one photo, and clearing app storage once uploaded. **Three also
 matches SHIP-100 and SHIP-173**, the other client rows that drive one flow over machinery that
 already exists.
+
+**That estimate was re-measured in wave 16 and it did not survive, and the reasoning above is where it
+went wrong rather than the arithmetic.** The comparison is sound: SHIP-130 wrote the camera and the
+compression policy from nothing and SHIP-81c reuses both. What the comparison assumed is that *moving
+three classes* is close to free, and the move is where the cost is:
+
+- **`ProofStore.folder` is `static const folder = 'proof'`** (`proof_image.dart:232`). Verification
+  documents must not land in a directory named `proof/`, so the move is a parameterisation and an API
+  decision, not a file rename.
+- **`proof_never_reaches_the_gallery_test.dart:195` hard-codes `'lib/features/delivery/proof_camera.dart'`
+  as a string.** No refactor tool follows it.
+- **`PermissionCopy.cameraPurpose` is byte-asserted against `NSCameraUsageDescription`.** The shipped
+  string describes proof at pickup and delivery only, so covering this use is a Dart edit and an iOS
+  plist edit that must move together — and it supersedes copy SHIP-179 already shipped.
+- **`features/profile/` is one 8-line stub library file.** The smallest comparable feature directory
+  holds seven files. The row was read as "point existing machinery at a different upload"; there is
+  no screen, controller, repository or model for it to point.
+- **The fallback needs a package the guard test bans by category.** `_forbiddenPackages` refuses
+  `image_picker` and every gallery package **and** demands a written argument for anything in that
+  space. SHIP-131's fallback reused a mechanism that existed; this one adds a dependency past a guard
+  built to stop exactly that. **Narrower is the wrong word for it.**
+
+**So the row was under-sized rather than over-scoped — which is what this entry already concluded
+once — and the honest number is 8.** `Docs/09`'s legend says nothing in it is an 8 because anything
+that size was split, and no row in the 232 was above a 5, so it is split rather than written:
+**SHIP-81c at 5 for the capture and SHIP-81d at 3 for the declined-permission fallback.** Same total,
+and the legend stays true.
 
 **Two blockers make it unstartable rather than merely unstarted, and both were measured on
 `54ea9af`.**
