@@ -212,6 +212,42 @@ func (postgresStore) markFailed(
 	return nil
 }
 
+// markRecipientDeleted retires a notification addressed to an account the platform has deleted
+// (SHIP-171b).
+//
+// # Three differences from [postgresStore.markUndeliverable], all of them deliberate
+//
+// The status is the same, and 000702's definition — "the address is gone, no retry can help, and
+// nobody needs telling" — is why. [Service.retire] carries the argument for reusing it rather than
+// widening ck_notifications_status a second time.
+//
+//  1. **attempts is not incremented.** That one counts an attempt that was made; this row is
+//     retired in front of the dispatch and nothing is handed to a sender, so incrementing would
+//     record an attempt that did not happen — and SHIP-171b's clause is that the counter stops
+//     climbing on a person the platform has deleted.
+//  2. **last_error names the account rather than the channel.** "Rejected by the channel and
+//     deregistered" would be false here in both halves. Somebody reading this row a year later
+//     wants to know that the recipient was erased, not that a mail server said something.
+//  3. **The guard is on the status.** A row that has already been sent is not un-sent by a later
+//     deletion, and a row already terminal is not rewritten with a second reason. Only a claimable
+//     row is retired, which is the same set the claim itself takes.
+//
+// sent_at stays NULL, which ck_notifications_sent_at requires of anything that is not `sent`.
+// next_attempt_at is left as it is: the status is terminal, so the claim never looks at it again,
+// and clearing it would erase when the row had last been deferred.
+func (postgresStore) markRecipientDeleted(ctx context.Context, r db.Runner, id uuid.UUID) error {
+	const q = `
+		UPDATE notifications
+		   SET status = 'undeliverable',
+		       last_error = 'the account this was addressed to has been deleted, so it was never sent'
+		 WHERE id = $1 AND status NOT IN ('sent', 'undeliverable')`
+
+	if _, err := r.Exec(ctx, q, id); err != nil {
+		return fmt.Errorf("notifications: retiring %s for a deleted recipient: %w", id, err)
+	}
+	return nil
+}
+
 // markUndeliverable records an address that no longer exists (SHIP-139, 000702).
 //
 // Terminal: the claim's predicate excludes this status, so the row is never worked again. attempts

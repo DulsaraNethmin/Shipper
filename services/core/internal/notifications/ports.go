@@ -116,6 +116,70 @@ type Pusher interface {
 	Push(ctx context.Context, deviceToken, title, body string, jobID uuid.UUID) (rejected bool, err error)
 }
 
+// Deletions reports which accounts the platform has deleted (SHIP-171b).
+//
+// # The defect this exists to close
+//
+// SHIP-171 replaces a person's name, address and number with a pseudonym and retains the
+// transaction, per Docs/05 §3.1. **It did not stop them being a notification recipient**, and its
+// own Docs/11 §3 entry says so: a person still party to a retained job resolves as a recipient of a
+// later `job.status_changed`, the row is written with the pseudonym as its address, it fails to
+// dispatch, and `attempts` climbs for ever on somebody the platform has deleted.
+//
+// `notifications.address` is a **resolved copy** — 000700 calls it "an email address, or an E.164
+// number. Resolved once, when the row is written, from users" — so pseudonymising `users` does not
+// fix it in either direction: a new row copies the pseudonym in, and an old row keeps whatever it
+// copied before. Measured on this tree before the fix was written: one `Consume` of `bid.placed`
+// for a pseudonymised customer wrote one `pending` row addressed to `deleted:<uuid>`, and one
+// dispatch pass took it to `failed` with `attempts` at 1, from which `failed` is not terminal.
+//
+// # Why this is a port and not a column, a join, or a string test
+//
+// **Not a string test.** The obvious implementation is to look at the address and refuse anything
+// beginning `deleted:`, and it is wrong twice over: it makes every caller depend on
+// identity.PseudonymFor's rendering, which that function's own comment treats as a free choice, and
+// it answers "does this look pseudonymised" rather than "has this person been deleted". Those come
+// apart the moment anybody changes the prefix, and they come apart silently.
+//
+// **Not a join.** The fact lives in `account_deletion_requests`, which is identity's table in
+// identity's migration block. This package reads `users` directly because migrations/blocks.go
+// calls the shared block "tables every domain reads" and five domains do; that table is not one of
+// them, and a join written here would read as though identity's requests were something
+// notifications owns. That is the argument [Parties] and [Sessions] already make, and this is the
+// fifth instance of the arrangement (SHIP-113, SHIP-117, SHIP-137, SHIP-140).
+//
+// **Not a column on `users`.** `users.status` is `active`, `restricted` or `suspended` under
+// ck_users_status, in the shared migration block, and SHIP-171 deliberately leaves `status` alone
+// because it "describes the record, not the human". Widening it would put a deletion state in a
+// column eight domains read for account standing.
+//
+// # What the authority actually is
+//
+// A request in identity's `completed` state. It is written by the same transaction that
+// pseudonymises the five tables, so there is no window in which one is true and the other is not,
+// and it is a record of the *act* rather than of its rendering. An account with no completed
+// request is not deleted however its address happens to read.
+//
+// # Why it is required rather than an option
+//
+// [WithSessions] is an option and this is not, and the difference is the rule that file states:
+// "An option is only acceptable here because the default is the safe answer in every case." A
+// missing [Sessions] addresses no handset, which under-notifies visibly. A missing [Deletions]
+// would restore exactly the defect above, silently, in whatever process forgot it — so the safe
+// default does not exist and the collaborator is positional, like [Parties], and refused when nil.
+type Deletions interface {
+	// DeletedAccounts returns the subset of ids the platform has deleted.
+	//
+	// A map rather than a slice, for [Sessions.LiveSessions]'s reason: the caller holds rows
+	// keyed by recipient and needs to test membership rather than iterate. An account with no
+	// request at all is simply absent, which is the same answer as an open request and is the
+	// answer this domain wants: address it normally.
+	//
+	// It takes a db.Runner so the read runs inside the pass's transaction, which is what makes
+	// the answer consistent with the rows being written or claimed beside it.
+	DeletedAccounts(ctx context.Context, r db.Runner, ids []uuid.UUID) (map[uuid.UUID]bool, error)
+}
+
 // Sessions reports which device sessions are still usable.
 //
 // # This is what makes SHIP-140's "clears on sign-out" a platform guarantee rather than a client one

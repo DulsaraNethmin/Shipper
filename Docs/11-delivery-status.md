@@ -872,6 +872,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-173** | M7 | The account deletion screen — the client half of the two, and the only place in the app that reaches `POST /v1/account/deletion`. **It renders `deferred` because SHIP-170 exists**, which is why the two were one lane: `contracts/paths/identity.yaml` had already told clients to branch on `state` rather than assume it, and a screen shipped before the state would have told somebody mid-delivery their account goes on the fifteenth. Consequences are `Docs/05` §3.1's split rather than a warning — what is deleted for good, and **what stays under a pseudonym**, which is the half nobody expects. The confirmation is tested in **both** directions: opening the dialog sends nothing and dismissing it sends nothing, which is `award_test.dart`'s argument that a confirmation tested only in the accepting direction is one nobody has checked. It draws **no job** on a screen both roles reach, and a repeat is not read as a new request — asking again is how a deferral lifts, so the button stays and the second call is what the test asserts. Entry point is a third app-bar action on the signed-in shell, because there is no settings screen and inventing one for a single action would be building what a later ticket has to reconcile with — *see below* |
 | **SHIP-171** | M7 | The clock runs out and the person stops being a person. `Docs/05` §3.1's *delete the person, retain the transaction*, executed from **cmd/worker's sixth registered task** because nobody presses a button to be erased on the thirtieth day. **`'completed'` joins the CHECK and must not join the open-request index** — `000105` said why before either state existed and `000106` named this ticket doing it — and the mutation adding it to `openDeletionStatesSQL` is killed **behaviourally** as well as by the pairing guard: PostgreSQL stops being able to infer the partial index from the `ON CONFLICT` predicate, and sixteen tests fail on the running query. The pseudonym is a **pure function of `users.id`**, which `Docs/05` §3.1 already calls the pseudonym, and it is deliberately **not a valid address or number**, so the account is unreachable at sign-in by construction rather than by a check. Five tables across four domains, one transaction; the two outside `internal/identity` are reached through a port it declares. **`notifications.address` is the finding** — a stored copy of the contact channel keyed to the account, which no list of tables would have caught and a **whole-schema sweep** did. `users.password_hash` is declared out of scope with its reason — *see below* |
 | **SHIP-171a** | M7 | `internal/platform/storage` can remove an object, and the three places saying it could not now say what changed. **It is the second application of SHIP-115's narrowing rather than an exception to it**: the rule that was always doing the work is *no transfer through this service*, and a DELETE carries no body in either direction exactly as a HEAD does not. **The one API decision was argued from a measurement rather than from the specification** — the running store answers **204 to a DELETE of a key that has never existed**, so idempotence is the store's behaviour and not a translation this package performs, and the only thing that answers **404 is a missing bucket**. That inverts `S3.Stored`'s treatment of 404 and the inversion is the point: folding it in would make a service pointed at the wrong bucket report every deletion as done. `internal/profiles`' statement turned out to be about something else and was **clarified rather than reversed** — a delete moves no byte, so *nothing here moves a byte* never explained its absence. **Nothing belonging to anybody is deleted by this row**: no domain declares a port for it, no composition root calls it, and every object the tests remove was created to be removed — *see below* |
+| **SHIP-171b** | M7 | The account is erased and the notifications stop. SHIP-171's own entry named this under *what this does not build* and gave it no ticket; **the finding reproduces, measured on this branch before anything was written** — one `Consume` wrote a `pending` row addressed to `deleted:<uuid>`, and one dispatch pass took it to `failed` with `attempts` at 1, from which `failed` is not terminal. `notifications.address` is a **resolved copy**, so pseudonymising `users` defeats nothing in either direction. **Not suppressed by the pseudonym's spelling**, and both directions are asserted: a deleted account with an ordinary address is suppressed, and a live account whose address reads exactly like a pseudonym is notified. The authority is a `completed` deletion request, reached through a port `notifications` declares and `cmd/notifier` supplies — the **fifth** instance of that arrangement — and it is **required rather than an `Option`** because neither default is safe, which is the rule `consume.go` already states. `undeliverable` rather than a fifth status, and **`attempts` is deliberately not incremented**: no attempt is made, and the row's own words are that the counter stops climbing. **No migration and no constraint.** A defect found and not fixed: `bid.rejected` and `bid.expired` notify nobody, ever — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -15949,6 +15950,133 @@ It is wrong in exactly the way `profiles`' was and it needs the same one-paragra
 - **No change to the deletion state machine.** `pseudonymise.go` closes an executed request to
   `completed`, and an "artefacts pending" state only SHIP-172 could exit would strand rows on
   `develop` for as long as X-4 is unanswered.
+
+### SHIP-171b — the account is erased and the notifications stop, which SHIP-171 left open
+
+SHIP-171's own §3 entry names this under *What this does not build*: *"Notifications to a
+pseudonymised account are not suppressed... the row would be written with the pseudonym as its
+address and would fail to dispatch, legibly, climbing `attempts`. It has no ticket."* It has one now.
+
+**The finding reproduces, measured on this branch before anything was built.** An account
+pseudonymised exactly as `internal/identity` does it, then:
+
+```
+Consume of one bid.placed -> 1 row, status pending, address "deleted:01a01424-…"
+one Dispatch pass         -> claimed, status failed, attempts 1, last_error "550 no such recipient"
+```
+
+`failed` is not terminal, so the second line is the one that matters: the row is claimed again on
+every later pass, for ever.
+
+#### Why pseudonymising `users` did not fix it, and why a string test would not either
+
+`notifications.address` is a **resolved copy** — `000700` says so: *"an email address, or an E.164
+number. Resolved once, when the row is written, from users"*. So the copy defeats it in both
+directions. A row written **after** the deletion copies the pseudonym in fresh; a row written
+**before** keeps whatever it copied, which SHIP-171's own adapter then overwrote with the pseudonym.
+Neither is reachable by fixing `users`.
+
+The obvious implementation is to refuse an address beginning `deleted:`. It is wrong twice: it makes
+the fix depend on `identity.PseudonymFor`'s rendering, which that function treats as a free choice,
+and it answers *does this look pseudonymised* rather than *has this person been deleted*. Those come
+apart silently. **Both directions are asserted** — a deleted account whose stored address is an
+ordinary one is still suppressed, and a live account whose address reads exactly like a pseudonym is
+still notified. The second matters more: an address is a value a person can influence.
+
+#### Where the suppression lives, and the port it needed
+
+The authority is a deletion request in identity's `completed` state, written by the same transaction
+that replaces the person in five tables — so there is no instant in which one is true and the other
+is not, and it records the **act** rather than its rendering.
+
+That table is identity's, in identity's block. `internal/notifications` reads `users` directly
+because `migrations/blocks.go` calls the shared block *"tables every domain reads"*, and
+`account_deletion_requests` is not one of them. So it is a **port the consuming domain declares** and
+`cmd/notifier` supplies — `notifications.Deletions`, the **fifth** instance of the arrangement after
+SHIP-113, SHIP-117, SHIP-137 and SHIP-140, written the same way deliberately.
+
+**It is required rather than an option, and that is the entry's one design argument.** `consume.go`
+already states the rule: *"An option is only acceptable here because the default is the safe answer
+in every case."* A missing `Sessions` addresses no handset, which under-notifies visibly. A missing
+`Deletions` has no safe default at all — one answer restores the defect silently and the other stops
+the platform notifying anybody. So it is positional beside `Parties`, refused when nil, and
+`cmd/api` supplies a `noDeletionsHere` that panics beside its `noPartiesHere`, for the reason that
+file already gives.
+
+**The adapter reads `identity.DeletionCompleted` rather than the literal `'completed'`**, which is
+`Docs/10` §3.4's pairing across a composition root: a domain that renamed its state breaks this
+build instead of quietly ceasing to suppress. And the **two open states are deliberately not
+deleted accounts** — a person inside the thirty days `Docs/05` §3.1 promises them is still a person,
+and a platform that stopped notifying them at the request would deny them exactly the messages about
+a delivery in flight that the window exists to let them finish. `40-identity.sh` leaves an account
+holding a `completed` request **and** a later open one, which is the row a predicate written as
+`state <> 'requested'` gets wrong, and `scripts/verify/82-notifications-deletion.sh` asserts on it.
+
+#### The two halves are different, and neither fixes the other
+
+| Half | Where | What it does |
+|---|---|---|
+| Nothing new is written | `resolve`, **before** the address read | A deleted account never becomes a `Recipient`: `users` is not read for it, nothing is rendered for it, no device lookup runs for it, and no row is written. The pseudonym is never in a variable, so there is nothing for a later change to leak into a row |
+| Nothing queued dispatches | `Dispatch`, after the claim | The rows retired here were written before the deletion, so the first half cannot reach them; and a row retired at dispatch has already been written to somebody erased, so the second cannot stand alone |
+
+#### `undeliverable` rather than a fifth status, and `attempts` deliberately unchanged
+
+`000702` defines the status as *"the address is gone, no retry can help, and nobody needs telling"*,
+which is true of this row more literally than of the rejected device token it was written for. That
+migration also says the status is *"deliberately not reachable from email"* — and **that paragraph is
+about bounces**: a hard bounce may be a full mailbox, the platform learns of it asynchronously
+through a webhook this MVP does not have, and it must not be treated as final. A deletion is not
+that. The platform destroyed the address itself, in a transaction, and knows it synchronously. A
+fifth status would have meant a migration widening `ck_notifications_status` to express a fact the
+fourth already expresses.
+
+**`attempts` is not incremented, and that is the clause rather than a detail.** `markUndeliverable`
+increments it *"because one was made"*; none is made here, because the row is retired in front of the
+dispatch and nothing is handed to a sender. The row's words are that the counter *stops climbing*, so
+a final increment would be the clause met in reduced form. `TestARetiredNotificationIsNeverClaimedAgain`
+runs a second pass to make "stops" a statement about time rather than about one run, and the harness
+does the same on a pass whose occurrence is evidenced by two control rows reaching `sent`.
+
+**Push rows are retired too and the device token is left exactly where it was.** `Service.reject`
+deregisters a token because FCM said the device was dead, which is a fact about the device; this is a
+fact about the account, `device_tokens.token` is named in SHIP-172's own *Done when*, and the row
+keeps its address so that what was aimed at which handset stays answerable.
+
+#### No migration, and the sweep that says so
+
+Nothing here adds a `CHECK`, a `NOT NULL`, a trigger, a required column or a required transition, so
+migration block 100–199 is untouched and `000108` is still free. The sweep was run anyway, because
+the behaviour of the dispatcher changed for rows other sections create: `grep -l "INSERT INTO
+notifications"` over `scripts/verify/` returns `40-identity.sh` and `81-notifier.sh` alone; only
+`81-notifier.sh` runs `cmd/notifier`; and **every assertion either file makes over `notifications`
+is fenced on its own `event_id` or `recipient_id`** — there is no unfenced count over that table
+anywhere in the harness.
+
+#### A statement this expires in a file it may not edit
+
+`cmd/worker/tasks_identity.go:234` justifies writing `notifications.address` from the composition
+root with *"`internal/notifications` declares no port for this and nothing in it has a reading of
+deletion."* **The second half is now false**: that domain declares `Deletions` and has a reading of
+deletion in both `Consume` and `Dispatch`. The decision it defends is still right — the address is a
+stored value with no policy attached, and the asymmetry with `provider_profiles` stands — but the
+sentence needs its second clause corrected to say that the reading exists and answers a different
+question. `cmd/worker` belongs to no lane this wave, so it is recorded here rather than edited.
+
+#### A defect this found and did not fix
+
+Building the verify section needed an event that routes to one named provider, and `bid.rejected`
+is that event — its only audience is `ToBidProvider`. **It notifies nobody, ever, in the only case it
+arises.** `resolve` skips `ToBidProvider` when the payload's `offered_by` is `provider`, which is the
+actor suppression `bid.countered` needs; and `emitClosed` puts the bid's own `offered_by` on the
+payload, so a losing provider's rejection carries `provider` and resolves to an empty audience.
+`bid.expired` is the same shape.
+
+Measured rather than read: consuming each with `offered_by: provider` and a real provider in
+`provider_id` wrote **0 rows**, twice. So *"Your offer was not accepted."* and *"Your offer has
+expired on its own terms."* have never been delivered to anybody. It has no ticket and this row does
+not fix it — the routing is a product decision, and changing it would alter what several verify
+sections see. The section works around it with `offered_by: customer`, which is a combination the
+platform genuinely emits, and says why in a comment.
 
 ## 4. Partly done — do not treat these as finished
 

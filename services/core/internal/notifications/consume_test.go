@@ -50,6 +50,55 @@ func (s *stubParties) PartiesOn(context.Context, db.Runner, uuid.UUID) (uuid.UUI
 	return s.customer, s.provider, true, nil
 }
 
+// stubDeletions answers which accounts the platform has deleted, without identity's table.
+//
+// The real implementation is cmd/notifier's deletedAccountLookup and reads
+// `account_deletion_requests`, which this package may not join to; the port exists precisely so
+// this package does not have to know that. What the stub cannot show is that the query is right,
+// which is why cmd/notifier tests it against a real database and the verify section runs it end to
+// end.
+//
+// **It is keyed by identifier and knows nothing about a pseudonym.** That is not incidental: a stub
+// that decided by inspecting an address would let a suppression built on the pseudonym's spelling
+// pass these tests, which is the implementation SHIP-171b's row rules out.
+type stubDeletions struct {
+	deleted map[uuid.UUID]bool
+	err     error
+	calls   int
+}
+
+func (s *stubDeletions) DeletedAccounts(
+	_ context.Context, _ db.Runner, ids []uuid.UUID,
+) (map[uuid.UUID]bool, error) {
+	s.calls++
+	if s.err != nil {
+		return nil, s.err
+	}
+	answer := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		if s.deleted[id] {
+			answer[id] = true
+		}
+	}
+	return answer, nil
+}
+
+// deletionsFor is a lookup that reports exactly these accounts as deleted.
+func deletionsFor(ids ...uuid.UUID) *stubDeletions {
+	deleted := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		deleted[id] = true
+	}
+	return &stubDeletions{deleted: deleted}
+}
+
+// noDeletions is the lookup for a test about something else: nobody has been deleted.
+//
+// Every service in this package needs one — [NewService] refuses a nil, because a process that
+// cannot tell a deleted account from a live one is the defect SHIP-171b closes — so this is what a
+// test that is not about deletion passes.
+func noDeletions() *stubDeletions { return &stubDeletions{} }
+
 // recordingSender counts what it was asked to send, and can be told to fail.
 type recordingSender struct {
 	sent []string
@@ -162,7 +211,7 @@ func TestAnEventBecomesOneRowPerRecipientPerChannel(t *testing.T) {
 	customer := newUser(t, pool, "consume-customer@example.com", "+61400007101", "customer")
 	provider := newUser(t, pool, "consume-provider@example.com", "+61400007102", "provider")
 	parties := &stubParties{customer: customer, provider: provider}
-	service := NewService(parties, clock.NewFixed(testInstant), Senders{})
+	service := NewService(parties, noDeletions(), clock.NewFixed(testInstant), Senders{})
 
 	job := uuid.Must(uuid.NewV7())
 	env := envelopeOf(t, "bid.accepted", map[string]any{
@@ -217,7 +266,7 @@ func TestTheSameEventTwiceWritesNothingTheSecondTime(t *testing.T) {
 	pool := pgtest.DB(t)
 
 	customer := newUser(t, pool, "twice-customer@example.com", "+61400007103", "customer")
-	service := NewService(&stubParties{customer: customer}, clock.NewFixed(testInstant), Senders{})
+	service := NewService(&stubParties{customer: customer}, noDeletions(), clock.NewFixed(testInstant), Senders{})
 
 	env := envelopeOf(t, "bid.placed", map[string]any{
 		"job_id":      uuid.Must(uuid.NewV7()).String(),
@@ -256,7 +305,7 @@ func TestARuleThatTellsNobodyWritesNothing(t *testing.T) {
 
 	customer := newUser(t, pool, "nobody@example.com", "+61400007104", "customer")
 	parties := &stubParties{customer: customer}
-	service := NewService(parties, clock.NewFixed(testInstant), Senders{})
+	service := NewService(parties, noDeletions(), clock.NewFixed(testInstant), Senders{})
 
 	env := envelopeOf(t, EventJobStatusChanged, map[string]any{
 		"job_id": uuid.Must(uuid.NewV7()).String(),
@@ -288,7 +337,7 @@ func TestAJobReachingCompletedTellsBothParties(t *testing.T) {
 
 	customer := newUser(t, pool, "completed-customer@example.com", "+61400007105", "customer")
 	provider := newUser(t, pool, "completed-provider@example.com", "+61400007106", "provider")
-	service := NewService(&stubParties{customer: customer, provider: provider},
+	service := NewService(&stubParties{customer: customer, provider: provider}, noDeletions(),
 		clock.NewFixed(testInstant), Senders{})
 
 	env := envelopeOf(t, EventJobStatusChanged, map[string]any{
@@ -316,7 +365,7 @@ func TestNobodyIsToldWhatTheyJustDid(t *testing.T) {
 
 	customer := newUser(t, pool, "suppress-customer@example.com", "+61400007107", "customer")
 	provider := newUser(t, pool, "suppress-provider@example.com", "+61400007108", "provider")
-	service := NewService(&stubParties{customer: customer, provider: provider},
+	service := NewService(&stubParties{customer: customer, provider: provider}, noDeletions(),
 		clock.NewFixed(testInstant), Senders{})
 
 	t.Run("the party who countered is not told about their own counter", func(t *testing.T) {
@@ -361,7 +410,7 @@ func TestNobodyIsToldWhatTheyJustDid(t *testing.T) {
 func TestAnEventAboutAJobThatIsGoneTellsNobody(t *testing.T) {
 	pool := pgtest.DB(t)
 
-	service := NewService(&stubParties{missing: true}, clock.NewFixed(testInstant), Senders{})
+	service := NewService(&stubParties{missing: true}, noDeletions(), clock.NewFixed(testInstant), Senders{})
 
 	env := envelopeOf(t, EventJobStatusChanged, map[string]any{
 		"job_id": uuid.Must(uuid.NewV7()).String(),
@@ -387,7 +436,7 @@ func TestAnEventAboutAJobThatIsGoneTellsNobody(t *testing.T) {
 func TestAnUnknownEventTypeIsRefused(t *testing.T) {
 	pool := pgtest.DB(t)
 
-	service := NewService(&stubParties{}, clock.NewFixed(testInstant), Senders{})
+	service := NewService(&stubParties{}, noDeletions(), clock.NewFixed(testInstant), Senders{})
 	env := envelopeOf(t, "job.something_nobody_routed", map[string]any{
 		"job_id": uuid.Must(uuid.NewV7()).String(),
 	})
@@ -403,7 +452,7 @@ func TestAnUnknownEventTypeIsRefused(t *testing.T) {
 func TestConsumeRefusesAPool(t *testing.T) {
 	pool := pgtest.DB(t)
 
-	service := NewService(&stubParties{}, clock.NewFixed(testInstant), Senders{})
+	service := NewService(&stubParties{}, noDeletions(), clock.NewFixed(testInstant), Senders{})
 	env := envelopeOf(t, "bid.placed", map[string]any{
 		"job_id":      uuid.Must(uuid.NewV7()).String(),
 		"provider_id": uuid.Must(uuid.NewV7()).String(),
@@ -428,7 +477,7 @@ func TestASuspendedAccountIsNotEmailed(t *testing.T) {
 		t.Fatalf("suspending the account: %v", err)
 	}
 
-	service := NewService(&stubParties{customer: customer}, clock.NewFixed(testInstant), Senders{})
+	service := NewService(&stubParties{customer: customer}, noDeletions(), clock.NewFixed(testInstant), Senders{})
 	env := envelopeOf(t, "bid.placed", map[string]any{
 		"job_id":      uuid.Must(uuid.NewV7()).String(),
 		"provider_id": uuid.Must(uuid.NewV7()).String(),

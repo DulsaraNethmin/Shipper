@@ -23,7 +23,7 @@ import (
 // preferenceService is a service with nothing wired but a clock and a parties stub, which is all a
 // preference test needs.
 func preferenceService(parties Parties) *Service {
-	return NewService(parties, clock.NewFixed(testInstant), Senders{Email: &recordingSender{}})
+	return NewService(parties, noDeletions(), clock.NewFixed(testInstant), Senders{Email: &recordingSender{}})
 }
 
 // setMuted runs SetMuted in a transaction, which is what it requires.

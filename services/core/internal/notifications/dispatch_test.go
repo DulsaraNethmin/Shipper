@@ -77,7 +77,7 @@ func TestDispatchSendsOnTheChannelTheRowNames(t *testing.T) {
 	recipient := newUser(t, pool, "dispatch@example.com", "+61400007201", "customer")
 	mail := &recordingSender{}
 	text := &smsSender{}
-	service := NewService(&stubParties{}, clock.NewFixed(testInstant),
+	service := NewService(&stubParties{}, noDeletions(), clock.NewFixed(testInstant),
 		Senders{Email: mail, SMS: text})
 
 	byEmail := pending(t, pool, recipient, ChannelEmail, "dispatch@example.com")
@@ -113,7 +113,7 @@ func TestASentNotificationIsNotSentAgain(t *testing.T) {
 
 	recipient := newUser(t, pool, "once@example.com", "+61400007202", "customer")
 	mail := &recordingSender{}
-	service := NewService(&stubParties{}, clock.NewFixed(testInstant), Senders{Email: mail})
+	service := NewService(&stubParties{}, noDeletions(), clock.NewFixed(testInstant), Senders{Email: mail})
 
 	pending(t, pool, recipient, ChannelEmail, "once@example.com")
 
@@ -143,7 +143,7 @@ func TestAFailedSendLeavesTheRowClaimable(t *testing.T) {
 
 	recipient := newUser(t, pool, "bounces@example.com", "+61400007203", "customer")
 	mail := &recordingSender{fail: errors.New("the provider returned 503")}
-	service := NewService(&stubParties{}, clock.NewFixed(testInstant), Senders{Email: mail})
+	service := NewService(&stubParties{}, noDeletions(), clock.NewFixed(testInstant), Senders{Email: mail})
 
 	id := pending(t, pool, recipient, ChannelEmail, "bounces@example.com")
 
@@ -171,7 +171,7 @@ func TestAFailedSendLeavesTheRowClaimable(t *testing.T) {
 
 	// Once the backoff has elapsed the message goes out, with no intervention and nothing
 	// scheduled: the claim's predicate is still what retries it.
-	later := NewService(&stubParties{}, clock.NewFixed(testInstant.Add(BackoffFor(1)+time.Second)),
+	later := NewService(&stubParties{}, noDeletions(), clock.NewFixed(testInstant.Add(BackoffFor(1)+time.Second)),
 		Senders{Email: mail})
 	claimed, err := dispatchOnce(t, pool, later)
 	if err != nil {
@@ -219,7 +219,7 @@ func TestOneStuckRowDoesNotStopTheQueue(t *testing.T) {
 
 	recipient := newUser(t, pool, "stuck@example.com", "+61400007213", "customer")
 	mail := &selectiveSender{failFor: "stuck@example.com"}
-	service := NewService(&stubParties{}, clock.NewFixed(testInstant), Senders{Email: mail})
+	service := NewService(&stubParties{}, noDeletions(), clock.NewFixed(testInstant), Senders{Email: mail})
 
 	// A batch's worth of rows that will never succeed, all older than the one that must go out.
 	for range DispatchBatch {
@@ -262,7 +262,7 @@ func TestOneFailureDoesNotRollBackTheRestOfTheBatch(t *testing.T) {
 	bad := newUser(t, pool, "bad@example.com", "+61400007205", "customer")
 
 	mail := &selectiveSender{failFor: "bad@example.com"}
-	service := NewService(&stubParties{}, clock.NewFixed(testInstant), Senders{Email: mail})
+	service := NewService(&stubParties{}, noDeletions(), clock.NewFixed(testInstant), Senders{Email: mail})
 
 	goodID := pending(t, pool, good, ChannelEmail, "good@example.com")
 	badID := pending(t, pool, bad, ChannelEmail, "bad@example.com")
@@ -288,7 +288,7 @@ func TestAChannelWithNoSenderStopsThePassAndKeepsTheRow(t *testing.T) {
 	pool := pgtest.DB(t)
 
 	recipient := newUser(t, pool, "unwired@example.com", "+61400007206", "customer")
-	service := NewService(&stubParties{}, clock.NewFixed(testInstant), Senders{})
+	service := NewService(&stubParties{}, noDeletions(), clock.NewFixed(testInstant), Senders{})
 
 	id := pending(t, pool, recipient, ChannelEmail, "unwired@example.com")
 
@@ -325,7 +325,7 @@ func TestTwoDispatchersSendEachNotificationOnce(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			service := NewService(&stubParties{}, clock.NewFixed(testInstant),
+			service := NewService(&stubParties{}, noDeletions(), clock.NewFixed(testInstant),
 				Senders{Email: senders[n]})
 
 			// Twice each, so that between them they drain a backlog larger than one

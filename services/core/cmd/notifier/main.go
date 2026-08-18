@@ -113,7 +113,7 @@ func run() error {
 	}
 	defer pool.Close()
 
-	service := notifications.NewService(jobPartiesLookup{}, clock.System{}, notifications.Senders{
+	service := notifications.NewService(jobPartiesLookup{}, deletedAccountLookup{}, clock.System{}, notifications.Senders{
 		Email: newEmailSender(cfg),
 		SMS:   newSMSSender(cfg),
 
