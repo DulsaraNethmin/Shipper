@@ -163,10 +163,28 @@ func Idempotent(store IdempotencyStore, scope func(*http.Request) string) func(h
 			next.ServeHTTP(buffered, r)
 			buffered.flush(w)
 
+			// Which outcomes settle, and which give the key back.
+			//
 			// A 5xx says "this might work if you try again", so the key goes back. Any
 			// settled outcome — including a 4xx the client caused — is the answer, and
 			// replaying it is what stops a retry loop turning one rejected bid into ten.
-			if buffered.status >= 500 {
+			//
+			// **429 is the exception, and the paragraph above is incomplete rather than
+			// wrong.** It is right about every 4xx that is an answer; a 429 is not an
+			// answer, it is a deferral. Nothing happened, so there is nothing to replay —
+			// and the response itself invites the retry that storing it would then
+			// refuse. A client that waits exactly as long as Retry-After told it to, and
+			// reuses the key it was told to reuse for that action, is handed the same
+			// refusal for the life of the entry. Twice over: a stored response carries a
+			// status, a content type, a location and a body and no other header, so the
+			// replay could not tell it how long to wait even once.
+			//
+			// Both live 429s sit behind this middleware — POST /v1/auth/login and
+			// POST /v1/admin/sessions, each refused by SHIP-47's token bucket before the
+			// credential is looked at. TestARateLimitedResponseReleasesTheKey holds this
+			// half and TestAClientErrorIsReplayed holds the other, because "release on
+			// every 4xx" would satisfy the first alone.
+			if buffered.status >= 500 || buffered.status == http.StatusTooManyRequests {
 				return
 			}
 
