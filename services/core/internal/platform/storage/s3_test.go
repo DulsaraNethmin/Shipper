@@ -737,3 +737,151 @@ func get(t *testing.T, signed string) (string, int) {
 	}
 	return string(body), response.StatusCode
 }
+
+// --- SHIP-171a: removing an object -------------------------------------------------------------
+
+// TestDeleteRemovesAnObjectThePlatformStored is SHIP-171a's *Done when* in Go, against the real
+// store rather than a fake.
+//
+// **The row says "against the real object store rather than a fake" and that clause is the row.**
+// A fake would accept any DELETE and answer whatever it was written to answer, so it would prove
+// that this package sends a request and nothing about whether the object is gone — which is the
+// whole claim. The absence is asserted with [S3.Stored], the one other request this package makes,
+// so a delete that answered 204 without removing anything fails here.
+//
+// The object is created by this test for the purpose. Nothing belonging to anybody is deleted by
+// SHIP-171a, and STORAGE_BUCKET is one bucket per worktree precisely so that a test which removes
+// things cannot reach another tree's objects.
+func TestDeleteRemovesAnObjectThePlatformStored(t *testing.T) {
+	signer, _ := liveSigner(t)
+	key := testKey(t)
+
+	const body = "an object created so that it can be removed again"
+
+	upload, _, err := signer.PresignUpload(t.Context(), key, "image/jpeg", int64(len(body)), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("signing the upload: %v", err)
+	}
+	if status := put(t, upload, "image/jpeg", body); status != http.StatusOK {
+		t.Fatalf("uploading answered %d, want 200", status)
+	}
+
+	// The fixture has to be reachable before the assertion means anything: a test whose whole
+	// claim is an absence passes just as well when the object was never there.
+	if _, _, _, found, err := signer.Stored(t.Context(), key); err != nil || !found {
+		t.Fatalf("before the delete, Stored says found=%v err=%v; the fixture never existed", found, err)
+	}
+
+	if err := signer.Delete(t.Context(), key); err != nil {
+		t.Fatalf("deleting %s: %v", key, err)
+	}
+
+	_, _, _, found, err := signer.Stored(t.Context(), key)
+	if err != nil {
+		t.Fatalf("asking about the deleted object: %v", err)
+	}
+	if found {
+		t.Error("the store still holds the object after Delete returned no error")
+	}
+}
+
+// TestDeletingAKeyThatHoldsNothingIsASuccess pins the decision S3.Delete's comment argues.
+//
+// The store answers 204 to a DELETE of a key that has never existed, so this is the behaviour
+// rather than a translation this package performs — and pinning it is what stops somebody
+// "improving" it into a not-found error later, which would make SHIP-172's cascade unable to run
+// twice.
+//
+// Two keys rather than one: a key that never existed, and a key this test deleted a moment ago.
+// They are the same request to the store and different situations for a caller, and the second is
+// the one a retrying cascade actually meets.
+func TestDeletingAKeyThatHoldsNothingIsASuccess(t *testing.T) {
+	signer, _ := liveSigner(t)
+
+	if err := signer.Delete(t.Context(), testKey(t)+"/never-uploaded"); err != nil {
+		t.Errorf("deleting a key nothing was ever stored under: %v, want no error", err)
+	}
+
+	key := testKey(t)
+	const body = "deleted twice, on purpose"
+
+	upload, _, err := signer.PresignUpload(t.Context(), key, "image/jpeg", int64(len(body)), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("signing the upload: %v", err)
+	}
+	if status := put(t, upload, "image/jpeg", body); status != http.StatusOK {
+		t.Fatalf("uploading answered %d, want 200", status)
+	}
+
+	if err := signer.Delete(t.Context(), key); err != nil {
+		t.Fatalf("the first delete: %v", err)
+	}
+	if err := signer.Delete(t.Context(), key); err != nil {
+		t.Errorf("the second delete: %v, want no error — a cascade has to be re-runnable", err)
+	}
+}
+
+// TestDeleteRefusesAWrongCredentialRatherThanReportingSuccess is the pairing that makes the
+// decision above safe.
+//
+// "Nothing there is a success" and "anything the store refuses is an error" have to hold together,
+// because the first on its own is the shape that reports a deletion nobody performed. A rotated
+// secret is the realistic way to produce one, and it is the same fixture
+// TestStoredRefusesAWrongCredentialRatherThanCallingItMissing uses.
+//
+// The object is uploaded with the good signer and removed with it afterwards, so a failure here
+// leaves nothing behind.
+func TestDeleteRefusesAWrongCredentialRatherThanReportingSuccess(t *testing.T) {
+	good, bucket := liveSigner(t)
+	key := testKey(t)
+	t.Cleanup(func() { removeObject(t, good, key) })
+
+	const body = "an object a wrong credential must not be able to remove"
+
+	upload, _, err := good.PresignUpload(t.Context(), key, "image/jpeg", int64(len(body)), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("signing the upload: %v", err)
+	}
+	if status := put(t, upload, "image/jpeg", body); status != http.StatusOK {
+		t.Fatalf("uploading answered %d, want 200", status)
+	}
+
+	bad, err := NewS3(Options{
+		Endpoint:        env("STORAGE_ENDPOINT", "http://localhost:9000"),
+		Bucket:          bucket,
+		Region:          env("STORAGE_REGION", "ap-southeast-2"),
+		AccessKeyID:     env("STORAGE_ACCESS_KEY_ID", "shipper"),
+		SecretAccessKey: "this-is-not-the-secret-the-store-holds",
+		UsePathStyle:    env("STORAGE_USE_PATH_STYLE", "true") != "false",
+	})
+	if err != nil {
+		t.Fatalf("building a signer with a wrong secret: %v", err)
+	}
+
+	if err := bad.Delete(t.Context(), key); err == nil {
+		t.Error("a delete signed with the wrong secret reported success, which would let a " +
+			"cascade record an artefact as removed while it is still there")
+	}
+
+	// And the object is still there, which is the half a status code cannot say.
+	if _, _, _, found, err := good.Stored(t.Context(), key); err != nil || !found {
+		t.Errorf("after the refused delete, Stored says found=%v err=%v; want the object intact",
+			found, err)
+	}
+}
+
+// TestDeleteRefusesAKeyItCannotSign keeps the one guard every method in this file shares.
+//
+// [validateObjectKey] runs before anything is signed, so a key naming a parent directory or
+// carrying a control character never reaches the store. Delete is the method where getting that
+// wrong destroys something rather than merely reading it, which is why it is asserted here rather
+// than assumed from the shared helper.
+func TestDeleteRefusesAKeyItCannotSign(t *testing.T) {
+	signer := testSigner(t)
+
+	for _, key := range []string{"", "../etc/passwd", "/leading-slash", "with\nnewline"} {
+		if err := signer.Delete(t.Context(), key); err == nil {
+			t.Errorf("Delete accepted the key %q", key)
+		}
+	}
+}

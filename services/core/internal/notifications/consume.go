@@ -38,11 +38,12 @@ type Senders struct {
 // and for a consumer pass that is this package, since "every row for one event, or none" is what
 // makes a redelivery meet a complete set.
 type Service struct {
-	parties  Parties
-	sessions Sessions
-	clock    clock.Clock
-	senders  Senders
-	store    postgresStore
+	parties   Parties
+	deletions Deletions
+	sessions  Sessions
+	clock     clock.Clock
+	senders   Senders
+	store     postgresStore
 }
 
 // Option adjusts what a service can do beyond consuming and sending.
@@ -70,25 +71,39 @@ func WithSessions(sessions Sessions) Option {
 
 // NewService builds the domain service.
 //
-// The parties lookup and the clock are required and it panics without them, in the same spirit as
-// jobs.NewService: this is called once from a composition root, a missing collaborator is a
-// programming mistake rather than a runtime condition, and the alternative is a consumer that runs
-// and quietly resolves nobody.
+// The parties lookup, the deletion lookup and the clock are required and it panics without them, in
+// the same spirit as jobs.NewService: this is called once from a composition root, a missing
+// collaborator is a programming mistake rather than a runtime condition, and the alternative is a
+// consumer that runs and quietly resolves nobody.
+//
+// **[Deletions] joined that list at SHIP-171b rather than becoming a fourth [Option]**, and the
+// reason is the rule [Option] itself states: an option is only acceptable when the default is the
+// safe answer in every case. There is no safe default here. A service with no deletion lookup
+// cannot tell a live account from one the platform has erased, and the only two things it could do
+// are address everybody — which is the defect SHIP-171b exists to fix, silently reinstated — or
+// address nobody, which would stop the platform notifying anyone at all. So it is positional, it is
+// refused when nil, and a process that must never resolve a recipient supplies one that says so:
+// cmd/api's noDeletionsHere sits beside its noPartiesHere and panics for the same reason.
 //
 // The senders are not required, and that is a different kind of absence. A process with no email
 // sender still consumes correctly — the rows are written and stay pending — and dispatch.go reports
 // [ErrNoSender] per row rather than at start-up, because the row is the thing that must not be
 // lost. cmd/notifier does supply one; a test that only exercises consumption does not have to.
-func NewService(p Parties, c clock.Clock, s Senders, opts ...Option) *Service {
+func NewService(p Parties, d Deletions, c clock.Clock, s Senders, opts ...Option) *Service {
 	if p == nil {
 		panic("notifications: NewService needs a Parties lookup; two thirds of the catalogue " +
 			"names only a job, and a consumer that cannot resolve a job's parties resolves " +
 			"nobody at all")
 	}
+	if d == nil {
+		panic("notifications: NewService needs a Deletions lookup (SHIP-171b); without one a " +
+			"consumer writes notifications addressed to accounts the platform has deleted and " +
+			"a dispatcher goes on attempting them, which is the defect it exists to prevent")
+	}
 	if c == nil {
 		panic("notifications: NewService needs a clock (Docs/10 §6.3)")
 	}
-	svc := &Service{parties: p, clock: c, senders: s}
+	svc := &Service{parties: p, deletions: d, clock: c, senders: s}
 	for _, opt := range opts {
 		opt(svc)
 	}
@@ -340,6 +355,21 @@ func (s *Service) resolve(
 		return nil, nil
 	}
 
+	// SHIP-171b, and it is deliberately in front of the address read rather than after it.
+	//
+	// A deleted account never becomes a [Recipient] at all: `users` is not read for it, no
+	// template is rendered for it, no device lookup is done for it, and no row is written for
+	// it. That is what "no notification is written addressed to a pseudonymised account" means
+	// as a property of this function rather than as a filter over its output — the pseudonym is
+	// never in a variable here, so there is nothing for a later change to leak into a row.
+	wanted, err := s.withoutDeletedAccounts(ctx, r, wanted, roles)
+	if err != nil {
+		return nil, err
+	}
+	if len(wanted) == 0 {
+		return nil, nil
+	}
+
 	recipients, err := s.store.contacts(ctx, r, wanted, roles)
 	if err != nil {
 		return nil, err
@@ -350,6 +380,46 @@ func (s *Service) resolve(
 		return recipients, nil
 	}
 	return s.withDevices(ctx, r, recipients)
+}
+
+// withoutDeletedAccounts drops the identifiers belonging to accounts the platform has deleted
+// (SHIP-171b).
+//
+// # Why this is a subtraction from the resolved set rather than a predicate in the address query
+//
+// The predicate would be shorter and would be in the wrong package. `account_deletion_requests` is
+// identity's table in identity's block, and [postgresStore.contacts] reads `users` only because
+// migrations/blocks.go calls the shared block "tables every domain reads". ports.go carries that
+// argument for [Parties] and [Sessions]; this is the same one, and the price of keeping it is one
+// query per pass rather than a join.
+//
+// `roles` is pruned alongside `wanted` because the two are read together one statement later — a
+// role left behind for an identifier nobody is asking about would be harmless today and would be a
+// mismatch waiting for whoever next iterates the map instead of the slice.
+//
+// A rule that resolves to one recipient, who has been deleted, ends here with nothing: the caller
+// treats an empty set the same way it treats a rule that tells nobody, which is an ordinary outcome
+// that acknowledges the message and writes no row.
+func (s *Service) withoutDeletedAccounts(
+	ctx context.Context, r db.Runner, wanted []uuid.UUID, roles map[uuid.UUID]Role,
+) ([]uuid.UUID, error) {
+	deleted, err := s.deletions.DeletedAccounts(ctx, r, wanted)
+	if err != nil {
+		return nil, fmt.Errorf("notifications: resolving which recipients have been deleted: %w", err)
+	}
+	if len(deleted) == 0 {
+		return wanted, nil
+	}
+
+	kept := wanted[:0]
+	for _, id := range wanted {
+		if deleted[id] {
+			delete(roles, id)
+			continue
+		}
+		kept = append(kept, id)
+	}
+	return kept, nil
 }
 
 // ruleNeedsPush reports whether a rule sends on [ChannelPush].

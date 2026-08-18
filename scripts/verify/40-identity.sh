@@ -946,14 +946,29 @@ ok "it needs an Idempotency-Key, so a retry replays the pair rather than rotatin
 ticket "SHIP-41  POST /v1/auth/login returns an access and refresh token pair"
 
 # SHIP-47 limits failed sign-ins per account and per network address, and every request in this
-# script arrives from 127.0.0.1 — so one address bucket is shared by every section below, and by
+# script arrives from the loopback — so one address bucket is shared by every section below, and by
 # every previous run of this script. A run that ended part-way through SHIP-47 would otherwise
 # leave it empty and the *next* run would fail here, with a 429 that looks like a broken endpoint.
 #
-# Cleared once, at the point sign-ins begin, so the run starts from a known state. Nothing above
-# this line signs in.
+# **Do not compose that bucket's key from a literal.** `localhost` resolves to `::1` rather than to
+# `127.0.0.1` on this machine, so a key built as `rl:v1:signin:address:127.0.0.1` names nothing and
+# a comparison against it passes by matching two empty strings. Scan for the pattern, as below.
+#
+# Cleared once, at the point sign-ins begin, so the run starts from a known state — and the state is
+# now **asserted rather than argued from what ran before**.
+#
+# This comment used to end *"Nothing above this line signs in"*, and wave 16 made it false:
+# SHIP-47's 429 proof in `30-http.sh` drives sign-in past the per-address bucket several sections
+# earlier. Nothing broke, because the clear was already written for leftovers from a previous run —
+# but **a claim of the form "nothing above this line does X" is true only of the harness as it stood
+# when it was written, and nothing checks it.** The assertion below checks the thing the sentence
+# was standing in for, so the next section that signs in early breaks nothing and corrects no
+# comment. It is a precondition rather than an acceptance criterion, so it counts no check.
 redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
   | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+
+[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' | wc -l | tr -d ' ')" == "0" ]] \
+  || fail "the sign-in rate-limit buckets are not empty after the clear, so this section's sign-ins start throttled"
 
 # The account registered above, whose password is the literal this file already knows. Signing in
 # is the first endpoint that creates a session rather than being handed one, so from here the

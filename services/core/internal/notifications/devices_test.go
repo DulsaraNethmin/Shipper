@@ -121,7 +121,7 @@ func deviceService(sessions Sessions) *Service {
 	if sessions != nil {
 		opts = append(opts, WithSessions(sessions))
 	}
-	return NewService(&stubParties{}, clock.NewFixed(testInstant), Senders{}, opts...)
+	return NewService(&stubParties{}, noDeletions(), clock.NewFixed(testInstant), Senders{}, opts...)
 }
 
 // TestRegisteringTheSameDeviceTwiceLeavesOneLiveToken is the first half of SHIP-140's *Done when*:
@@ -379,7 +379,7 @@ func TestARejectedTokenIsDeregisteredAndTheRowIsTerminal(t *testing.T) {
 	session := newSession(t, pool, customer, "an uninstalled app")
 
 	pusher := &rejectingPusher{}
-	service := NewService(&stubParties{customer: customer}, clock.NewFixed(testInstant),
+	service := NewService(&stubParties{customer: customer}, noDeletions(), clock.NewFixed(testInstant),
 		Senders{Push: pusher}, WithSessions(&stubSessions{}))
 
 	if _, err := register(t, pool, service, customer, session, PlatformIOS, "dead-token"); err != nil {

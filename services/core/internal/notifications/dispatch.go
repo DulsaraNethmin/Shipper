@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 )
 
@@ -110,7 +112,22 @@ func (s *Service) Dispatch(ctx context.Context, r db.Runner) (int, error) {
 		return 0, err
 	}
 
+	// SHIP-171b's second half. One lookup for the whole batch rather than one per row, for the
+	// reason resolve() gives: this is a round trip inside a transaction holding a claim.
+	deleted, err := s.deletedIn(ctx, r, due)
+	if err != nil {
+		return 0, err
+	}
+
 	for _, n := range due {
+		if deleted[n.Recipient] {
+			// Retired without being sent and without being attempted. See [Service.retire].
+			if err := s.retire(ctx, r, n); err != nil {
+				return 0, err
+			}
+			continue
+		}
+
 		sender, err := s.senderFor(n.Channel)
 		if err != nil {
 			return 0, fmt.Errorf("notifications: %s (%s): %w", n.ID, n.Channel, err)
@@ -137,6 +154,81 @@ func (s *Service) Dispatch(ctx context.Context, r db.Runner) (int, error) {
 		}
 	}
 	return len(due), nil
+}
+
+// deletedIn is which of a claimed batch's recipients the platform has deleted.
+//
+// The identifiers are de-duplicated first: an event with two channels and two handsets is several
+// rows for one person, and a claim of twenty rows can be a claim about three accounts.
+func (s *Service) deletedIn(
+	ctx context.Context, r db.Runner, due []Notification,
+) (map[uuid.UUID]bool, error) {
+	if len(due) == 0 {
+		return nil, nil
+	}
+
+	seen := make(map[uuid.UUID]bool, len(due))
+	ids := make([]uuid.UUID, 0, len(due))
+	for _, n := range due {
+		if seen[n.Recipient] {
+			continue
+		}
+		seen[n.Recipient] = true
+		ids = append(ids, n.Recipient)
+	}
+
+	deleted, err := s.deletions.DeletedAccounts(ctx, r, ids)
+	if err != nil {
+		return nil, fmt.Errorf("notifications: resolving which claimed recipients have been "+
+			"deleted: %w", err)
+	}
+	return deleted, nil
+}
+
+// retire ends a notification addressed to an account the platform has deleted (SHIP-171b).
+//
+// # These rows exist, and nothing else was ever going to end them
+//
+// A row written before the deletion keeps the address it copied out of `users` when it was written
+// — 000700 says so — and SHIP-171 then overwrote that copy with the pseudonym. Either way the row
+// stays claimable: `failed` is deliberately not terminal, so the dispatcher takes it on every pass,
+// the send does not land, and `attempts` climbs on somebody who no longer exists. Measured on this
+// tree before the fix: one pass took such a row to `failed` with `attempts` at 1, and nothing in
+// the platform would ever have stopped it.
+//
+// # `undeliverable` rather than a fifth status, and the argument is 000702's own
+//
+// That migration defines the status as "the address is gone, no retry can help, and nobody needs
+// telling", which is true of this row more literally than of the rejected device token it was
+// written for. It also says the status is "deliberately not reachable from email", and that
+// paragraph is about **bounces**: a hard bounce today may be a full mailbox, the platform learns
+// about it asynchronously through a webhook this MVP does not have, and it must not be treated as
+// final. A deletion is not that. The platform destroyed the address itself, in a transaction, and
+// knows it synchronously — so the ambiguity the paragraph protects against does not exist here.
+//
+// A fifth status would have needed a migration in the notifications block widening
+// ck_notifications_status, to express a fact the fourth already expresses, and would have left every
+// report that counts terminal rows needing to know about both.
+//
+// # attempts is not incremented, and that is the clause rather than a detail
+//
+// [postgresStore.markUndeliverable] increments it "because one was made". None is made here:
+// nothing is handed to a sender, and the row is retired in front of the dispatch rather than after
+// a failure. The ticket's own words are that "the attempts counter stops climbing on a person the
+// platform has deleted", so a final increment would be the clause met in reduced form. A row
+// retired this way carries whatever count it had already earned, which is the operational history
+// somebody reading it wants.
+//
+// # Every channel, and the device token is left alone
+//
+// Push rows are retired too. SHIP-171 revokes every device session of a deleted account, so nothing
+// resolves a new push address for one; a row already queued is a message aimed at the handset of
+// somebody the platform has erased. The token is **not** deregistered here — [Service.reject] does
+// that because FCM said the token was dead, which is a fact about the device. This is a fact about
+// the account, `device_tokens.token` is named in SHIP-172's own *Done when*, and the row keeps its
+// address so that what was aimed where stays answerable.
+func (s *Service) retire(ctx context.Context, r db.Runner, n Notification) error {
+	return s.store.markRecipientDeleted(ctx, r, n.ID)
 }
 
 // reject records that an address is gone, and stops addressing it (SHIP-139, SHIP-140).
