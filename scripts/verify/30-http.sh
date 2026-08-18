@@ -323,7 +323,16 @@ status="$(idem429_login "$idem429_wrong_key" "$idem429_email" "not-the-registere
 # The tokens left in the address bucket are the side effect that says whether the handler ran: a
 # refused credential charges one unit, and a reply from the store charges nothing. Compared with
 # half a unit of slack because the bucket refills continuously.
-idem429_tokens_before="$(redis-cli -u "$REDIS_URL" hget rl:v1:signin:address:127.0.0.1 tokens)"
+#
+# **The key is read out of Redis rather than spelled here.** SHIP-47 keys the address bucket on
+# the address the transport reports, and `localhost` resolves to `127.0.0.1` or to `::1` depending
+# on the machine — so a literal key name is a check that silently reads nothing and then compares
+# two empty strings. It did exactly that on the first run of this section.
+idem429_bucket="$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' | head -1)"
+[[ -n "$idem429_bucket" ]] \
+  || fail "the refused credential charged no per-address bucket, so nothing here can tell a replay from a re-run"
+idem429_tokens_before="$(redis-cli -u "$REDIS_URL" hget "$idem429_bucket" tokens)"
+[[ -n "$idem429_tokens_before" ]] || fail "$idem429_bucket holds no token count"
 
 status="$(idem429_login "$idem429_wrong_key" "$idem429_email" "not-the-registered-password" "Verify 429 Wrong" wrong2)"
 [[ "$status" == "400" ]] || { cat "$WORKDIR/i429-wrong2.json"; fail "the retried refusal returned $status, want the stored 400"; }
@@ -332,10 +341,11 @@ status="$(idem429_login "$idem429_wrong_key" "$idem429_email" "not-the-registere
 diff -q "$WORKDIR/i429-wrong1.json" "$WORKDIR/i429-wrong2.json" >/dev/null \
   || fail "the replayed refusal differs from the original"
 
-idem429_tokens_after="$(redis-cli -u "$REDIS_URL" hget rl:v1:signin:address:127.0.0.1 tokens)"
+idem429_tokens_after="$(redis-cli -u "$REDIS_URL" hget "$idem429_bucket" tokens)"
+[[ -n "$idem429_tokens_after" ]] || fail "$idem429_bucket holds no token count after the retry"
 awk -v before="$idem429_tokens_before" -v after="$idem429_tokens_after" \
   'BEGIN { exit !(after > before - 0.5) }' \
-  || fail "the address bucket went from $idem429_tokens_before to $idem429_tokens_after, so the replayed 400 ran the handler again"
+  || fail "$idem429_bucket went from $idem429_tokens_before to $idem429_tokens_after, so the replayed 400 ran the handler again"
 ok "a 400 under the same key is still answered from the store, byte for byte, without the handler running"
 
 # The bucket is shared with every section below. Cleared where it was spent, and asserted rather
