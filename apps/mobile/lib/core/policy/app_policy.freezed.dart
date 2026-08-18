@@ -29,7 +29,7 @@ mixin _$AppPolicy {
 ///
 /// **A budget, not the platform's bound.** `STORAGE_MAX_UPLOAD_BYTES` is the bound — the size
 /// above which the platform refuses to sign an upload at all — and it is ten times this.
-/// `proof_image.dart` argues the difference; `internal/config` refuses a deployment that
+/// `core/capture/captured_image.dart` argues the difference; `internal/config` refuses a deployment that
 /// inverts the two.
 @JsonKey(name: 'proof_compression_budget_bytes') int get proofCompressionBudgetBytes;
 /// Create a copy of AppPolicy
@@ -244,7 +244,7 @@ class _AppPolicy extends AppPolicy {
 ///
 /// **A budget, not the platform's bound.** `STORAGE_MAX_UPLOAD_BYTES` is the bound — the size
 /// above which the platform refuses to sign an upload at all — and it is ten times this.
-/// `proof_image.dart` argues the difference; `internal/config` refuses a deployment that
+/// `core/capture/captured_image.dart` argues the difference; `internal/config` refuses a deployment that
 /// inverts the two.
 @override@JsonKey(name: 'proof_compression_budget_bytes') final  int proofCompressionBudgetBytes;
 
