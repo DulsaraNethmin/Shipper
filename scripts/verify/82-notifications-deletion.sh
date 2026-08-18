@@ -12,32 +12,85 @@
 # dispatcher do about an account another domain erased, which is neither. 82 puts it inside the
 # notifications range and **after 81**, which is load-bearing rather than tidy — see below.
 #
-# # This section runs on two earlier sections' leavings, deliberately
+# # It runs on 40-identity.sh's subject, and brings its own machinery
 #
-# Sections are sourced into one shell, so everything they set is in scope here. Two things are
-# reused rather than rebuilt, and in both cases rebuilding would have made the demonstration weaker:
+# Sections are sourced into one shell, so what an earlier one set is in scope — but **81-notifier.sh
+# unsets every helper and variable it defined** when it finishes, which is a hygiene convention this
+# file discovered by depending on it and failing. So the consumer is built and driven here, with
+# helpers of this section's own.
 #
-#   - **40-identity.sh's `$pseudo_user`.** A real account, registered through the API, whose
-#     deletion request was made through the endpoint and executed by the real worker — so its
-#     `notifications` rows carry the pseudonym because SHIP-171's own adapter wrote it there, not
-#     because this file typed it. It also carries a **second, still-open** request, which
-#     40-identity.sh added to prove a completed request does not stop a later one and which is
-#     exactly the row a lookup written as `state <> 'requested'` would get wrong.
-#   - **81-notifier.sh's `run_notifier`, its group and its built binary.** A group of its own would
-#     start at the beginning of `shipper.bid`, which is deliberately padded to eighteen hundred
-#     messages; reusing the caught-up group costs nothing and asserts nothing different.
+# **40-identity.sh's `$pseudo_user` is the one thing taken from elsewhere, and it is worth the
+# coupling.** It is a real account, registered through the API, whose deletion request was made
+# through the endpoint and executed by the real worker — so its `notifications` rows carry the
+# pseudonym because SHIP-171's own adapter put it there rather than because this file typed it. It
+# also carries a **second, still-open** request, added by that section to prove a completed request
+# does not stop a later one, which is exactly the row a lookup written as `state <> 'requested'`
+# would get wrong. A fixture written here with psql would assert the same words about a weaker
+# claim. It is checked for rather than assumed: if 40-identity.sh ever adopts 81's unset discipline
+# this section fails loudly and says what to do, which is the right failure.
 #
-# Both are checked for rather than assumed, because a section that silently found an empty variable
-# would assert its way to a pass over nothing.
+# The consumer group is **81-notifier.sh's own name, composed rather than inherited**. A fresh group
+# starts at the beginning of `shipper.bid`, which is deliberately padded to eighteen hundred
+# messages; the caught-up group makes this section seconds rather than minutes. Composing the string
+# rather than reading the variable is what survives that section's `unset`, and if the name ever
+# changes this section gets a new group and is merely slower.
 
 ticket "SHIP-171b  a pseudonymised account stops being a notification recipient"
 
-declare -f run_notifier >/dev/null \
-  || fail "81-notifier.sh did not define run_notifier — this section runs after it and reuses it"
 [[ -n "${pseudo_user:-}" ]] \
-  || fail "40-identity.sh did not leave a pseudonymised account in \$pseudo_user"
-[[ -n "${notif_group:-}" ]] \
-  || fail "81-notifier.sh did not leave a consumer group in \$notif_group"
+  || fail "40-identity.sh left no pseudonymised account in \$pseudo_user; if it now unsets its own variables, this section needs a fixture of its own"
+
+pushd "$ROOT/services/core" >/dev/null
+go build -o "$WORKDIR/shipper-notifier-171b" ./cmd/notifier
+go build -o "$WORKDIR/shipper-worker-171b" ./cmd/worker
+popd >/dev/null
+
+deletion_group="shipper-notifications-verify-$$"
+
+# publish_171b <logfile> <outbox-id> — one short worker run, which drains whatever is unpublished.
+publish_171b() {
+  local log="$1" waiting="$2" pid
+  SHIPPER_ENV=development \
+  LOG_FORMAT=json \
+  LOG_LEVEL=info \
+  DATABASE_URL="$DATABASE_URL" \
+  REDIS_URL="$REDIS_URL" \
+  KAFKA_BROKERS="${KAFKA_BROKERS:-localhost:29092}" \
+    "$WORKDIR/shipper-worker-171b" >"$log" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 50); do
+    [[ "$("$PSQL" "$DATABASE_URL" -tAc \
+        "select published_at is not null from outbox where id = '$waiting';")" == "t" ]] && break
+    sleep 0.2
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+  wait "$pid" 2>/dev/null || true
+}
+
+# dispatch_171b <logfile> <predicate-sql> — run the consumer until the predicate holds, then stop.
+#
+# Stopped before anything is asserted, so a failed assertion cannot leave a consumer running and
+# holding a group membership. 81-notifier.sh's shape and its two-minute budget, for its reasons.
+dispatch_171b() {
+  local log="$1" predicate="$2" pid
+  SHIPPER_ENV=development \
+  LOG_FORMAT=json \
+  LOG_LEVEL=info \
+  DATABASE_URL="$DATABASE_URL" \
+  REDIS_URL="$REDIS_URL" \
+  KAFKA_BROKERS="${KAFKA_BROKERS:-localhost:29092}" \
+    "$WORKDIR/shipper-notifier-171b" -group "$deletion_group" >"$log" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 600); do
+    [[ "$("$PSQL" "$DATABASE_URL" -tAc "$predicate")" == "t" ]] && break
+    sleep 0.2
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 75); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+  wait "$pid" 2>/dev/null || true
+}
+ok "cmd/notifier and cmd/worker are built for this section, which drives them itself"
 
 # --- the state that produced the defect, restated as facts rather than as a premise -------------
 
@@ -75,7 +128,7 @@ ok "$pseudo_notif_total notification rows are queued to it, two of them addresse
 # Run the dispatcher until nothing of the subject's is claimable. 81-notifier.sh's own run will
 # usually have done this already — its rows are older, and the claim takes the oldest first — and
 # running it here anyway is what stops this section depending on that having happened.
-run_notifier "$WORKDIR/notif-deleted.log" \
+dispatch_171b "$WORKDIR/notif-deleted.log" \
   "select count(*) = 0 from notifications
     where recipient_id = '$pseudo_user' and status not in ('sent', 'undeliverable');"
 
@@ -173,7 +226,7 @@ for target in "$pseudo_user" "$live_provider" "$lookalike_provider"; do
 done
 ok "three bid.rejected events are in the outbox, one per account"
 
-publish_outbox "$WORKDIR/notif-deleted-publish.log" "$deleted_event"
+publish_171b "$WORKDIR/notif-deleted-publish.log" "$deleted_event"
 for event_id in $deletion_events; do
   [[ "$("$PSQL" "$DATABASE_URL" -tAc \
     "select published_at is not null from outbox where id = '$event_id';")" == "t" ]] \
@@ -187,7 +240,7 @@ ok "and cmd/worker published all three onto shipper.bid"
 #
 # `status = 'sent'` rather than the row merely existing, so the wait covers a consume *and* a
 # dispatch — which is what makes the pass a genuine second look at the retired rows below.
-run_notifier "$WORKDIR/notif-deleted-consume.log" \
+dispatch_171b "$WORKDIR/notif-deleted-consume.log" \
   "select count(*) = 2 from notifications
     where event_id in ('$live_event', '$lookalike_event') and status = 'sent';"
 
@@ -228,3 +281,8 @@ ok "both controls' notifications were dispatched, so nothing is left due"
     where recipient_id = '$pseudo_user' and (attempts <> 0 or status <> 'undeliverable');")" == "0" ]] \
   || fail "a later dispatcher pass moved the subject's rows, so the counter has not stopped"
 ok "and a later pass leaves every one of them exactly as it was: the counter has stopped"
+
+unset pseudo_notif_total pseudo_claimable pseudo_sent pseudo_retired deletion_group
+unset live_provider lookalike_provider deletion_events deleted_event live_event lookalike_event
+unset live_rows lookalike_rows deleted_rows event_id target
+unset -f publish_171b dispatch_171b
