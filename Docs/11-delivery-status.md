@@ -56,11 +56,31 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 188 | 576 |
-| Remaining | 43 | 138 |
-| **Total** | 231 | 714 |
+| **Done** | 195 | 601 |
+| Remaining | 37 | 116 |
+| **Total** | 232 | 717 |
 
-**Measured on `develop` at `54ea9af`, and this branch's figures are the same figures.** That is the
+**Measured on `develop` at `81e52f2`** — the wave-15 count-line commit, which is `develop`'s tip
+as this is written and therefore a ref that stays true. `make status` prints 195 / 232 and 601 / 717
+on it, and the parser below reproduces both before any row was written.
+
+**Wave 15 delivered three tickets and 11 points**: SHIP-155 and SHIP-159 (M6, 6) on
+`ship-155-159-verification-evidence`, and SHIP-171 (M7, 5) on `ship-171-user-pseudonymisation`.
+**M6 went 19 → 21 of 22 and M7 went 7 → 8 of 20.** Two orchestrator repair branches landed ahead of
+the lanes — `ship-15ae-verify-false-pass` and `ship-15af-ship-81c-decision` — neither of which is a
+backlog row and neither of which moves a counter. `make verify` went **974 → 1005 checks across 16
+sections**.
+
+**Wave 14 delivered four tickets and 14 points before it** — SHIP-164, SHIP-81b, SHIP-170 and
+SHIP-173 — and created one row, SHIP-81c, by splitting SHIP-81b. That split is why the totals below
+read 232 / 717 where the paragraphs further down still say 231 / 714: the split **added** three
+points rather than redistributing them, because the row was under-sized rather than over-scoped.
+
+**The paragraphs below this point were written by earlier passes and are left in their own terms.**
+They describe waves 11 and 13 against the refs they name, and those statements are true of those
+refs. Where one of them states a total, read the table above instead.
+
+**What the sentence below used to say, and why it is worth keeping the shape of it.** That is the
 second consecutive pass the sentence has been that short: this pass adds no row to `Docs/09` either,
 so there is no branch-versus-`develop` split to state and the totals are `develop`'s. Every cell was
 recomputed from `Docs/09`'s rows against `Docs/11-done.txt` by a parser written for this pass rather
@@ -235,9 +255,27 @@ That distinction is worth keeping in mind rather than rounding away: six domains
 | Branch | At | Holds |
 |---|---|---|
 | `main` | PR #19 | **Wave 1, released 11 August 2026.** Now well behind `develop` |
-| `develop` | wave 13 merged | Everything below. **Cut new branches from here** |
+| `develop` | wave 15 merged, at `81e52f2` | Everything below. **Cut new branches from here** |
 
-**`develop` is 407 commits ahead of `main` at `54ea9af`, and holds thirteen waves.** Wave 1 was released as PR #19; everything since — SHIP-17a, the wave-2 pre-step and its three tracks, the wave-3 pre-step (SHIP-15e) and its three lanes, the wave-4 pre-step (SHIP-15g) and its four tracks, the wave-5 pre-step (SHIP-15i) and its four tracks, the wave-6 pre-step (SHIP-15m) and its four tracks, the wave-7 pre-step (SHIP-15p) and its four tracks, the wave-8 pre-step (SHIP-15r) and its five branches, the wave-9 pre-step `ship-15t` and its four tracks, the wave-10 pre-step `ship-15u` and its four lanes, the wave-11 pre-step `ship-15v` and its four lanes, the wave-12 pre-step `ship-15w` and its four lanes, and the wave-13 pre-step `ship-15x` and its four lanes — is on `develop` only. The next `develop → main` pull request is the second release, and it is now several times the size of the first.
+**`develop` is 456 commits ahead of `main` at `81e52f2`, and holds fifteen waves.** The other two
+readings, re-measured on that ref rather than adjusted: `--first-parent` **97**, `--no-merges`
+**356**. **Wave 15's delta is 17 / 5 / 13 and the three tie out exactly** — 12 commits across four
+branches (`ship-15ae` 1, `ship-15af` 1, Lane A 5, Lane B 5), plus 4 merge commits, plus the one
+count-line commit on `develop`: 12 + 1 = 13 non-merge, 4 + 1 = 5 first-parent, 13 + 4 = 17 total.
+
+**The identity §2 has been tracking holds again**: first-parent delta equals branch count plus
+however many count-line commits were made on `develop`. Wave 15 made one, and `CLAUDE.md` now
+assigns that commit to Claude rather than the owner — the six direct first-parent non-merge commits
+on `develop` are `81e52f2`, `6f9a8ac`, `d3321ef`, `b0c25d3`, `b0bd7cf` and `23618e5`, and the first
+of those is the first one Claude wrote.
+
+**The release check was re-run on `81e52f2` and passes**: `git merge-tree --write-tree main develop`
+and `git rev-parse develop^{tree}` are **both `d9f76891102415ebf9a1b6fa32d8651b57528b17`**, so a
+`develop` → `main` merge produces exactly `develop`'s tree. **Every commit on either branch changes
+this, so re-run the pair immediately before cutting the release.** The historical note below is kept
+for its reasoning.
+
+**What the paragraph below said when it was written, at `54ea9af`:** Wave 1 was released as PR #19; everything since — SHIP-17a, the wave-2 pre-step and its three tracks, the wave-3 pre-step (SHIP-15e) and its three lanes, the wave-4 pre-step (SHIP-15g) and its four tracks, the wave-5 pre-step (SHIP-15i) and its four tracks, the wave-6 pre-step (SHIP-15m) and its four tracks, the wave-7 pre-step (SHIP-15p) and its four tracks, the wave-8 pre-step (SHIP-15r) and its five branches, the wave-9 pre-step `ship-15t` and its four tracks, the wave-10 pre-step `ship-15u` and its four lanes, the wave-11 pre-step `ship-15v` and its four lanes, the wave-12 pre-step `ship-15w` and its four lanes, and the wave-13 pre-step `ship-15x` and its four lanes — is on `develop` only. The next `develop → main` pull request is the second release, and it is now several times the size of the first.
 
 **The release check was re-run on `54ea9af` rather than carried, and it passes.** `git merge-tree --write-tree main develop` and `git rev-parse develop^{tree}` both give **`5d76d8977ef19f877c19a96a93110a6a95ddbde6`**, so the merge would produce exactly `develop`'s content and the revert on `main` takes nothing away. It was `d520c384` on `4fd7fd5` and `4b5ad00c` on `5a3b8d7`; **every merge changes it, so the check is worth nothing unless it is re-run immediately before the release is cut.** The two commands are at the foot of this section with the reason they are needed here at all. **There is a commit outstanding that will change it before the release is cut** — the owner holds §3's check-count commit, which is not in `54ea9af`.
 
@@ -16026,7 +16064,45 @@ fact.** §9 has the entry, the two measured blockers and the proposed backlog ro
 
 ## 6. Ready to start now
 
-Strict build order says the next ticket is the lowest-numbered open one, which is **SHIP-24** — and it is blocked on X-2, as are the other three M0 stragglers. **Sixteen tickets have every dependency met: 11 code tickets worth 37 points, plus five Track-X tickets worth 12.** The lowest startable ticket of any kind is **X-1**; the lowest startable *code* ticket is **SHIP-81b**, which has been the lowest for two waves and has been declined in both. Build order is a preference rather than a constraint at this point.
+**Recomputed on `develop` at `81e52f2`, after wave 15 merged.** Strict build order says the next
+ticket is the lowest-numbered open one, which is **SHIP-24** — and it is blocked on X-2, as are the
+other three M0 stragglers. **Twelve tickets have every dependency met: 7 code tickets worth 25
+points, plus five Track-X tickets worth 12.** The lowest startable ticket of any kind is **X-1**; the
+lowest startable *code* ticket is **SHIP-81c**.
+
+**The set went 22 → 16 → 16 → 14 → 12, and the composition improved for the first time in three
+passes.** Wave 15 closed three rows and opened one — **SHIP-172** behind SHIP-171 — and **removed
+two strikes without building anything**: SHIP-155 and SHIP-159 were struck a pass ago as *"every
+dependency met and unbuildable in fact"*, and both were built this wave, which is the first time
+that strike has been cleared rather than carried.
+
+**SHIP-81c is unstruck by an owner decision rather than by code.** It was blocked on whether
+`Docs/07` §2's closed set of seven feature directories gains an eighth. It does not: verification
+evidence capture lives in **`features/profile/`**, which §2 already assigned it to, and `Docs/07` §2
+now records that explicitly along with the consequence — `ProofCamera`, `ProofImagePolicy` and
+`ProofStore` move from `features/delivery/` to `core/` on `ProviderOnly`'s precedent. **That move is
+SHIP-81c's to make** and it is the first row a client-side wave should take.
+
+| Ticket | Pts | Area | Held? |
+|---|---|---|---|
+| SHIP-81c | 3 | A provider captures their four verification documents in the app. **Unblocked this wave by an owner decision**, not by code — see above. Needs the three proof classes moved to `core/` first | — |
+| SHIP-172 | 5 | Cascade deletion of personal artefacts — **startable for the first time**, behind SHIP-171. Verification documents, message bodies, device tokens and attributable images are *removed* rather than replaced, which is a different act with different failure modes. SHIP-171 handed it `users.password_hash` with a stated reason | — |
+| ~~SHIP-156~~ | 3 | **Strike carried, sixth consecutive pass.** The conversation exists; **the report mechanism does not**, and no `Docs/09` row describes it. What would lift it is a row, and what is reportable, by whom, with what outcome and against what policy is `Docs/04` §5's territory | — |
+| ~~SHIP-174~~ | 3 | Struck — needs a Datadog account (external) | — |
+| ~~SHIP-178~~ | 3 | Struck — needs store-console access (external) | — |
+| ~~SHIP-182~~ | 5 | Struck — needs a deployed environment (external) | — |
+| ~~SHIP-183~~ | 3 | **Struck for contention, not for an external blocker**, and that distinction matters because it is the only strike a wave can lift by scheduling. It touches every domain and `internal/httpx`; it needs a wave where it is the only code row | — |
+
+Plus **X-1, X-3, X-4, X-5 and X-10**, none of which is code and none of which has started. **X-5 and
+X-10 need no third party at all.**
+
+**The startable-and-sensible set is two tickets and 8 points** — SHIP-81c and SHIP-172. That is the
+narrowest this board has been, and it is not a slowdown: **five of the seven code rows are struck for
+reasons no amount of engineering removes**, four of them external and one (SHIP-183) waiting on a
+wave of its own. **Track X is now the binding constraint on the whole board**, as §5 has been saying
+for four passes.
+
+### What this section said before wave 15, kept for its reasoning
 
 **Every figure and every row was recomputed from `Docs/09`'s dependency column against `Docs/11-done.txt`** by a parser written for this pass, not adjusted from the last one and not taken from a dispatch brief. **The parser reproduced `make status`'s done counts exactly — 188 / 231 and 576 / 714 — before a single row below was written**, which is the only way to tell a correct figure from a copied one. It is the **complete** startable set; an early version of this table was a curated selection that read like a full list.
 
