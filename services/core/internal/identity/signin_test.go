@@ -49,7 +49,7 @@ func signInService(t *testing.T, profile passwords.Argon2Profile) (*Service, *pg
 	}
 
 	svc, err := NewService(pool, hasher, testServiceIssuer(t, clock.System{}), testLimiter(t),
-		&recordingSender{}, &recordingTexter{}, clock.System{})
+		&recordingSender{}, &recordingTexter{}, noDelivery, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}
@@ -473,7 +473,7 @@ func serviceWithoutADatabase(t *testing.T) *Service {
 		t.Fatalf("building the hasher: %v", err)
 	}
 	svc, err := NewService(nil, hasher, testServiceIssuer(t, clock.System{}), testLimiter(t),
-		&recordingSender{}, &recordingTexter{}, clock.System{})
+		&recordingSender{}, &recordingTexter{}, noDelivery, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}
@@ -708,7 +708,7 @@ func TestSignInWithoutARateLimiterCacheIsRefused(t *testing.T) {
 		t.Fatalf("building the limiter: %v", err)
 	}
 	svc, err := NewService(pool, hasher, testServiceIssuer(t, clock.System{}), limiter,
-		&recordingSender{}, &recordingTexter{}, clock.System{})
+		&recordingSender{}, &recordingTexter{}, noDelivery, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}

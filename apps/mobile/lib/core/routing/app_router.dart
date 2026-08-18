@@ -17,6 +17,7 @@ import 'package:shipper/features/delivery/tracking_screen.dart';
 import 'package:shipper/features/fleet/add_vehicle_screen.dart';
 import 'package:shipper/features/fleet/fleet_screen.dart';
 import 'package:shipper/features/fleet/vehicle_screen.dart';
+import 'package:shipper/features/identity/account_deletion_screen.dart';
 import 'package:shipper/features/identity/email_verification_screen.dart';
 import 'package:shipper/features/identity/phone_verification_screen.dart';
 import 'package:shipper/features/identity/registration_complete_screen.dart';
@@ -258,6 +259,21 @@ abstract final class Routes {
   /// [vehicleDetail] for one vehicle.
   static String vehicleDetailFor(String vehicleId) => '/fleet/vehicles/$vehicleId';
 
+  /// Deleting this account (SHIP-173).
+  ///
+  /// `/account/deletion` mirrors the endpoint's own path, which is deliberate here where
+  /// [myBids] deliberately does not: those diverge because a URL is a person's map of the product
+  /// and `/v1/fleet/bids` names where a provider's *records* live on the platform. This is the
+  /// account itself, and the two words mean the same thing on both sides.
+  ///
+  /// **Not under `/settings`, because there is none.** `features/profile` is a doc-only stub and
+  /// this app has no settings screen; inventing one to hold a single action would be building the
+  /// screen a later ticket has to reconcile with. It is reached from the signed-in shell's app
+  /// bar, which is what makes deletion discoverable in-app — Apple's actual requirement.
+  ///
+  /// Two segments, and it collides with nothing: no other route begins `/account`.
+  static const accountDeletion = '/account/deletion';
+
   /// The connectivity check (SHIP-19).
   ///
   /// Reachable from **both** shells on purpose. It is the only screen that demonstrates build
@@ -307,6 +323,7 @@ const _signedOutLocations = <String>{
 /// bounce a provider off their own fleet every time they opened the app from a notification. The
 /// role decides what a screen *draws* — `ProviderOnly` — not where the router is willing to go.
 const _signedInLocations = <String>{
+  Routes.accountDeletion,
   Routes.home,
   Routes.newJob,
   Routes.myBids,
@@ -613,6 +630,10 @@ final routerProvider = Provider<GoRouter>((ref) {
         builder: (context, state) => VehicleScreen(
           vehicleId: state.pathParameters['id'] ?? '',
         ),
+      ),
+      GoRoute(
+        path: Routes.accountDeletion,
+        builder: (context, state) => const AccountDeletionScreen(),
       ),
       GoRoute(
         path: Routes.health,

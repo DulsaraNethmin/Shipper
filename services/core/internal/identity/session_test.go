@@ -51,7 +51,7 @@ func newSessionService(t *testing.T, clk clock.Clock) (*Service, *pgxpool.Pool, 
 	}
 
 	svc, err := NewService(pool, hasher, testServiceIssuer(t, clk), testLimiter(t),
-		&recordingSender{}, &recordingTexter{}, clk)
+		&recordingSender{}, &recordingTexter{}, noDelivery, clk)
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}
@@ -543,7 +543,7 @@ func TestRefreshWithoutADatabaseIsUnavailable(t *testing.T) {
 		t.Fatalf("building the hasher: %v", err)
 	}
 	svc, err := NewService(nil, hasher, testServiceIssuer(t, clock.System{}), testLimiter(t),
-		&recordingSender{}, &recordingTexter{}, clock.System{})
+		&recordingSender{}, &recordingTexter{}, noDelivery, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}
@@ -561,7 +561,7 @@ func TestAServiceWithNoIssuerIsRefused(t *testing.T) {
 		t.Fatalf("building the hasher: %v", err)
 	}
 	if _, err := NewService(nil, hasher, nil, testLimiter(t),
-		&recordingSender{}, &recordingTexter{}, clock.System{}); err == nil {
+		&recordingSender{}, &recordingTexter{}, noDelivery, clock.System{}); err == nil {
 		t.Error("a service was built with no access token issuer")
 	}
 }
@@ -575,7 +575,7 @@ func TestAServiceWithNoRateLimiterIsRefused(t *testing.T) {
 		t.Fatalf("building the hasher: %v", err)
 	}
 	if _, err := NewService(nil, hasher, testServiceIssuer(t, clock.System{}), nil,
-		&recordingSender{}, &recordingTexter{}, clock.System{}); err == nil {
+		&recordingSender{}, &recordingTexter{}, noDelivery, clock.System{}); err == nil {
 		t.Error("a service was built with no rate limiter")
 	}
 }

@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 
+	"github.com/google/uuid"
+
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/email"
@@ -195,7 +200,7 @@ func identityHandler(d Deps) *identity.Handler {
 	}
 
 	svc, err := identity.NewService(d.Pool, hasher, issuer, limiter,
-		newEmailSender(d.Config), newSMSSender(d.Config), d.Clock)
+		newEmailSender(d.Config), newSMSSender(d.Config), activeJobLookup{}, d.Clock)
 	if err != nil {
 		panic("cmd/api: identity service: " + err.Error())
 	}
@@ -263,3 +268,78 @@ func newSMSSender(cfg *config.Config) identity.SMSSender {
 	}
 	return sender
 }
+
+// activeJobLookup implements identity.ActiveJobs over `jobs` and `bids` (SHIP-170).
+//
+// # Why the query is here rather than in the domain
+//
+// It reads `jobs`, which is `internal/jobs`', and `bids`, which is `internal/bidding`'s, and
+// `internal/identity` may import neither — the boundary lint refuses both directions. The
+// composition root is where a dependency between domains is visible to somebody reading how the
+// service is wired, rather than buried in `internal/identity/postgres.go` where `jobs` and `bids`
+// would read as tables identity owns. jobPartiesLookup in routes_admin.go is the same arrangement
+// for the same reason, and this statement is that one's join with a status predicate added.
+//
+// **`internal/jobs` and `internal/bidding` are untouched by this ticket**, which is the property
+// that made SHIP-170 buildable in a wave where neither package is anybody's: the deferral is a read
+// of rows those domains already write, and nothing about creating, awarding or moving a job
+// changes.
+type activeJobLookup struct{}
+
+// activeJobStatuses is Docs/02 §1's six committed statuses, in the document's own order.
+//
+// **Written out rather than expressed as a complement, and that is the same decision
+// overduePickupStatuses records.** "Not Draft, Open, Negotiating, Completed, Cancelled or Disputed"
+// would be six exclusions doing the work of six inclusions and would silently absorb a thirteenth
+// status added to Docs/02 §1 later — into the *deferring* set, which is the direction that quietly
+// stops people being deleted. Naming them means a new status is deliberately absent until somebody
+// decides it belongs.
+//
+// The range is Docs/05 §3.1's own — "a request made between Awarded and Delivered" — and it is
+// inclusive at both ends. `Delivered` is in it because the delivery is not finished until the job
+// is `Completed` (Docs/02 §6.1's 72-hour auto-complete, or the customer confirming): a job sitting
+// at `Delivered` can still move to `Disputed`, and erasing a party at that moment is precisely what
+// strands the counterparty. `Disputed` is deliberately *not* in it — a dispute is not a delivery in
+// flight, it is one that has stopped, and SHIP-164 is what ends it.
+//
+// A single-line constant, so that TestTheActiveStatusesAreTheOnesTheLifecycleDeclares can read this
+// file and resolve the concatenation by name.
+const activeJobStatuses = `('Awarded', 'Driver assigned', 'En route to pickup', 'Picked up', 'In transit', 'Delivered')`
+
+// HasActiveJob reports whether this account is party to a job in flight, on either side.
+//
+// # Both parties, and the OR is the whole ticket
+//
+// Docs/05 §3.1: "Erasing a party mid-delivery would strand the counterparty." A *party* is the
+// customer whose goods are moving (`jobs.customer_id`) or the provider whose offer was accepted
+// (`bids.provider_id` where the bid is `Accepted`), and the deletion endpoint is `RequireUser` with
+// no role predicate, so both halves of the marketplace reach it. A query that checked only the
+// customer would pass every customer-side assertion and delete a driver mid-delivery.
+//
+// `uq_bids_one_accepted_per_job` is partial on `status = 'Accepted'`, so the LEFT JOIN cannot
+// multiply rows however many bids a job carries (SHIP-80, SHIP-91) — the same property
+// jobPartiesLookup relies on. `EXISTS` rather than a count: the question is yes or no, and the
+// planner can stop at the first row.
+//
+// No lock and no ordering. The answer is a snapshot, and identity's own note on the port says why
+// that is enough: the state is re-read every time the request is touched rather than recorded once.
+func (activeJobLookup) HasActiveJob(ctx context.Context, r db.Runner, userID uuid.UUID) (bool, error) {
+	const q = `
+		SELECT EXISTS (
+		       SELECT 1
+		         FROM jobs j
+		         LEFT JOIN bids b ON b.job_id = j.id AND b.status = 'Accepted'
+		        WHERE j.status IN ` + activeJobStatuses + `
+		          AND (j.customer_id = $1 OR b.provider_id = $1))`
+
+	var active bool
+	if err := r.QueryRow(ctx, q, userID).Scan(&active); err != nil {
+		return false, fmt.Errorf("cmd/api: reading whether %s is carrying a delivery: %w", userID, err)
+	}
+	return active, nil
+}
+
+// Compile-time proof that the adapter satisfies the port identity declared, which is the only place
+// in the build where that can be established — identity names no type here and this type names no
+// domain but identity, so nothing else links them.
+var _ identity.ActiveJobs = activeJobLookup{}

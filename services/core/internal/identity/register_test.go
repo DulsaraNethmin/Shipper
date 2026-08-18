@@ -65,7 +65,7 @@ func newTestService(t *testing.T) (*Service, *pgxpool.Pool, *recordingSender) {
 
 	mail := &recordingSender{}
 	svc, err := NewService(pool, hasher, testServiceIssuer(t, clock.System{}), testLimiter(t),
-		mail, &recordingTexter{}, clock.System{})
+		mail, &recordingTexter{}, noDelivery, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}
@@ -86,7 +86,7 @@ func newTestServiceWithSMS(t *testing.T, clk clock.Clock) (*Service, *pgxpool.Po
 
 	texter := &recordingTexter{}
 	svc, err := NewService(pool, hasher, testServiceIssuer(t, clk), testLimiter(t),
-		&recordingSender{}, texter, clk)
+		&recordingSender{}, texter, noDelivery, clk)
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}
@@ -493,7 +493,7 @@ func TestRegisterWithoutADatabaseIsUnavailableNotAPanic(t *testing.T) {
 		t.Fatalf("building the hasher: %v", err)
 	}
 	svc, err := NewService(nil, hasher, testServiceIssuer(t, clock.System{}), testLimiter(t),
-		&recordingSender{}, &recordingTexter{}, clock.System{})
+		&recordingSender{}, &recordingTexter{}, noDelivery, clock.System{})
 	if err != nil {
 		t.Fatalf("building the service: %v", err)
 	}

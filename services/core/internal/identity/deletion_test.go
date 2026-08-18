@@ -1,6 +1,9 @@
 package identity
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -8,6 +11,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
 // SHIP-169 against a real PostgreSQL, per Docs/06 §4.1.
@@ -301,5 +307,413 @@ func TestRequestDeletionWithoutADatabaseIsUnavailable(t *testing.T) {
 
 	if _, _, err := svc.RequestDeletion(t.Context(), uuid.Nil); err != errUnavailable {
 		t.Errorf("err = %v, want errUnavailable", err)
+	}
+}
+
+// --- SHIP-170: the deferral -----------------------------------------------------------------
+
+// noDelivery is the [ActiveJobs] every test that is not about the deferral runs with.
+//
+// A package-level value rather than a literal at each call site, so that the service helpers in
+// register_test.go read as "nobody in this test is carrying a delivery" rather than as a struct
+// somebody has to decode.
+//
+// **Its own stateless type rather than a zero [fakeActiveJobs]**, because it is shared by every
+// test in the package and `fakeActiveJobs` counts its calls — one shared counter written from
+// several tests is a data race `go test -race` would find, and a fixture that fails the race
+// detector teaches nothing about the code.
+var noDelivery = noActiveJobs{}
+
+type noActiveJobs struct{}
+
+func (noActiveJobs) HasActiveJob(context.Context, db.Runner, uuid.UUID) (bool, error) {
+	return false, nil
+}
+
+// fakeActiveJobs is the port's test double, and it is deliberately controllable *between* calls.
+//
+// The deferral is re-evaluated on every request, so a double that answered one fixed value could
+// only ever demonstrate half the ticket: what makes "queues until the job closes" a claim rather
+// than a state is that the same account gets a different answer once the delivery ends. `active` is
+// therefore a field a test moves, and `calls` is what proves the port was asked again rather than
+// remembered.
+//
+// The **real** statement — the one that decides which jobs and which parties count — is exercised
+// in cmd/api against a real database (TestTheActiveJobLookupSeesBothParties). A fake here would
+// otherwise be a test of the domain's response and of nothing else, which is the shape wave 12
+// recorded as "a mutation killed by the wrong layer".
+type fakeActiveJobs struct {
+	active bool
+	err    error
+	calls  int
+}
+
+func (f *fakeActiveJobs) HasActiveJob(context.Context, db.Runner, uuid.UUID) (bool, error) {
+	f.calls++
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.active, nil
+}
+
+// newDeletionService is newTestServiceWithSMS with the active-job port under the test's control.
+func newDeletionService(t *testing.T, clk clock.Clock, jobs ActiveJobs) (*Service, *pgxpool.Pool) {
+	t.Helper()
+
+	pool := pgtest.DB(t)
+
+	hasher, err := passwords.NewHasher(testProfile)
+	if err != nil {
+		t.Fatalf("building the hasher: %v", err)
+	}
+
+	svc, err := NewService(pool, hasher, testServiceIssuer(t, clk), testLimiter(t),
+		&recordingSender{}, &recordingTexter{}, jobs, clk)
+	if err != nil {
+		t.Fatalf("building the service: %v", err)
+	}
+	return svc, pool
+}
+
+// deletionRequestState is the stored state alone, for the assertions that are about the row rather
+// than about the answer.
+func deletionRequestState(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) string {
+	t.Helper()
+
+	state, _, _ := deletionRequestRow(t, pool, userID)
+	return state
+}
+
+// TestARequestDuringADeliveryIsDeferred is SHIP-170's acceptance criterion, first half.
+//
+// **Deferred, not refused**, which is Docs/05 §3.1's own word and the thing a plausible
+// implementation gets wrong: refusing would answer an error, record nothing, and leave a person
+// carrying a delivery unable to ask at all — Apple requires in-app deletion to be *offered*.
+//
+// The assertion is on the stored row as well as on the answer, for deletion_test.go's standing
+// reason: a return value is the same shape under an implementation that wrote the state and one
+// that decorated the response on the way out.
+func TestARequestDuringADeliveryIsDeferred(t *testing.T) {
+	jobs := &fakeActiveJobs{active: true}
+	svc, pool := newDeletionService(t, clock.NewFixed(deletionRequestedAt), jobs)
+	user := registerFor(t, svc, "1700")
+
+	request, created, err := svc.RequestDeletion(t.Context(), user.ID)
+	if err != nil {
+		t.Fatalf("requesting deletion during a delivery: %v", err)
+	}
+
+	if !created {
+		t.Error("the request was not created; a deferral is a request that exists, not one that was refused")
+	}
+	if request.State != DeletionDeferred {
+		t.Errorf("State = %q, want %q — Docs/05 §3.1 defers a request made between Awarded and "+
+			"Delivered rather than refusing it", request.State, DeletionDeferred)
+	}
+	if jobs.calls != 1 {
+		t.Errorf("the active-job port was asked %d times, want 1", jobs.calls)
+	}
+
+	if state := deletionRequestState(t, pool, user.ID); state != string(DeletionDeferred) {
+		t.Errorf("the stored state is %q, want %q — the deferral has to be in the row, or "+
+			"SHIP-171 has nothing to read before it executes", state, DeletionDeferred)
+	}
+}
+
+// TestTheDeferralExplainsWhy is the criterion's second half — "and explains why".
+//
+// On the rendered response rather than on the constant, because a state carried in a field no
+// response includes explains nothing to anybody. The assertion is in **both** directions: a live
+// request must carry no explanation, or a client cannot tell the two apart by the field's presence,
+// which is what `omitempty` is for.
+func TestTheDeferralExplainsWhy(t *testing.T) {
+	promised := time.Date(2020, 1, 1, 8, 15, 0, 0, time.UTC)
+	base := DeletionRequest{
+		ID:          uuid.New(),
+		UserID:      uuid.New(),
+		RequestedAt: promised,
+		CompleteBy:  promised.Add(DeletionWindow),
+	}
+
+	t.Run("a deferred request says why it is waiting", func(t *testing.T) {
+		deferred := base
+		deferred.State = DeletionDeferred
+
+		got := deletionRequestFrom(deferred)
+
+		if got.State != string(DeletionDeferred) {
+			t.Errorf("state rendered as %q, want %q", got.State, DeletionDeferred)
+		}
+		if got.DeferralReason != DeferralReason {
+			t.Errorf("deferral_reason = %q, want the platform's own words", got.DeferralReason)
+		}
+		// The explanation has to be about the deferral rather than about the delivery.
+		// A sentence naming a job would put job data on a screen both halves of the
+		// marketplace reach — Docs/01 §4.3 — and there is nothing a person could do with it.
+		for _, forbidden := range []string{"job", "Job", "$"} {
+			if strings.Contains(got.DeferralReason, forbidden) {
+				t.Errorf("the deferral explanation contains %q: %q", forbidden, got.DeferralReason)
+			}
+		}
+	})
+
+	t.Run("a live request carries no explanation at all", func(t *testing.T) {
+		live := base
+		live.State = DeletionRequested
+
+		got := deletionRequestFrom(live)
+
+		if got.DeferralReason != "" {
+			t.Errorf("deferral_reason = %q on a request that is not deferred; a client "+
+				"branching on the field being present would render an explanation for "+
+				"a request that has none", got.DeferralReason)
+		}
+	})
+}
+
+// TestTheDeferralLiftsWhenTheDeliveryCloses is "queues until the job closes", which is the clause
+// no single call can demonstrate.
+//
+// Three things are asserted and the third is the one worth having: the state moves, the completion
+// date is re-recorded from the moment it moved, and **the account still holds exactly one request**.
+// An implementation that answered correctly and inserted a second row would pass the first two and
+// leave the platform holding two promises — the observed side effect is what tells them apart, and
+// it is the shape wave 12 recorded as the strongest assertion available.
+func TestTheDeferralLiftsWhenTheDeliveryCloses(t *testing.T) {
+	clk := clock.NewFixed(deletionRequestedAt)
+	jobs := &fakeActiveJobs{active: true}
+	svc, pool := newDeletionService(t, clk, jobs)
+	user := registerFor(t, svc, "1701")
+
+	deferred, _, err := svc.RequestDeletion(t.Context(), user.ID)
+	if err != nil {
+		t.Fatalf("the deferred request: %v", err)
+	}
+	if deferred.State != DeletionDeferred {
+		t.Fatalf("the fixture did not defer: State = %q", deferred.State)
+	}
+
+	// The delivery finishes, and time passes before the person asks again.
+	clk.Advance(5 * 24 * time.Hour)
+	jobs.active = false
+
+	live, created, err := svc.RequestDeletion(t.Context(), user.ID)
+	if err != nil {
+		t.Fatalf("the request after the delivery closed: %v", err)
+	}
+
+	if created {
+		t.Error("the deferral lifting created a second request")
+	}
+	if live.ID != deferred.ID {
+		t.Errorf("the lifted request is %s and the deferred one was %s", live.ID, deferred.ID)
+	}
+	if live.State != DeletionRequested {
+		t.Errorf("State = %q after the delivery closed, want %q — the queue is drained by "+
+			"re-reading the request, so a state that never moves is a request that waits forever",
+			live.State, DeletionRequested)
+	}
+
+	t.Run("the thirty days start when the deferral lifts", func(t *testing.T) {
+		want := deletionRequestedAt.Add(5 * 24 * time.Hour).Add(DeletionWindow)
+		if !live.CompleteBy.Equal(want) {
+			t.Errorf("CompleteBy = %s, want %s — a deferred request's clock has not started, "+
+				"so the window runs from the moment it does", live.CompleteBy, want)
+		}
+		if !live.RequestedAt.Equal(deletionRequestedAt) {
+			t.Errorf("RequestedAt = %s, want the instant of the original request, %s — "+
+				"when somebody asked is evidence and does not move", live.RequestedAt, deletionRequestedAt)
+		}
+	})
+
+	t.Run("and the row says so", func(t *testing.T) {
+		state, requestedAt, completeBy := deletionRequestRow(t, pool, user.ID)
+
+		if state != string(DeletionRequested) {
+			t.Errorf("the stored state is %q, want %q", state, DeletionRequested)
+		}
+		if !completeBy.Equal(live.CompleteBy) {
+			t.Errorf("the row holds %s and the person was told %s", completeBy, live.CompleteBy)
+		}
+		if !requestedAt.Equal(deletionRequestedAt) {
+			t.Errorf("the stored requested_at moved to %s", requestedAt)
+		}
+	})
+
+	t.Run("one row, across the whole lifecycle", func(t *testing.T) {
+		if n := deletionRequestCount(t, pool, user.ID); n != 1 {
+			t.Errorf("%d deletion requests after a deferral lifted, want 1 — two rows are two "+
+				"promises about one account, and whichever SHIP-171 read would be the one that counted", n)
+		}
+	})
+}
+
+// TestALiveRequestGoesBackOnHoldWhenADeliveryStarts is the other direction, and it is the one a
+// reader would not assume.
+//
+// Docs/05 §3.1's sentence is about a request *made* during a delivery, but its reason —
+// "erasing a party mid-delivery would strand the counterparty" — is about *executing* one. A person
+// who asks to be deleted and then wins a job is in exactly the state the rule exists for, and a
+// stored state that stayed live would tell them a date the platform must not keep. So the state is
+// a fact about where the account stands now, re-read on every call, rather than a fact about the
+// instant somebody tapped.
+func TestALiveRequestGoesBackOnHoldWhenADeliveryStarts(t *testing.T) {
+	clk := clock.NewFixed(deletionRequestedAt)
+	jobs := &fakeActiveJobs{active: false}
+	svc, pool := newDeletionService(t, clk, jobs)
+	user := registerFor(t, svc, "1702")
+
+	live, _, err := svc.RequestDeletion(t.Context(), user.ID)
+	if err != nil {
+		t.Fatalf("the first request: %v", err)
+	}
+	if live.State != DeletionRequested {
+		t.Fatalf("the fixture did not start live: State = %q", live.State)
+	}
+
+	clk.Advance(2 * 24 * time.Hour)
+	jobs.active = true
+
+	held, created, err := svc.RequestDeletion(t.Context(), user.ID)
+	if err != nil {
+		t.Fatalf("the request after a delivery started: %v", err)
+	}
+
+	if created {
+		t.Error("going on hold created a second request")
+	}
+	if held.State != DeletionDeferred {
+		t.Errorf("State = %q after the account took on a delivery, want %q", held.State, DeletionDeferred)
+	}
+	if held.ID != live.ID {
+		t.Errorf("the held request is %s and the original was %s", held.ID, live.ID)
+	}
+	if state := deletionRequestState(t, pool, user.ID); state != string(DeletionDeferred) {
+		t.Errorf("the stored state is %q, want %q", state, DeletionDeferred)
+	}
+	if n := deletionRequestCount(t, pool, user.ID); n != 1 {
+		t.Errorf("%d deletion requests, want 1", n)
+	}
+}
+
+// TestADeferredRequestAskedAgainDoesNotMoveItsDate is SHIP-169's property, checked in the state
+// SHIP-170 added.
+//
+// It is the assertion that separates "the date is written by an event" from "the date is worked out
+// whenever somebody asks". The clock moves ten days between two calls that change nothing, and a
+// recomputing implementation answers ten days later the second time.
+func TestADeferredRequestAskedAgainDoesNotMoveItsDate(t *testing.T) {
+	clk := clock.NewFixed(deletionRequestedAt)
+	svc, pool := newDeletionService(t, clk, &fakeActiveJobs{active: true})
+	user := registerFor(t, svc, "1703")
+
+	first, _, err := svc.RequestDeletion(t.Context(), user.ID)
+	if err != nil {
+		t.Fatalf("the first request: %v", err)
+	}
+
+	clk.Advance(10 * 24 * time.Hour)
+
+	second, created, err := svc.RequestDeletion(t.Context(), user.ID)
+	if err != nil {
+		t.Fatalf("the second request: %v", err)
+	}
+
+	if created {
+		t.Error("asking again while deferred created a second request")
+	}
+	if second.State != DeletionDeferred {
+		t.Errorf("State = %q, want %q — the delivery has not closed", second.State, DeletionDeferred)
+	}
+	if !second.CompleteBy.Equal(first.CompleteBy) {
+		t.Errorf("the completion date moved from %s to %s across two calls that changed nothing; "+
+			"it is being computed at read time", first.CompleteBy, second.CompleteBy)
+	}
+
+	if _, _, completeBy := deletionRequestRow(t, pool, user.ID); !completeBy.Equal(first.CompleteBy) {
+		t.Errorf("the row holds %s and the person was told %s", completeBy, first.CompleteBy)
+	}
+}
+
+// TestAFailingActiveJobLookupRecordsNothing is the error branch, made real.
+//
+// **The failure happens before any SQL**, which is wave 10's rule for proving an error branch is
+// checked: PostgreSQL aborts a transaction as soon as a statement raises, so a fault injected into
+// the *database* would reach the caller through the COMMIT whether or not the code looked at it.
+// A port that returns an error cannot.
+//
+// What it protects: an implementation that read the lookup's error and carried on would record a
+// live request for somebody who might be mid-delivery — the failure Docs/05 §3.1 names, arriving
+// through the one path where nothing looks wrong.
+func TestAFailingActiveJobLookupRecordsNothing(t *testing.T) {
+	broken := &fakeActiveJobs{err: errors.New("jobs: the database went away")}
+	svc, pool := newDeletionService(t, clock.NewFixed(deletionRequestedAt), broken)
+	user := registerFor(t, svc, "1704")
+
+	if _, _, err := svc.RequestDeletion(t.Context(), user.ID); err == nil {
+		t.Fatal("the request succeeded while the active-job lookup was failing, so the platform " +
+			"cannot know whether it has just promised to erase somebody mid-delivery")
+	}
+
+	if n := deletionRequestCount(t, pool, user.ID); n != 0 {
+		t.Errorf("%d deletion requests were recorded despite the lookup failing, want 0", n)
+	}
+}
+
+// TestNewServiceRefusesWithoutAnActiveJobLookup.
+//
+// A missing collaborator is a wiring mistake rather than a transient condition, and this one fails
+// silently in the worst direction: every request would be recorded live, the responses would look
+// ordinary, and nothing would show until SHIP-171 erased a party mid-delivery.
+func TestNewServiceRefusesWithoutAnActiveJobLookup(t *testing.T) {
+	hasher, err := passwords.NewHasher(testProfile)
+	if err != nil {
+		t.Fatalf("building the hasher: %v", err)
+	}
+
+	_, err = NewService(nil, hasher, testServiceIssuer(t, clock.System{}), testLimiter(t),
+		&recordingSender{}, &recordingTexter{}, nil, clock.System{})
+	if err == nil {
+		t.Fatal("a service was built with no active-job lookup")
+	}
+}
+
+// TestTheOpenStatesInSQLAreTheOnesTheDomainDeclares holds the one list that had to be written twice.
+//
+// [openDeletionStatesSQL] cannot be parameterised — PostgreSQL infers a partial unique index by
+// proving its predicate, and a placeholder proves nothing — so the open states exist as a SQL
+// literal and as [DeletionState.Open]. **This is the guard SHIP-171 needs**: adding 'completed' to
+// [DeletionStates] without keeping it out of the open list would make an executed request block the
+// same account from ever asking again, and nothing else in the build would notice.
+//
+// It is a text guard and wave 10's note applies — a test that reads a constant does not test the
+// query that interpolates it. What tests the query is every deletion test above, which runs the
+// real statement against a real index.
+func TestTheOpenStatesInSQLAreTheOnesTheDomainDeclares(t *testing.T) {
+	inSQL := map[string]bool{}
+	for _, quoted := range strings.Split(strings.Trim(openDeletionStatesSQL, "()"), ",") {
+		inSQL[strings.Trim(strings.TrimSpace(quoted), "'")] = true
+	}
+
+	inGo := map[string]bool{}
+	for _, state := range OpenDeletionStates() {
+		inGo[state.String()] = true
+	}
+
+	if len(inSQL) != len(inGo) {
+		t.Fatalf("openDeletionStatesSQL names %d states and OpenDeletionStates() has %d: %v vs %v",
+			len(inSQL), len(inGo), inSQL, inGo)
+	}
+	for state := range inGo {
+		if !inSQL[state] {
+			t.Errorf("%q is an open state and openDeletionStatesSQL does not name it — the "+
+				"partial index would stop covering a row the domain thinks is open", state)
+		}
+	}
+	for state := range inSQL {
+		if !inGo[state] {
+			t.Errorf("openDeletionStatesSQL names %q and DeletionState.Open does not — an "+
+				"executed request would block the same account from ever asking again", state)
+		}
 	}
 }

@@ -830,6 +830,8 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-169** | M7 | `POST /v1/account/deletion` — a signed-in person asks to be deleted and is told the date, and **the date is recorded when it is promised rather than derived when it is read**. That is the whole ticket: `now() + 30 days` computed while rendering answers plausibly every time, writes nothing, and lets the promise slide forward for as long as nobody executes it. The state lives in a **new table in identity's block** (`000105`) and not in a column on `users` — the shared block is not a domain branch's to take, and `Docs/10` §3.3 forbids the soft delete a `deleted_at` invites. One open request per account is a **partial unique index**, so two honest taps carrying two keys are one promise. **The deferral clause is declared out of scope with its reason**: `Docs/09` gives it to SHIP-170, which depends on SHIP-57 as well as on this — *see below* |
 | **SHIP-164** | M6 | `GET /v1/admin/disputes`, `GET /v1/admin/disputes/{id}` and `POST /v1/admin/disputes/{id}/resolution` — the four-times-held row, and the ticket that **unfreezes a job**. `Docs/04` §7's five outcomes and `Docs/02` §2's two destinations are **orthogonal**, so a resolution records both and derives neither; three of the five are equally true of a delivery that completed and one that failed. **No thirteenth job status and no fourth Kafka aggregate** — the transition emits `job.status_changed`, which `StatusRules` already routes on both destinations. The outcome, the transition and the audit entry are **one transaction**, which is the ticket's hardest invariant and the only thing a happy path cannot demonstrate. `idx_disputes_open` finally has a reader. **§7's right-of-reply clause is declared unmet with its reason**, and a constraint written and then removed found a **two-clock inconsistency on `disputes.created_at`** — *see below* |
 | **SHIP-81b** | M3 | The evidence behind a verification record: `provider_verification_documents` (`000201`, `internal/profiles`' second table), a pre-signed upload URL, the submission that turns an uploaded object into one of `Docs/04` §3's four documents, and a read that mints a fresh signed URL per request. **The platform is not in the path of the bytes and never sees an image** — it signs, the handset PUTs to the store, and the record is written only after the store is *asked* what it holds. **`profiles.Documents` is a second type rather than a wider `Service`**, because `routes_admin.go` constructs a `Service` to decide a verification and has no business holding a signer. **No expiry column and no renewal cadence** — that is X-4's and SHIP-159's. **The client half was not taken**, for a reason that is a finding rather than scheduling — *see below* | 
+| **SHIP-170** | M7 | The deferral. A deletion request made while the account is party to a job between `Awarded` and `Delivered` is recorded as `deferred` with the platform's own explanation beside it, and **both parties count** — `Docs/05` §3.1 says a *party* mid-delivery, and the endpoint is `RequireUser` with no role predicate, so a lookup reading `jobs.customer_id` alone would pass every customer-side assertion and erase a driver mid-delivery. It is `internal/identity`'s **first port over another domain** rather than over an adapter, following `admin.JobParties`: one method answering yes or no, with the statement that spans `jobs` and `bids` in `cmd/api`. **No job identifier is stored** — the deferral is re-read on every call, in both directions, so it cannot go stale and the row stays what `000105` built it to be. `000106` widens the CHECK *and* the open-request index, which is the half a reader would miss: a deferred request is an open request, and an index still partial on `'requested'` would let one account hold two promises. It answers `deletion.go:200`'s question — the two statements became three and one transaction, because the re-read is now followed by a write. The mutation dropping the provider half is reported below with the layer that killed it — *see below* |
+| **SHIP-173** | M7 | The account deletion screen — the client half of the two, and the only place in the app that reaches `POST /v1/account/deletion`. **It renders `deferred` because SHIP-170 exists**, which is why the two were one lane: `contracts/paths/identity.yaml` had already told clients to branch on `state` rather than assume it, and a screen shipped before the state would have told somebody mid-delivery their account goes on the fifteenth. Consequences are `Docs/05` §3.1's split rather than a warning — what is deleted for good, and **what stays under a pseudonym**, which is the half nobody expects. The confirmation is tested in **both** directions: opening the dialog sends nothing and dismissing it sends nothing, which is `award_test.dart`'s argument that a confirmation tested only in the accepting direction is one nobody has checked. It draws **no job** on a screen both roles reach, and a repeat is not read as a new request — asking again is how a deferral lifts, so the button stays and the second call is what the test asserts. Entry point is a third app-bar action on the signed-in shell, because there is no settings screen and inventing one for a single action would be building what a later ticket has to reconcile with — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -15028,6 +15030,258 @@ One new migration (`000201`, profiles' block, highest there now `000201`), two n
 **`Service.mustBeProvider` became a package-level function.** Two types in this package ask the same question of the same table, and a method on `Service` would have made "is this caller a provider" reachable only by holding a service that can also move a verification state.
 
 **Constraint sweep.** The ticket adds a table with four `CHECK`s, a `RESTRICT` foreign key, a unique index and two append-only triggers, so every `scripts/verify/*.sh` was swept rather than only this domain's. Nothing outside `62-profiles.sh` names `provider_verification_documents`; nothing anywhere deletes from `provider_verifications`; `90-admin.sh` updates `provider_verifications.created_at`, which `provider_verification_change_is_guarded` passes through untouched because it has an opinion about `state` alone; and `40-identity.sh`'s `delete from users` already fails on `device_sessions`. The new table is referenced by nothing and references only `provider_verifications`, so no existing fixture can collide with it.
+
+### SHIP-170 — the deferral, and why both parties count
+
+`POST /v1/account/deletion` is unchanged as a route. What changed is what it records: a request made
+while the caller is party to a job between `Awarded` and `Delivered` is stored as `deferred`, answered
+`202` with a `deferral_reason` beside it, and becomes `requested` once the delivery closes.
+
+**Deferred rather than refused, which is `Docs/05` §3.1's own word.** A `409` would have been wrong
+twice: the request succeeded, and a client rendering an error would tell somebody their deletion had
+not been recorded when it had. Apple requires deletion to be *offered*, and a person carrying a
+delivery must still be able to ask.
+
+#### The first port `internal/identity` holds over another domain
+
+`ports.go` declared two ports before this and both were **adapters** — a transport the domain needs
+and does not own. `identity.ActiveJobs` is the first thing it needs of another *domain*, and it
+follows `admin.JobParties` exactly: one method, `HasActiveJob(ctx, r, userID) (bool, error)`, and the
+statement lives in `cmd/api/routes_identity.go` because it spans `jobs` and `bids` — two tables
+`identity` may not import, in either direction, and the boundary lint refuses both. `ports.go:44-47`
+states the rule the shape follows: *a port is what a domain needs rather than what the other domain
+has.* Not the job, not its status, not a list — a boolean, because the question `Docs/05` §3.1 asks is
+a boolean and a shape that never carried a job cannot leak one.
+
+It takes a `db.Runner` for `Docs/10` §3.2's reason: the answer about the delivery and the state
+written from it are one statement of what was true.
+
+#### Both parties, which is the whole ticket and is easy to get half right
+
+`Docs/05:89` — *"Erasing a party mid-delivery would strand the counterparty."* **Party**, not customer.
+Measured rather than assumed: the deletion route is `RequireUser` with no role predicate, and
+`scripts/verify/40-identity.sh` already registered a customer and a provider and got `202` for both.
+So the customer side is `jobs.customer_id` and the provider side is `bids.provider_id` where the bid
+is `Accepted` — `uq_bids_one_accepted_per_job` is partial on that status, which is what stops the
+`LEFT JOIN` multiplying rows.
+
+`activeJobStatuses` is a single-line constant naming Docs/02 §1's six committed statuses, written out
+rather than expressed as a complement — `overduePickupStatuses`' decision, for its reason: a
+thirteenth status added to `Docs/02` §1 would be absorbed into the *deferring* set by a complement,
+which is the direction that quietly stops people being deleted. **`Delivered` is inside the range and
+`Disputed` is outside it.** A job at `Delivered` is not finished — `Docs/02` §6.1 auto-completes it 72
+hours later and it can still go to `Disputed` — and a dispute is a delivery that has stopped rather
+than one in flight.
+
+#### No job identifier on the request, and the argument against one
+
+The tempting shape is a nullable `waiting_on_job_id` with a foreign key. It was rejected. That is a
+cross-block foreign key from an identity-block table into `jobs`, and `000105`'s own reasoning argues
+against it: the row is evidence and must outlive everything, which is why its one foreign key is
+`ON DELETE RESTRICT` — tying it to a job would make the job unremovable too, and would leave a stale
+identifier behind the moment the deferral lifted.
+
+**So the deferral is re-evaluated through the port every time the request is touched, in both
+directions.** A deferred request becomes live once the delivery closes; a live one goes back on hold
+if the person has since taken on a delivery. The second direction is not in `Docs/05` §3.1's sentence
+— which is about a request *made* during a delivery — but it is in its reason, which is about
+*executing* one, and SHIP-171 will ask the same question again before it does.
+
+**What that costs, stated rather than hidden: nothing moves on its own.** A person who defers and
+never asks again stays deferred until SHIP-171 looks. There is no worker task, and inventing one here
+would be inventing SHIP-171's shape from the ticket before it.
+
+#### `000106` widens two things, and the second is the one a reader would miss
+
+The CHECK, which `000105` pre-authorised by name — *"SHIP-170 `'deferred'` … Adding either is
+`ALTER TABLE … DROP CONSTRAINT … ADD CONSTRAINT …`, which is the whole reason §3.4 rejects an enum
+type"* — and **`uq_account_deletion_requests_open` with it.** That index was partial on
+`state = 'requested'`, and `000105` said why: *"only an open one does"*. A deferred request **is**
+open, so leaving the predicate alone would have made the index stop covering the row the instant it
+was deferred, and an account could then hold one deferred request and one live one. Two rows are two
+promises about one account — the exact defect the index exists to prevent, invisible until SHIP-171
+read whichever it happened to find. SHIP-171's `'completed'` is the state that must **not** join that
+predicate, and `TestTheOpenStatesTheIndexCoversAreTheOnesTheDomainCallsOpen` is what will say so.
+
+The `down` migration converts `'deferred'` back to `'requested'` **before** narrowing the CHECK,
+because PostgreSQL refuses the narrowing while any row holds the value — a down migration that fails
+on a database somebody has used is a down migration that does not exist.
+
+#### `deletion.go:200-204`'s question, answered
+
+SHIP-169 left the `INSERT` and the `SELECT` unwrapped and wrote down why that was safe *then*, asking
+whichever of SHIP-170 and SHIP-171 arrived first to decide whether the two needed to become one.
+
+**They do, and there are now three.** The sequence is insert-or-conflict, re-read, and — when the
+deferral has moved — *write*. SHIP-169's argument rested on nothing ever moving a request out of
+`requested`, which this ticket is precisely what falsifies: between the read and the write another
+request on the same account can move the same row, and two callers would each decide the state from
+what they saw. So `RequestDeletion` opens a transaction, the re-read takes `FOR UPDATE`, and the port
+is called inside it. The lock is taken at the read rather than at the write, because the decision is
+made from what the read returned — locking at the write would be locking after the race.
+
+#### The completion date still never moves at a read, and now moves at a write
+
+SHIP-169's headline property is that `complete_by` is recorded when it is promised rather than derived
+when it is read. That is kept and stated more precisely: **the date is written at a state change and
+never at a read.** A deferred request's thirty days have not started, so what it carries is the
+earliest the platform could finish from where it stands, and it is re-recorded at the moment the
+deferral lifts. Two calls that change nothing return the same date — which is what
+`TestTheCompletionDateDoesNotMoveWithTheClock` and
+`TestADeferredRequestAskedAgainDoesNotMoveItsDate` pin, and what a recomputing implementation cannot
+have. The contract says which of the two a client is looking at, and the screen must not present a
+deferred date as a promise.
+
+#### The explanation is served, not shipped
+
+`deferral_reason` is a string the platform holds. `CLAUDE.md` puts policy copy server-side and
+`Docs/05` §3.1 is a legal position: a sentence built into a mobile release cannot be corrected without
+another release, and Flutter has no over-the-air path for Dart code. It is `omitempty`, so its presence
+is the same fact as the state, and it **names no job, no address and no amount** — both halves of the
+marketplace reach this endpoint, and `Docs/01` §4.3 is easiest to keep on a sentence that never had a
+job to describe. Asserted in both directions, in Go and in the harness: a live request must carry no
+explanation, or a client branching on the field would render one for a request that has none.
+
+#### The mutation: drop the provider half of the query
+
+`WHERE j.status IN (…) AND (j.customer_id = $1 OR b.provider_id = $1)` reduced to
+`AND j.customer_id = $1`, with the `LEFT JOIN` to `bids` removed.
+
+**The mechanism stays perfect.** The port answers, the deferral works, a customer mid-delivery is
+queued and told why, the state moves when the job closes, and the date is re-recorded. What breaks is
+only coverage of the other party — which is the failure `Docs/05:89` names.
+
+| Layer | Verdict |
+|---|---|
+| `internal/identity`'s own tests | **survived** — every one passes. They drive a fake port, which is the whole reason the fake cannot be the ticket's evidence |
+| `cmd/api` — `TestTheActiveJobLookupSeesBothParties` | **killed**, naming `the provider whose offer was accepted` |
+| `cmd/api` — `TestTheActiveJobLookupCoversDocs02sWholeVocabulary` | **killed**, at all six committed statuses, for `the awarded provider` |
+| `scripts/verify/40-identity.sh` | **killed** — *"the awarded provider's request is not deferred; erasing them mid-delivery would strand the customer"*, with the body printed beside it showing `"state":"requested"` |
+| `services/core/migrations` | survived, correctly — the schema has no opinion about which parties a query reads |
+
+**The layer that holds it is `cmd/api`'s database-backed tests**, and they are the reason this ticket
+did not rest on the harness alone: wave 12 recorded a mutation killed by the wrong layer, and a domain
+test driven by a fake proves the domain's response and nothing about the statement behind it. Three
+readings rather than one layer — the statement in Go, the endpoint over HTTP, and neither of them
+reachable from `internal/identity`, whose tests all passed throughout.
+
+**The mutated run also found a defect in the harness fixture, which is worth recording because it is
+the reason a mutation run is not wasted when it stops early.** The first attempt failed before
+reaching any deferral assertion: `psql -tAc "insert … returning id"` prints the `INSERT 0 1` command
+tag after the returned identifier, so the job id became two lines and the next statement interpolated
+a malformed uuid. `-qtAc` is the fix, and the section could not have passed on any tree before it.
+
+The mutation was reverted from a copy taken before it was applied, with the checksums written to a
+`SHASUMS` file beside the copy in the same command, and confirmed afterwards with `git diff` **and**
+`shasum -a 256 -c` — the second being the one that means anything, since after a restore `git diff`
+is silent whether the file was restored or destroyed.
+
+#### What it touched, and what it deliberately did not
+
+One migration (`000106`, identity's block, highest there now `000106`), one port, one service field and
+one `NewService` argument, one store function split into three statements under a transaction, one
+response field, one adapter in `cmd/api`, one contract fragment, one `make verify` section, eight new
+domain tests, four new `cmd/api` tests against real rows, and two new migration tests. **No new error
+code**, so `Docs/10-api-error-codes.md` is untouched — a deferral is not a failure. **No new route and
+no `contracts/openapi.yaml` change**: the endpoint already existed, and `$ref` lines are per path.
+**`internal/jobs` and `internal/bidding` are untouched**, which is the property that made this
+buildable in a wave where neither package is anybody's.
+
+**Swept for the widened constraint.** `grep -rn account_deletion_requests scripts/verify/*.sh` names
+`40-identity.sh` and no other file, and the two guards SHIP-169 planted — the harness's state-list
+assertion and `migrations/account_deletion_requests_test.go`'s pairing — were both moved rather than
+deleted, which is what SHIP-169 wrote the first one for.
+
+### SHIP-173 — the deletion screen, and why it had to come second
+
+`/account/deletion`, reached from a third action in the signed-in shell's app bar, over the endpoint
+SHIP-169 built and the state SHIP-170 added. It is the only place in the client that reaches
+`POST /v1/account/deletion`.
+
+**It was built after SHIP-170 deliberately, on the same lane.** `contracts/paths/identity.yaml`
+already told clients that *"a request made during an active delivery will report a deferred state
+once SHIP-170 exists, so branch on this rather than assuming it"* — so a screen shipped first would
+have been a screen that silently broke on the day the state arrived, telling somebody mid-delivery
+that their account goes on the fifteenth of September.
+
+#### Where it lives, and the screen that was not invented to hold it
+
+There is no settings or account screen in this app: `features/profile` is a doc-only stub and
+`Routes` has no `/settings`. The affordance is an app-bar `IconButton` beside sign-out, on the shell
+both halves of the marketplace land on — which is what Apple actually requires, that deletion be
+*discoverable* from inside the app. Inventing an account screen to hold one action would have been
+building the surface a later ticket has to reconcile with, and the screen's own header records that
+it moves under one when it exists.
+
+`Routes.accountDeletion` mirrors the endpoint's path, which `Routes.myBids` deliberately does not —
+those diverge because a URL is a person's map of the product and `/v1/fleet/bids` names where a
+provider's records live. This is the account itself, and both sides mean the same thing by it.
+
+#### The trap this route was one line from falling into
+
+`_signedInLocations` has a third entry, added in the same change as the route. A route missing from
+that set sends the app to the home shell, which **from the outside is indistinguishable from a button
+that does nothing** — SHIP-102's lane lost a run to it. The test asserts both halves after the tap:
+the deletion screen is present *and* `shell-signed-in` is not, so the silent redirect fails rather
+than passing as a screen nobody looked at.
+
+#### The two clauses, and what would have made each look true
+
+**Clear consequences** is `Docs/05` §3.1's split rather than a warning. Two paragraphs, because they
+answer two different questions: what is deleted for good, and **what stays** — the jobs, the offers
+and the history, under a pseudonym that is no longer you, which is the part nobody expects and which
+"this cannot be undone" would omit entirely. Asserted on the rendered text of both.
+
+**Confirmation** is tested in both directions, which is `award_test.dart`'s argument applied
+unchanged: *"a confirmation that is only tested in the accepting direction is a confirmation nobody
+has checked is a confirmation"* — it would pass against a dialog that deleted when it opened. So
+opening it sends nothing, dismissing it sends nothing, and both are asserted on **what the repository
+was asked** rather than on what the screen drew, because a screen that changed colour and sent
+nothing looks identical.
+
+#### What it does not draw, and the repeat it must not misread
+
+**No jobs.** A deferral is explained by the platform's own sentence and by nothing this screen
+assembles. Listing the delivery being waited on would put job data on a screen both roles reach,
+which engages `Docs/01` §4.3 for no gain — and the person can already see their own deliveries.
+Asserted as a real negative: the deferred sentence is confirmed on screen first, so the absence is a
+finding rather than a blank page passing.
+
+**A `200` is not "nothing happened".** The endpoint answers `202` first and `200` on every repeat, and
+a repeat is also how a deferral lifts. So the button stays after a request exists — relabelled, and
+without a second confirmation, because checking on a request that already exists cannot delete
+anything twice and a dialog nobody needs is one they learn to dismiss. The lift is asserted as a
+**second call** with a different answer, which is the only shape that can demonstrate "queues until
+the job closes" from the client's side.
+
+**No "cancel my request".** Withdrawing a deletion has no ticket and no endpoint; `000105` declined
+to invent the state because doing so invents the product decision with it.
+
+#### `deferral_reason` is rendered as given
+
+The platform holds the sentence (`CLAUDE.md` puts policy copy server-side, and `Docs/05` §3.1 is a
+legal position); the screen renders it and never parses it. The test compares against the platform's
+own wording rather than a paraphrase, so a screen that rewrote a legal sentence fails. There is a
+fallback sentence for the case where the field is absent, which is the `Docs/07` §6 direction — read
+what you use, tolerate the rest.
+
+#### `make verify` has nothing to say about this ticket, and that is stated rather than implied
+
+`git diff --name-only develop...HEAD -- services/ scripts/ contracts/ deploy/ mk/ Makefile` attributes
+**no file** to SHIP-173: every line of it is under `apps/mobile`. The harness drives the platform with
+`curl`, so `make flutter-check` is this ticket's only real guard — 1050 tests including twelve new
+ones, plus the analyzer.
+
+#### What it touched
+
+One model, one controller, one screen, one repository method with a **second base constant** — the
+endpoint is `/v1/account/deletion` and `ApiIdentityRepository._base` is `/v1/auth`, a different prefix
+chosen deliberately on the platform's side, so `'$_base/…'` would have been a `404` nobody would
+predict from the call site. Three lines in `app_router.dart` (a `Routes` constant, a `GoRoute`, an
+entry in `_signedInLocations`), one `IconButton` in `signed_in_shell.dart`, two fixtures and one
+method on `FakeIdentityRepository`, and one test file. **`signup_app.dart` is untouched**: the screen
+reads `identityRepositoryProvider`, which that harness already overrides, so no new named parameter
+was needed.
 
 ## 4. Partly done — do not treat these as finished
 

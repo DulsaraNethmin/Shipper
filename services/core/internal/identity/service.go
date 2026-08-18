@@ -92,6 +92,14 @@ type Service struct {
 	sms     SMSSender
 	clock   clock.Clock
 	store   postgresStore
+
+	// activeJobs answers whether this account is in the middle of a delivery (SHIP-170).
+	//
+	// The first port this domain holds over another *domain* rather than over an adapter —
+	// see ports.go. It is required rather than optional: a nil one would make every deletion
+	// request live, which is the exact defect Docs/05 §3.1 forbids and which nothing in a
+	// response would show.
+	activeJobs ActiveJobs
 }
 
 // NewService builds the domain service.
@@ -102,7 +110,7 @@ type Service struct {
 // mistake rather than a transient condition: a service with no hasher would accept a password
 // and store nothing derivable from it, and one with no email or SMS sender would register
 // accounts that can never be verified.
-func NewService(pool *pgxpool.Pool, hasher *passwords.Hasher, issuer *AccessTokenIssuer, limiter *ratelimit.Limiter, sender EmailSender, texter SMSSender, clk clock.Clock) (*Service, error) {
+func NewService(pool *pgxpool.Pool, hasher *passwords.Hasher, issuer *AccessTokenIssuer, limiter *ratelimit.Limiter, sender EmailSender, texter SMSSender, jobs ActiveJobs, clk clock.Clock) (*Service, error) {
 	if hasher == nil {
 		return nil, errors.New("identity: a service needs a password hasher")
 	}
@@ -124,12 +132,19 @@ func NewService(pool *pgxpool.Pool, hasher *passwords.Hasher, issuer *AccessToke
 	if texter == nil {
 		return nil, errors.New("identity: a service needs an SMS sender")
 	}
+	if jobs == nil {
+		// SHIP-170. A service without it would answer every deletion request as live, and
+		// Docs/05 §3.1's rule would be silently absent rather than visibly broken — the
+		// person would be told a date, the request would look ordinary, and the failure
+		// would only surface when SHIP-171 erased somebody mid-delivery.
+		return nil, errors.New("identity: a service needs an active-job lookup")
+	}
 	if clk == nil {
 		return nil, errors.New("identity: a service needs a clock")
 	}
 	return &Service{
 		pool: pool, hasher: hasher, issuer: issuer, limiter: limiter,
-		email: sender, sms: texter, clock: clk,
+		email: sender, sms: texter, activeJobs: jobs, clock: clk,
 	}, nil
 }
 

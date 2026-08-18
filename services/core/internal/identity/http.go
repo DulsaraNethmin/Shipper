@@ -596,22 +596,38 @@ func (h *Handler) RevokeDevice() http.Handler {
 type deletionRequestResponse struct {
 	ID string `json:"id"`
 
-	// State is `requested` for every response this endpoint can currently produce. It is here
-	// rather than implied, because SHIP-170 adds `deferred` and a client that had assumed one
-	// value would render a deferral as an ordinary request.
+	// State is `requested` or, since SHIP-170, `deferred`. SHIP-169 put it here rather than
+	// leaving it implied for exactly this reason: a client that had assumed one value would
+	// render a deferral as an ordinary request, and the contract said so before the second
+	// value existed.
 	State string `json:"state"`
 
 	RequestedAt string `json:"requested_at"`
 	CompletesBy string `json:"completes_by"`
+
+	// DeferralReason is why the request is waiting, present only when it is (SHIP-170).
+	//
+	// **Omitted rather than empty on a live request.** `omitempty` makes the field's presence
+	// the same fact as the state, so a client cannot render an explanation for a request that
+	// has none — and a screen branching on the field being there is branching on the same
+	// thing as one branching on the state.
+	//
+	// It carries no job, in any form. Both halves of the marketplace reach this endpoint, and
+	// Docs/01 §4.3's invariant is easiest to keep on a shape that never had a job to describe.
+	DeferralReason string `json:"deferral_reason,omitempty"`
 }
 
 func deletionRequestFrom(req DeletionRequest) deletionRequestResponse {
-	return deletionRequestResponse{
+	response := deletionRequestResponse{
 		ID:          req.ID.String(),
 		State:       req.State.String(),
 		RequestedAt: timestamp(req.RequestedAt),
 		CompletesBy: timestamp(req.CompleteBy),
 	}
+	if req.State == DeletionDeferred {
+		response.DeferralReason = DeferralReason
+	}
+	return response
 }
 
 // RequestAccountDeletion handles POST /v1/account/deletion (SHIP-169).
@@ -630,6 +646,18 @@ func deletionRequestFrom(req DeletionRequest) deletionRequestResponse {
 // 200 with the same body — the request that already exists, carrying the date it has carried since
 // it was made. A client can tell "I have just asked" from "I asked before" without either being an
 // error, and neither answer moves the completion date.
+//
+// # A deferral is neither an error nor a different status code (SHIP-170)
+//
+// Docs/05 §3.1 defers a request made during a delivery rather than refusing it, so the answer is
+// the same 202: the platform has accepted it and will act. What differs is `state` and the
+// `deferral_reason` beside it. **A 409 or a 422 would have been the wrong shape twice** — the
+// request succeeded, and a client rendering an error would tell somebody their deletion had not
+// been recorded when it had.
+//
+// The status codes therefore say only whether a request was *created*, and the state says whether
+// its clock is running. A client must not read a `200` as "nothing happened": the deferral may have
+// lifted on this very call, which is a change to the account with no new row to show for it.
 func (h *Handler) RequestAccountDeletion() http.Handler {
 	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
 		who, err := callerFrom(r)

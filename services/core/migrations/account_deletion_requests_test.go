@@ -204,3 +204,130 @@ func TestDeletingTheAccountCannotRemoveItsRequest(t *testing.T) {
 		t.Errorf("state = %q, want %q", state, identity.DeletionRequested)
 	}
 }
+
+// --- SHIP-170: 000106 widens the CHECK, and the index with it ---------------------------------
+
+// deferDeletionAt writes one deferred request the way SHIP-170 does.
+func deferDeletionAt(t *testing.T, pool *pgxpool.Pool, user uuid.UUID, at time.Time) uuid.UUID {
+	t.Helper()
+
+	id, err := uuid.NewV7()
+	if err != nil {
+		t.Fatalf("generating an id: %v", err)
+	}
+
+	if _, err := pool.Exec(t.Context(), `
+		INSERT INTO account_deletion_requests (id, user_id, state, requested_at, complete_by)
+		VALUES ($1, $2, 'deferred', $3, $4)`,
+		id, user, at, at.Add(identity.DeletionWindow)); err != nil {
+		t.Fatalf("recording a deferred deletion request: %v", err)
+	}
+	return id
+}
+
+// TestADeferredRequestIsStillAnOpenRequest is the half of 000106 a reader would miss.
+//
+// Widening `ck_account_deletion_requests_state` on its own would have left
+// `uq_account_deletion_requests_open` partial on `state = 'requested'` — so the index would stop
+// covering a row the instant it was deferred, and an account could hold one deferred request and
+// one live one. **Two rows are two promises about one account**, which is the exact defect 000105
+// built that index to prevent, and it would have been invisible until SHIP-171 read whichever of
+// them it happened to find.
+//
+// Both orderings are checked. A predicate widened in one direction only — deferred blocks
+// requested but not the reverse — passes half of this.
+func TestADeferredRequestIsStillAnOpenRequest(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	t.Run("a live request is refused while a deferred one is open", func(t *testing.T) {
+		user := newUser(t, pool, "deletion-deferred-one@example.com", "+61400000706", "provider")
+		deferDeletionAt(t, pool, user, time.Now().UTC())
+
+		id, _ := uuid.NewV7()
+		now := time.Now().UTC()
+		_, err := pool.Exec(t.Context(), `
+			INSERT INTO account_deletion_requests (id, user_id, state, requested_at, complete_by)
+			VALUES ($1, $2, 'requested', $3, $4)`,
+			id, user, now, now.Add(identity.DeletionWindow))
+		if err == nil {
+			t.Fatal("an account now holds a deferred request and a live one, so it has been " +
+				"promised two different completion dates")
+		}
+		if !strings.Contains(err.Error(), "uq_account_deletion_requests_open") {
+			t.Errorf("expected uq_account_deletion_requests_open to refuse it, got: %v", err)
+		}
+	})
+
+	t.Run("a deferred request is refused while a live one is open", func(t *testing.T) {
+		user := newUser(t, pool, "deletion-deferred-two@example.com", "+61400000707", "customer")
+		requestDeletion(t, pool, user, time.Now().UTC())
+
+		id, _ := uuid.NewV7()
+		now := time.Now().UTC()
+		_, err := pool.Exec(t.Context(), `
+			INSERT INTO account_deletion_requests (id, user_id, state, requested_at, complete_by)
+			VALUES ($1, $2, 'deferred', $3, $4)`,
+			id, user, now, now.Add(identity.DeletionWindow))
+		if err == nil {
+			t.Fatal("an account now holds a live request and a deferred one")
+		}
+		if !strings.Contains(err.Error(), "uq_account_deletion_requests_open") {
+			t.Errorf("expected uq_account_deletion_requests_open to refuse it, got: %v", err)
+		}
+	})
+
+	t.Run("and another account is unaffected", func(t *testing.T) {
+		other := newUser(t, pool, "deletion-deferred-three@example.com", "+61400000708", "provider")
+		deferDeletionAt(t, pool, other, time.Now().UTC())
+	})
+}
+
+// TestTheOpenStatesTheIndexCoversAreTheOnesTheDomainCallsOpen is Docs/10 §3.4's pairing applied to
+// the index rather than to the CHECK.
+//
+// **SHIP-171 is what this exists for.** 'completed' is a state the domain must add to
+// [identity.DeletionStates] and must keep *out* of the open set — a completed request is history and
+// must not stop the same account asking again, which is 000105's own reason for making the index
+// partial. Adding it to the index predicate would be a silent, permanent refusal, and nothing else
+// in the build would report it.
+func TestTheOpenStatesTheIndexCoversAreTheOnesTheDomainCallsOpen(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	var definition string
+	if err := pool.QueryRow(t.Context(),
+		`SELECT indexdef FROM pg_indexes WHERE indexname = $1`,
+		"uq_account_deletion_requests_open").Scan(&definition); err != nil {
+		t.Fatalf("reading uq_account_deletion_requests_open: %v", err)
+	}
+
+	// The predicate alone. The indexed column is `user_id`, which is not a state and must not
+	// be read as one.
+	_, predicate, found := strings.Cut(definition, " WHERE ")
+	if !found {
+		t.Fatalf("the index is no longer partial, so a completed request would stop a later "+
+			"one forever: %s", definition)
+	}
+
+	inSQL := map[string]bool{}
+	for _, match := range quotedLiteral.FindAllStringSubmatch(predicate, -1) {
+		inSQL[match[1]] = true
+	}
+
+	inGo := map[string]bool{}
+	for _, state := range identity.OpenDeletionStates() {
+		inGo[string(state)] = true
+	}
+
+	for state := range inGo {
+		if !inSQL[state] {
+			t.Errorf("%q is open to the domain and the index does not cover it — an account "+
+				"could hold two open deletion requests", state)
+		}
+	}
+	for state := range inSQL {
+		if !inGo[state] {
+			t.Errorf("the index covers %q and the domain does not call it open — an account "+
+				"in that state could never ask again", state)
+		}
+	}
+}

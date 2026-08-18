@@ -9,11 +9,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
 
 // The identity routes through the real router (SHIP-30 onwards).
@@ -779,4 +782,271 @@ func TestAccountDeletionWithACredentialButNoDatabaseIsUnavailable(t *testing.T) 
 	if got := errorCode(t, rec); got != string(httpx.CodeUnavailable) {
 		t.Errorf("code = %q, want %q — 500 tells the client to give up", got, httpx.CodeUnavailable)
 	}
+}
+
+// --- SHIP-170: the active-job lookup, against real rows ---------------------------------------
+//
+// The rest of this file is deliberately database-free, and this section deliberately is not.
+//
+// [activeJobLookup] is the half of SHIP-170 that `internal/identity` cannot hold: it names `jobs`
+// and `bids`, which belong to two other domains, and a domain may not import another. So the domain
+// tests answer through an [identity.ActiveJobs] they control — which proves the *rule* and can prove
+// nothing about the statement behind it — and this proves the statement. [jobBidders] in
+// routes_jobs_test.go sits in exactly the same position and is the precedent, down to the fixture
+// helpers, which are shared with it because test helpers do not cross a package boundary in Go.
+//
+// The two failures this catches and the domain tests cannot: a predicate that sees only the
+// customer, and a status set that is not Docs/05 §3.1's range.
+
+// moveJobTo walks a job to a status through the guard SHIP-57a installed.
+//
+// The status column is not settable (`jobs_status_change_is_guarded`, 000402): an UPDATE has to be
+// accompanied, in the same transaction, by a `job_status_history` row describing it and named to
+// the trigger through a transaction-local setting. This is that protocol, and it is the same one
+// `move_job` in scripts/verify/50-jobs.sh runs — which is 000402's own intention, that a fixture and
+// the domain be the same caller rather than the fixture having a private way in.
+//
+// **It is not a claim about which transitions Docs/02 §2 permits.** The database does not hold that
+// table — the guarded function in `internal/jobs` does — so this helper will happily record a move
+// the product forbids. That is what lets the walk below cover Docs/02 §1's whole vocabulary without
+// having to route through eleven legal transitions, and the walk says so where it uses it.
+func moveJobTo(t *testing.T, pool *pgxpool.Pool, job, actor uuid.UUID, from, to string) {
+	t.Helper()
+
+	tx, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("opening the transition transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+
+	var transition uuid.UUID
+	if err := tx.QueryRow(t.Context(), `
+		INSERT INTO job_status_history
+		    (id, job_id, from_status, to_status, actor_type, actor_id, actor_recorded_at)
+		VALUES (gen_random_uuid(), $1, $2, $3, 'customer', $4, now())
+		RETURNING id`, job, from, to, actor).Scan(&transition); err != nil {
+		t.Fatalf("recording %s -> %s: %v", from, to, err)
+	}
+
+	if _, err := tx.Exec(t.Context(),
+		`SELECT set_config('shipper.job_status_transition', $1, true)`, transition.String()); err != nil {
+		t.Fatalf("naming the transition to the guard: %v", err)
+	}
+
+	if _, err := tx.Exec(t.Context(),
+		`UPDATE jobs SET status = $2 WHERE id = $1`, job, to); err != nil {
+		t.Fatalf("moving the job to %s: %v", to, err)
+	}
+
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatalf("committing %s -> %s: %v", from, to, err)
+	}
+}
+
+// acceptBidOn puts a provider on a job as the awarded one.
+//
+// `uq_bids_one_accepted_per_job` is partial on `status = 'Accepted'`, so exactly one of these can
+// exist per job — which is the property [activeJobLookup]'s LEFT JOIN relies on to not multiply
+// rows. `ck_bids_offer_has_timing` is why both instants are supplied.
+func acceptBidOn(t *testing.T, pool *pgxpool.Pool, job, provider uuid.UUID, status string) {
+	t.Helper()
+
+	id, err := uuid.NewV7()
+	if err != nil {
+		t.Fatalf("generating an id: %v", err)
+	}
+	if _, err := pool.Exec(t.Context(), `
+		INSERT INTO bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+		VALUES ($1, $2, $3, $4, 185.00, now() + interval '2 days', now() + interval '3 days')`,
+		id, job, provider, status); err != nil {
+		t.Fatalf("placing a %s bid: %v", status, err)
+	}
+}
+
+// TestTheActiveJobLookupSeesBothParties is the assertion the whole ticket rests on.
+//
+// Docs/05 §3.1: "Erasing a party mid-delivery would strand the counterparty." **Party**, not
+// customer — and the deletion endpoint is `RequireUser` with no role predicate, so both halves of
+// the marketplace reach it. A lookup that read `jobs.customer_id` alone would pass every
+// customer-side assertion in this repository and delete a driver in the middle of a delivery.
+//
+// Four accounts and one job, so that the false answers are as load-bearing as the true ones: a
+// predicate that answered true for everybody would satisfy the two positive cases on its own.
+func TestTheActiveJobLookupSeesBothParties(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	customer := newBidFixtureUser(t, pool, "deferral-c@example.com", "+61400000710", "customer")
+	awarded := newBidFixtureUser(t, pool, "deferral-p1@example.com", "+61400000711", "provider")
+	losing := newBidFixtureUser(t, pool, "deferral-p2@example.com", "+61400000712", "provider")
+	bystander := newBidFixtureUser(t, pool, "deferral-p3@example.com", "+61400000713", "provider")
+
+	job := newBidFixtureJob(t, pool, customer)
+	acceptBidOn(t, pool, job, awarded, "Accepted")
+	acceptBidOn(t, pool, job, losing, "Rejected")
+
+	moveJobTo(t, pool, job, customer, "Draft", "Open")
+	moveJobTo(t, pool, job, customer, "Open", "Awarded")
+
+	lookup := activeJobLookup{}
+
+	for _, c := range []struct {
+		name string
+		user uuid.UUID
+		want bool
+	}{
+		{"the customer whose goods are moving", customer, true},
+		{"the provider whose offer was accepted", awarded, true},
+		{"a provider whose offer was rejected", losing, false},
+		{"a provider with no offer on it at all", bystander, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := lookup.HasActiveJob(t.Context(), pool, c.user)
+			if err != nil {
+				t.Fatalf("reading: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("HasActiveJob(%s) = %v, want %v.\n"+
+					"  Docs/05 §3.1 defers deletion for a *party* to a delivery — the "+
+					"customer and the provider holding the accepted bid are each the "+
+					"other's counterparty, and a lookup that sees one of them strands "+
+					"the other.", c.user, got, c.want)
+			}
+		})
+	}
+}
+
+// TestTheActiveJobLookupCoversDocs02sWholeVocabulary walks one job through every status in
+// Docs/02 §1 and asserts the answer at each, for **both** parties.
+//
+// # Why a walk rather than six fixtures
+//
+// The six committed statuses are the ones that must defer, and the other six are the ones that must
+// not — and only asserting both makes the range a range. A test that checked `Awarded` alone would
+// pass against a predicate reading `status <> 'Draft'`, which defers a person whose job was
+// cancelled a year ago and never lets them leave.
+//
+// It walks Docs/02 §1's order rather than Docs/02 §2's permitted transitions, and the database is
+// what makes that legitimate: 000402 requires a recorded history row for a status change and has no
+// opinion about which changes are allowed — that table lives in the guarded function in
+// `internal/jobs`. So this covers the *vocabulary* completely, which is what stops a thirteenth
+// status being added and silently untested.
+func TestTheActiveJobLookupCoversDocs02sWholeVocabulary(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	customer := newBidFixtureUser(t, pool, "deferral-walk-c@example.com", "+61400000720", "customer")
+	provider := newBidFixtureUser(t, pool, "deferral-walk-p@example.com", "+61400000721", "provider")
+
+	job := newBidFixtureJob(t, pool, customer)
+	acceptBidOn(t, pool, job, provider, "Accepted")
+
+	active := map[jobs.Status]bool{}
+	for _, status := range activeStatusesFromTheLifecycle() {
+		active[status] = true
+	}
+	if len(active) != 6 {
+		t.Fatalf("Docs/05 §3.1's range resolves to %d statuses, want 6: %v", len(active), active)
+	}
+
+	lookup := activeJobLookup{}
+	at := jobs.StatusDraft
+
+	for _, status := range jobs.Statuses {
+		if status != at {
+			moveJobTo(t, pool, job, customer, at.String(), status.String())
+			at = status
+		}
+
+		for _, party := range []struct {
+			name string
+			user uuid.UUID
+		}{{"the customer", customer}, {"the awarded provider", provider}} {
+			got, err := lookup.HasActiveJob(t.Context(), pool, party.user)
+			if err != nil {
+				t.Fatalf("%s at %s: %v", party.name, status, err)
+			}
+			if got != active[status] {
+				t.Errorf("at %q, HasActiveJob for %s = %v, want %v.\n"+
+					"  Docs/05 §3.1 defers a request made between Awarded and "+
+					"Delivered, and nowhere else: a job that has not been awarded has "+
+					"no counterparty to strand, and one that has completed, been "+
+					"cancelled or gone to dispute is no longer in flight.",
+					status, party.name, got, active[status])
+			}
+		}
+	}
+}
+
+// TestTheActiveJobLookupAnswersFalseForAnAccountWithNoJobs records the answer rather than leaving
+// it to be discovered.
+//
+// False rather than an error, and that matters: it is the answer every account that has never
+// traded gets, which is most of them, and an error would make the ordinary case the failing one.
+func TestTheActiveJobLookupAnswersFalseForAnAccountWithNoJobs(t *testing.T) {
+	pool := pgtest.DB(t)
+
+	active, err := activeJobLookup{}.HasActiveJob(t.Context(), pool, uuid.New())
+	if err != nil {
+		t.Fatalf("reading: %v", err)
+	}
+	if active {
+		t.Error("an account that does not exist is carrying a delivery")
+	}
+}
+
+// TestTheActiveStatusesAreTheOnesTheLifecycleDeclares pairs [activeJobStatuses] with Docs/02 §1.
+//
+// The SQL list is a hand-written copy of six values from a generated vocabulary
+// (`contracts/statuses.yaml`, SHIP-56a), so `want` is built from `jobs.Statuses` — a different
+// source from the subject, which is the property wave 12 recorded as the difference between a test
+// and a tautology.
+//
+// It is a text guard and cannot prove the query uses it; the walk above is what proves that.
+func TestTheActiveStatusesAreTheOnesTheLifecycleDeclares(t *testing.T) {
+	inSQL := map[string]bool{}
+	for _, match := range quotedBidStrings.FindAllStringSubmatch(activeJobStatuses, -1) {
+		inSQL[match[1]] = true
+	}
+
+	want := map[string]bool{}
+	for _, status := range activeStatusesFromTheLifecycle() {
+		want[status.String()] = true
+	}
+
+	for status := range want {
+		if !inSQL[status] {
+			t.Errorf("%q is between Awarded and Delivered and activeJobStatuses does not name "+
+				"it — a deletion during it would not be deferred", status)
+		}
+	}
+	for status := range inSQL {
+		if !want[status] {
+			t.Errorf("activeJobStatuses names %q, which is outside Docs/05 §3.1's range — a "+
+				"person whose job is in that status would be held indefinitely", status)
+		}
+	}
+}
+
+// activeStatusesFromTheLifecycle is Docs/05 §3.1's range, resolved against Docs/02 §1's own order.
+//
+// "A request made between Awarded and Delivered", inclusive at both ends, read off the ordered
+// vocabulary rather than typed out again. A status inserted into Docs/02 §1 between those two ends
+// up here, which is what makes the pairing above notice it.
+func activeStatusesFromTheLifecycle() []jobs.Status {
+	var (
+		out   []jobs.Status
+		open  bool
+		known = jobs.Statuses
+	)
+	for _, status := range known {
+		if status == jobs.StatusAwarded {
+			open = true
+		}
+		if open {
+			out = append(out, status)
+		}
+		if status == jobs.StatusDelivered {
+			break
+		}
+	}
+	return out
 }
