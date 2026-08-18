@@ -494,6 +494,11 @@ const _shellCopy = <String>{
   'Shipper',
   'Connectivity',
   'Sign out',
+  // SHIP-173's app-bar action, a tooltip rather than visible text — so it reaches a provider
+  // through `Semantics.tooltip`, which is one of the channels this collector added. It is shell
+  // chrome shared by both roles and carries nothing about a job, which is why it is recorded
+  // here beside 'Sign out' rather than in any screen's own set.
+  'Delete account',
 };
 
 /// Every string the provider feed may put in front of a provider.
