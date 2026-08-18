@@ -2111,8 +2111,13 @@ ok "and it is registered as account-pseudonymisation, the sixth task in a binary
 pseudo_token="deleted:$pseudo_user"
 pseudo_short="${pseudo_user: -12}"
 
-read -r pseudo_name pseudo_new_email pseudo_new_phone <<<"$("$PSQL" "$DATABASE_URL" -tAc \
-  "select name, email::text, phone from users where id = '$pseudo_user';" | tr '|' ' ')"
+# Read one at a time rather than with `read -r … <<< $(… | tr '|' ' ')`, which is the shape every
+# other multi-value check in this file uses and which is wrong here: the pseudonymised **name**
+# contains a space, so word splitting hands `read` four fields for three variables. It failed as
+# `users.email is 'user'` — the second word of "Deleted user …" arriving in the email variable.
+pseudo_name="$("$PSQL" "$DATABASE_URL" -tAc "select name from users where id = '$pseudo_user';")"
+pseudo_new_email="$("$PSQL" "$DATABASE_URL" -tAc "select email::text from users where id = '$pseudo_user';")"
+pseudo_new_phone="$("$PSQL" "$DATABASE_URL" -tAc "select phone from users where id = '$pseudo_user';")"
 [[ "$pseudo_new_email" == "$pseudo_token" ]] \
   || fail "users.email is '$pseudo_new_email', want '$pseudo_token'"
 [[ "$pseudo_new_phone" == "$pseudo_token" ]] \
