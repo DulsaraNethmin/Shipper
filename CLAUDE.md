@@ -86,7 +86,8 @@ When implementing, state which ticket you are working and check its listed depen
 | `develop` | Stable integration branch. Ticket work merges here |
 | `<ticket-id>-<slug>` | One per ticket, branched from `develop` |
 
-**Never commit directly to `main` or `develop`.**
+**Never commit directly to `main`.** `develop` takes merge commits and the `verify-update` count
+line, both described below, and nothing else — no direct edits, no fixups, no ticket work.
 
 Ticket branches are lowercase, ticket ID first so they sort into build order:
 
@@ -102,9 +103,14 @@ Batch tightly-related tickets on one branch only when they form a single reviewa
 
 ### Commits
 
-**Claude never runs `git commit`.** Stage nothing, commit nothing. When work is complete, write the proposed commit message to a scratch file and hand it over — the repository owner makes every commit.
+**Claude commits on its own `ship-*` / `x-*` branches, and merges those branches into `develop`.**
+The table below is the authority; this paragraph used to say "never runs `git commit`" and was two
+narrowings out of date.
 
-This keeps authorship and co-authorship trailers entirely under the owner's control. Do not add `Co-Authored-By` trailers to proposed messages.
+**Every commit Claude makes is authored as the repository owner**, from `.git/config`'s identity —
+there is no second author and no trailer naming one. **Never add `Co-Authored-By` trailers.** That is
+what keeps authorship the owner's, and it is why the rule below can be relaxed without giving anything
+away.
 
 Format:
 
@@ -167,13 +173,30 @@ and the same gap discovered later costs the wave.
 |---|---|
 | Write code, create branches, edit files | Claude |
 | **`git commit`** — **on its own `ship-*` / `x-*` branch only** | Claude |
-| `git commit` on `main` or `develop` | **Never** |
-| **`git merge`** — ticket branches and pull requests alike | **Owner only** |
-| **`git push`** | Owner, unless explicitly asked |
+| `git commit` on `main` — and on `develop` for anything but the count line | **Never** |
+| **`git merge`** — ticket branch → `develop`, `--no-ff` | Claude, authored as the owner |
+| **`git commit`** on `develop` — **the `verify-update` count line only** | Claude, authored as the owner |
+| **`git merge`** — anything into `main`, and pull requests | **Owner only** |
+| **`git push`** | **Owner only**, unless explicitly asked |
 
 **The commit rule is branch-scoped, and that is a deliberate narrowing.** The original rule — stage nothing, commit nothing — was written for one agent handing one branch to one owner. It does not survive several branches being built at once: the owner becomes the serialisation point for every one of them, which is the bottleneck the parallelism exists to remove. And the Definition of Done requires green CI, which runs on commits.
 
-So Claude may commit to a branch it created whose name matches `ship-<n>` or `x-<n>`. It may not commit to `main` or `develop`, may not merge anything, may not open or approve its own pull request, and may not add `Co-Authored-By` trailers. **What enters `develop` and `main` remains entirely the owner's decision**, which is what the rule was protecting.
+**The merge rule has now been relaxed the same way, and for the same reason.** Claude merges ticket
+branches into `develop` with `--no-ff`, and writes the `verify-update` count line on the merged tree.
+It may **not** touch `main`, may not open or approve a pull request, may not push, and may not add
+`Co-Authored-By` trailers.
+
+**What protects the owner's decision is no longer the merge — it is the push.** Nothing Claude does
+leaves the machine. A wave that merges badly is `git reset --hard origin/develop` away from gone, and
+the owner reads the result before it becomes public. **So the gate moved rather than disappeared**, and
+the thing to guard is that it is genuinely read: an unreviewed push is now the failure this rule used
+to prevent at the merge.
+
+**A merge is still owed everything a hand-over was owed** — the gates re-run rather than reported, the
+order measured with `git merge-tree` rather than predicted, and a gated trial merge first. **Run every
+gate the tree has, not only the ones the wave's Go work needed.** Wave 14 merged a Flutter regression
+into `develop` because the trial merge was gated with `make check` and never `make flutter-check`; two
+branches green alone collided semantically, and no textual conflict was reported.
 
 The flow:
 
@@ -244,7 +267,9 @@ Also avoid committing generated artefacts, `node_modules`, build output, and loc
 
 ### Reviewing agent-written code
 
-There are two review gates and both belong to the repository owner: the merge into `develop`, and the pull request into `main`. Neither is performed by Claude.
+There are two review gates and both belong to the repository owner: **the push of `develop`**, and the
+pull request into `main`. Claude performs the merge into `develop` but never the push, so the first
+gate is the moment the owner runs `git push` — everything before it is local and reversible.
 
 Read the diff at the first gate, not the second — by the time work reaches a `develop` → `main` pull request it is batched with other tickets and individual mistakes are harder to see. Pay particular attention to anything touching the award transaction, token handling, or the budget-privacy invariant, where a plausible-looking implementation can be quietly wrong.
 
