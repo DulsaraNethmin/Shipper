@@ -56,15 +56,28 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 195 | 601 |
-| Remaining | 37 | 116 |
-| **Total** | 232 | 717 |
+| **Done** | 199 | 615 |
+| Remaining | 38 | 123 |
+| **Total** | 237 | 738 |
 
-**Measured on `develop` at `81e52f2`** — the wave-15 count-line commit, which is `develop`'s tip
-as this is written and therefore a ref that stays true. `make status` prints 195 / 232 and 601 / 717
-on it, and the parser below reproduces both before any row was written.
+**Measured on `develop` at `45154a8`** — the wave-16 count-line commit, which is `develop`'s tip as
+this is written and therefore a ref that stays true. `make status` prints 199 / 237 and 615 / 738 on
+it, with both guards green.
 
-**Wave 15 delivered three tickets and 11 points**: SHIP-155 and SHIP-159 (M6, 6) on
+**The total grew by five rows and 21 points while four tickets were finished, and that is the wave
+rather than an accounting artefact.** Wave 16 measured three rows the board called startable, found
+none of them buildable as written, and created SHIP-171a, SHIP-171b, SHIP-183a, SHIP-81d and SHIP-17b
+in the process of saying so. **A backlog that grows when it is read carefully is the honest outcome;
+the previous total was not smaller, it was less true.**
+
+**Wave 16 delivered four tickets and 14 points**: SHIP-171a and SHIP-171b (M7, 6) on
+`ship-171a-171b-deletion-capability`, and SHIP-81c and SHIP-81d (M3, 8) on
+`ship-81c-81d-verification-capture`. **M3 closed at 39 of 39** — on the capture clause actually being
+built, which is what §7 has the detail on — and **M7 went 8 → 10 of 23.** Three surfaces landed with
+it and move no counter: the contract-drift repair, the backlog re-sizing, and the 429 defect.
+`make verify` went **1005 → 1032 checks, and 16 → 18 sections.**
+
+**Wave 15 delivered three tickets and 11 points before it**: SHIP-155 and SHIP-159 (M6, 6) on
 `ship-155-159-verification-evidence`, and SHIP-171 (M7, 5) on `ship-171-user-pseudonymisation`.
 **M6 went 19 → 21 of 22 and M7 went 7 → 8 of 20.** Two orchestrator repair branches landed ahead of
 the lanes — `ship-15ae-verify-false-pass` and `ship-15af-ship-81c-decision` — neither of which is a
@@ -255,11 +268,18 @@ That distinction is worth keeping in mind rather than rounding away: six domains
 | Branch | At | Holds |
 |---|---|---|
 | `main` | PR #19 | **Wave 1, released 11 August 2026.** Now well behind `develop` |
-| `develop` | wave 15 merged, at `81e52f2` | Everything below. **Cut new branches from here** |
+| `develop` | wave 16 merged, at `45154a8` | Everything below. **Cut new branches from here** |
 
-**`develop` is 456 commits ahead of `main` at `81e52f2`, and holds fifteen waves.** The other two
-readings, re-measured on that ref rather than adjusted: `--first-parent` **97**, `--no-merges`
-**356**. **Wave 15's delta is 17 / 5 / 13 and the three tie out exactly** — 12 commits across four
+**`develop` is 476 commits ahead of `main` at `45154a8`, and holds sixteen waves.** The other two
+readings, re-measured on that ref rather than adjusted: `--first-parent` **104**, `--no-merges`
+**370**. **Wave 16's delta is 18 / 6 / 13 and the three tie out exactly** — 12 commits across five
+branches (`ship-15ah` 1, `ship-15ai` 2, Lane A 3, Lane B 4, Lane C 2), plus 5 merge commits, plus the
+one count-line commit on `develop`: 12 + 1 = 13 non-merge, 5 + 1 = 6 first-parent, 13 + 5 = 18 total.
+**The identity §2 tracks holds for the second consecutive wave.**
+
+**`develop` is 18 commits ahead of `origin/develop` and none of wave 16 is pushed.** The owner's gate
+is the push, and it is the only thing wave 16 is waiting on. Wave 15's figures below were measured on
+`81e52f2` and are kept in their own terms. **Wave 15's delta is 17 / 5 / 13 and the three tie out exactly** — 12 commits across four
 branches (`ship-15ae` 1, `ship-15af` 1, Lane A 5, Lane B 5), plus 4 merge commits, plus the one
 count-line commit on `develop`: 12 + 1 = 13 non-merge, 4 + 1 = 5 first-parent, 13 + 4 = 17 total.
 
@@ -16558,6 +16578,38 @@ still governs the next proposal: §9 has the entry, the two measured blockers an
 
 ## 6. Ready to start now
 
+**Recomputed on `develop` at `45154a8`, after wave 16 merged**, by parsing `Docs/09`'s dependency
+column against `Docs/11-done.txt`. Strict build order says the next ticket is the lowest-numbered open
+one, which is still **SHIP-24**, still blocked on X-2. **Twelve tickets have every dependency met: 7
+code tickets worth 29 points, plus five Track-X tickets worth 12.**
+
+**The set went 12 → 15 → 12, and the composition is the thing to read.** Phase 0 measured it up to 15
+by splitting three rows; the wave then closed four of them. **Two of the seven code rows are new this
+wave and both came out of a measurement rather than a plan.**
+
+| Ticket | Pts | Area | Held? |
+|---|---|---|---|
+| SHIP-17b | 5 | Contract validation that reaches the authenticated surface. **The gate reaches 4 of 86 routes and there is no request-body check at all** — that is how SHIP-159's `expires_at` drifted for a wave. `kin-openapi` is already wired, so the machinery exists; what does not is a way to drive an authenticated POST without a fixture per route, and the request half has a second wall: the handler request structs are unexported in their domain packages | — |
+| SHIP-183 | 5 | Choose and justify a limit for every endpoint. **The contention strike is lifted**: deciding 86 numbers touches no code. Applying them is SHIP-183a, which is not startable until this lands | — |
+| ~~SHIP-172~~ | 5 | **Struck, by something no parser can see.** Every declared dependency is met and **X-4 gates it** — deleting verification evidence is what a retention obligation constrains. SHIP-171a removed the *other* blocker this wave: the delete now exists | — |
+| ~~SHIP-156~~ | 3 | **Strike carried, eighth consecutive pass.** The conversation exists; the report mechanism does not, and no `Docs/09` row describes it | — |
+| ~~SHIP-174~~ | 3 | Struck — needs a Datadog account (external) | — |
+| ~~SHIP-178~~ | 3 | Struck — needs store-console access (external) | — |
+| ~~SHIP-182~~ | 5 | Struck — needs a deployed environment (external) | — |
+
+Plus **X-1, X-3, X-4, X-5 and X-10**, none of which is code and none of which has started. **X-5 and
+X-10 need no third party at all.**
+
+**The startable-and-sensible set is two tickets and 10 points** — SHIP-17b and SHIP-183. Both are
+consequences of wave 16 rather than rows anybody planned, and **neither of them ships product**: one
+closes a gate that lets contracts drift, the other decides 84 numbers. **That is what the board looks
+like when Track X is the binding constraint and has been for six passes.**
+
+**SHIP-172 is the row to watch.** It is now blocked on X-4 alone — a legal answer, not an
+engineering one — and everything it needed from this repository exists as of this wave.
+
+### What this section said before wave 16 merged, kept for its reasoning
+
 **Recomputed after wave 16's Phase 0 re-sizing, on the tree that carries it, by parsing `Docs/09`'s
 dependency column against `Docs/11-done.txt`.** Strict build order says the next ticket is the
 lowest-numbered open one, which is still **SHIP-24**, still blocked on X-2 along with the other three
@@ -16997,7 +17049,112 @@ it as SHIP-164's blocker.
 
 **Public routes still share the anonymous idempotency scope, and that remains safe** for the reason §6 has given since SHIP-44: `replayOrRefuse` fingerprints method, path and body, so reading another caller's stored response requires sending their exact request — which, on every route on `Docs/10` §4.1's allow-list, means already holding the secret material in their body. **What changed in wave 12 is who is left in that scope.** SHIP-147b gave every bearer credential that produces no subject its own `credential:<digest>` namespace, so an administrator's console session and a driver's job-scoped token both left `anonymous` — and what remains in it is exactly the traffic the argument above was written about. §9's two entries claiming an open driver-token hole are corrected there.
 
-## 7. Wave 13 — what landed
+## 7. Wave 16 — what landed
+
+**A repair-and-unblock wave, and the first one this file has recorded that shipped no feature it set
+out to ship.** Wave 15 handed forward three startable code rows; **all three were mis-sized or
+unbuildable when measured**, and two live defects were sitting on `develop`, one of them wave 15's
+own. So the wave repaired both, built the capability the deletion chain was missing, closed a defect
+SHIP-171 left behind, and delivered the one genuinely buildable feature at its true size.
+
+**Four tickets, 14 points, and five rows created.** `develop` moved `7d90e25` → **`45154a8`**:
+eighteen commits, six merges, all `--no-ff`, authored as the owner, no `Co-Authored-By` anywhere.
+
+| Order | Branch | Tip | Commits | Tickets | Pts |
+|---|---|---|---|---|---|
+| 1 | `ship-15ah-document-contract-drift` | `77e9ccc` | 1 | — (a surface) | — |
+| 2 | `ship-15ai-wave-16-backlog-and-reconciliation` | `977d8fd` | 2 | — (a surface) | — |
+| 3 | `ship-15aj-idempotent-429` | `0da070b` | 3 | — (a defect) | — |
+| 4 | `ship-171a-171b-deletion-capability` | `39135c5` | 4 | SHIP-171a, SHIP-171b | 6 |
+| 5 | `ship-81c-81d-verification-capture` | `31e8941` | 2 | SHIP-81c, SHIP-81d | 8 |
+
+**M3 closed at 39 of 39**, and *how* it closed is the point. Wave 14 closed it at 37 of 37 on
+SHIP-81b, whose *Done when* opens *"A provider photographs each of `Docs/04` §3's four documents …
+**in the app**"* — a clause that was not built. §9 called that **"the most expensive version of this
+file's oldest failure, because nobody re-reads a closed milestone."** The split reopened it, wave 16
+re-sized what the split had left, and **M3 now closes on the clause actually being built.**
+
+### The two defects
+
+**A 429 was stored and replayed by the idempotency middleware.** `idempotency.go` released the key
+only on `>= 500`, and its comment blessed the rest: *"any settled outcome — including a 4xx the
+client caused — is the answer."* That is right about every 4xx that is an answer and wrong about the
+one that is a deferral. A client that waited exactly as long as `Retry-After` said and reused the key
+it was told to reuse got the same refusal for the life of the entry — **and could not have waited
+correctly anyway, because a stored response carries a status, a content type, a location and a body
+and no other header, so the replay dropped `Retry-After` entirely.** Fixed by the settle rule alone;
+the middleware ordering in `cmd/api/routes.go` was the rejected alternative and was not touched.
+
+**Wave 15 merged a contract drift and the wave that merged it did not notice.** SHIP-159 added
+`expires_at` to the submission handler, the response struct and `contracts/paths/admin.yaml`, and not
+to `contracts/paths/profiles.yaml`, where both document schemas declare `additionalProperties: false`.
+For a wave the published contract **forbade a field the service accepted on the way in and returned on
+the way out.**
+
+**Why nothing caught it is worth more than the defect.** `TestResponsesMatchTheContract` is SHIP-17a's
+criterion, it works, and its `exercisable()` filter reaches **4 of 86 routes** — every non-GET,
+authenticated and parameterised route is outside it, including all 47 mutating ones, and there is no
+request-body check at any coverage. **The test logs that gap on every run**, exactly as its own
+comment says it should. A named gap in a passing test's output is not a gate. The general fix is
+SHIP-17b, written the same day.
+
+### Three rows measured and found wrong before anything was dispatched
+
+| Row | The board said | Measured |
+|---|---|---|
+| SHIP-172 | 5, startable | **Unbuildable.** Nothing could delete an object. That is SHIP-171a |
+| SHIP-183 | 3 | **5, and mis-shaped.** `Docs/01` states no rate-limiting requirement, so 84 of 86 routes need a number nobody has chosen. Applying them is SHIP-183a |
+| SHIP-81c | 3 | **8.** `features/profile/` held one stub file. Split 5 + 3 because this file's legend says nothing in it is an 8 |
+
+**The SHIP-183 split had to be inverted from the way it was proposed.** Making SHIP-183 the mechanical
+half would have made it depend on SHIP-183a, which sorts after it, and dependencies here point
+backwards. SHIP-183 decides; SHIP-183a applies.
+
+### Two guards that were not guards
+
+**`ProofStore`'s second path check was inert and had been since SHIP-130.** It compared
+`file.absolute.path.startsWith(folder.absolute.path)` on the joined string, so
+`'/root/verification/../x.jpg'` starts with `'/root/verification'` and passes. Its own comment called
+it *"belt and braces beside the check above, and the one that survives a change to it"*; it survived
+nothing. The store had **one guard wearing a two-layer disguise**, and it was inherited verbatim into
+`core/` before Lane C's mutation found it. Closed by normalising before comparing, and made public so
+the second layer can be tested without going through the first — **a layer reachable only through
+another is one nobody can demonstrate, which is exactly how this survived every test the store ever
+had.** Delivery gets the fix too, because the class moved rather than being copied.
+
+**A mutation that never reached the file read exactly like a surviving guard.** Lane C's fourth
+mutation survived its first run because the edit adding `file_picker` to the forbidden list **aborted
+before writing**, so the ban existed in a script and not in the repository. Believed, it would have
+shipped a commit claiming a guard that was not there. This is the recorded trap firing — *checksum or
+print the file after mutating, not only after restoring* — and the first time a lane caught it on
+itself rather than the orchestrator catching it afterwards.
+
+### Gates, re-run rather than reported
+
+| Tree | `make check` | `make verify` | `make status` | `flutter-check` |
+|---|---|---|---|---|
+| base `13b9ff2` | exit 0, 30 pkgs | 1005 / 16 | 195/237, 601/738 | — |
+| Lane A `0da070b` | exit 0, zero FAIL | 1013 / 16 *(reported)* | unchanged | — |
+| Lane B `39135c5` | exit 0, zero FAIL | 1024 / 18 *(reported)* | 197/237, 607/738 | — |
+| Lane C `31e8941` | — | not owed, measured | 197/237, 609/738 | exit 0, 1120 tests |
+| **merged trial `b92de39`** | **exit 0, zero FAIL** | **1032 / 18, zero ✗** | **199/237, 615/738** | **exit 0** |
+
+**`develop` after all three merges and the trial worktree are both `b92de39`.** That equality is what
+makes the trial gates mean anything about `develop`, and it also proves the two §3 conflict
+resolutions were identical to the trial's. **Lane A's and Lane B's own verify counts were taken on
+report** — the merged figure is the one that was measured here, and it reconciles with both.
+
+**The section count moved for the first time since wave 12**, 16 → 18, because Lane B put both its
+proofs in new files rather than editing sections it did not own.
+
+### Waves 14 and 15 have no entry in this section
+
+Neither wave reconciled §7, so it stood titled *"Wave 13 — what landed"* for two waves. **Their
+accounts exist** — `~/.claude/plans/wave-14-plan.md` and `wave-15-plan.md` — and are not reproduced
+here, because writing them now from the plan files would be this section recording what it did not
+measure. **§7a is therefore wave 13 and not wave 15**, and the heading is the thing to read.
+
+## 7a. Wave 13 — what landed
 
 One pre-step, then four lanes concurrently. **Five tickets of six dispatched, 19 points of 22**, with
 the sixth declined as scheduled rather than trimmed. It is the smallest wave the file has recorded
@@ -17134,7 +17291,7 @@ four decided outcomes with a recorded reason, written to `provider_verification_
 who may trade on this marketplace has an endpoint, an audit trail, a two-person control beside it —
 and no screen. §1 says the same thing from the other end.
 
-## 7a. Wave 12 — what landed
+## 7b. Wave 12 — what landed
 
 One pre-step, then four lanes concurrently. **Nine tickets of eleven dispatched, 26 points of 32**,
 with two declined for measured reasons rather than trimmed for time.
@@ -17249,7 +17406,7 @@ bodies with `diff -q`, but `Docs/10` §4.6 puts `request_id` *inside* the error 
 refusals can never be byte-identical by design. It was found and repaired by the lane that inherited
 it. **Run a section to the end and read the last line; do not infer from a section that started.**
 
-## 7b. Wave 11 — what landed
+## 7c. Wave 11 — what landed
 
 One pre-step, then four lanes concurrently. **Fourteen tickets, forty-one points, no trim and
 nothing delivered beyond the dispatch** — the first wave since wave 7 where the delivered set equals
@@ -17330,7 +17487,7 @@ to; what it could not do from a lane branch is settle whether `Docs/02` §2 is m
 the platform is missing a transition. §9 has it, and it is a document decision before it is a code
 one.
 
-## 7c. Wave 10 — what landed
+## 7d. Wave 10 — what landed
 
 One pre-step, then four lanes concurrently. **Thirteen tickets, thirty-nine points, one ticket
 trimmed and two delivered beyond the dispatch.**
@@ -17444,7 +17601,7 @@ is served in the only form this platform stores.
 `000409` widens the index and the claim together, and `Docs/02` §2's expiry row was widened first, as
 the ticket's *Done when* required.
 
-## 7d. Wave 9 — what landed
+## 7e. Wave 9 — what landed
 
 One pre-step serially, then four tracks concurrently. **Eleven tickets, thirty-seven points, all
 delivered, no trim taken.**
@@ -17573,7 +17730,7 @@ database, while its own event was nowhere on the topic. §9 has the two failure 
 of them is a fencing problem. The operational half is now a row in `CLAUDE.md`'s worktree table; the
 assertion half is `Docs/09`'s SHIP-134a.
 
-## 7e. Wave 8 — what landed
+## 7f. Wave 8 — what landed
 
 One ticket serially, then five branches. **Fifteen tickets, forty-nine points, all delivered, no trim
 taken** — the largest wave by ticket count, and level with wave 7 on points.
@@ -17647,7 +17804,7 @@ What changed is the **shape**. Wave 7 ran two four-deep chains and wave 8 ran no
 so one more branch bought no more points. A chain cannot be split across tracks, and a wave of short
 chains spends its concurrency on breadth instead.
 
-## 7f. Wave 7 — what landed
+## 7g. Wave 7 — what landed
 
 One ticket serially, then four tracks concurrently. **Fourteen tickets, forty-nine points, all
 delivered, no trim taken.**
@@ -17779,7 +17936,7 @@ two of them consumed half the wave's concurrency for its whole length — and th
 well as it did in wave 6: six of the fourteen tickets closed were unblocked inside their own branch
 and never appeared in §6 at all.
 
-## 7g. Wave 6 — what landed
+## 7h. Wave 6 — what landed
 
 One ticket serially, then four tracks concurrently. **Thirteen tickets, forty-seven points, all
 delivered, no trim taken.**
@@ -17895,7 +18052,7 @@ fits in a wave; a five-deep chain occupies one track for the whole wave whatever
 The counterpart is that a chain track unblocks a great deal at once: five of the eleven tickets that
 arrived in §6 came from this one branch.
 
-## 7h. Wave 5 — what landed
+## 7i. Wave 5 — what landed
 
 One ticket serially, then four tracks concurrently. **Eleven tickets, thirty-seven points, all
 delivered, no trim taken.**
@@ -18031,7 +18188,7 @@ more than three deep. That is the shape a wave takes once the queue is made of e
 rather than independent foundations, and it is worth planning for: a four-deep chain cannot be split
 across tracks at all, so its length rather than its point total is what decides whether it fits.
 
-## 7i. Wave 4 — what landed
+## 7j. Wave 4 — what landed
 
 One ticket serially, then four tracks concurrently — one more track than wave 3 ran. **Eleven tickets, thirty-nine points, all delivered, no trim taken**, and **M1 closed**.
 
@@ -18075,7 +18232,7 @@ Nothing collided in code. Three things needed resolving at merge time and all th
 
 Wave 1 delivered 32 points, wave 2 delivered 37, wave 3 delivered 48, and wave 4 delivered **39 across four tracks**. That is a deliberate step *down* in points and *up* in concurrency: the wave's risk was four tracks rather than three, in four domains rather than two, and it was not worth also carrying wave 3's volume. Seven agent runs, no trim, no conflict in code.
 
-## 7j. Wave 3 — what landed
+## 7k. Wave 3 — what landed
 
 One ticket serially, then three lanes concurrently. **Seventeen tickets, forty-eight points, all delivered, no trim taken.**
 
@@ -18102,7 +18259,7 @@ The one conflict was this file's `make verify` check-count line — and it is wo
 
 Wave 1 delivered 32 points, wave 2 delivered 37, wave 3 delivered **48** — a 30% step up that the plan named as the wave's real risk, taken without invoking the trim order. Three lanes, five agent runs, one conflict.
 
-## 7k. Wave 2 — what landed
+## 7l. Wave 2 — what landed
 
 Two tickets serially, then three tracks concurrently. Thirteen tickets, thirty-seven points, all delivered.
 
@@ -19809,6 +19966,69 @@ Nothing to fix; the habit is to re-read it at each reconciliation, which this pa
 **Two more were added after this pass's first four commits, at the orchestrator's request. The first
 is the most consequential instrument finding of the wave and the second is an owner edit this branch
 was refused permission to make.**
+
+### An idempotent replay drops every header but two, and one of them is `WWW-Authenticate`
+
+**Wave 16 fixed the 429 instance and did not fix the class, deliberately.** `idempotency.Response`
+stores `Status`, `ContentType`, `Location` and `Body`. Every other header a handler set is gone from
+the replay.
+
+The 429 case is closed at the source — the key is released, so the retry re-executes and mints a
+fresh `Retry-After` rather than replaying a stale one without it. **Two instances survive:**
+
+- **`WWW-Authenticate` on a 401**, at six sites in `internal/admin/adminauth.go` and
+  `internal/delivery/driverauth.go`. Those guards sit **inside** `Idempotent`, so a 401 is a settled
+  4xx, is stored, and is replayed **without the challenge header RFC 9110 requires.**
+- **`Retry-After` on the two 202s**, harmless today only because the body carries
+  `retry_after_seconds` as well.
+
+**The fix is a header allow-list on the stored response**, which changes the stored shape and is not
+a one-condition repair. **It wants a row**, and the row should state which headers are replayable
+rather than enumerate the ones that are not.
+
+### A down migration that says it is idempotent is not, in 19 of 22 cases
+
+`000202`'s down file opens *"Every statement uses IF EXISTS: a down migration that fails halfway
+leaves a schema nobody can describe (SHIP-15g)"* — and guards the **column** while leaving the
+**table** unguarded. It fired in wave 16's Phase 0: a worktree database whose history predated
+`provider_verification_documents` reported version 804, because the admin block sorts last, so
+`make migrate-down n=all` walked into a migration for a table it never had and aborted. The database
+had to be dropped and recreated.
+
+**It is systemic, not one file.** `grep -l '^ALTER TABLE [a-z]' migrations/*.down.sql` returns **19**
+across every domain block; only **3** use `ALTER TABLE IF EXISTS`. It survives because the ordinary
+path applies and reverses on the same branch, where the table always exists — **it only bites the
+per-worktree rebuild, which has now been needed for six consecutive waves.** The fix is one word per
+statement. **It wants a row**, and it is a shared edit in every migration block at once, so it wants
+a wave's Phase 0 rather than a lane.
+
+### `bid.rejected` and `bid.expired` have never notified anybody
+
+**Measured by wave 16's Lane B, not read.** Their only audience is `ToBidProvider`; `resolve` skips
+that audience when the payload's `offered_by` is `provider`; and `emitClosed` puts the bid's own
+`offered_by` on the payload. Consuming each event with `offered_by: provider` wrote **0 rows**,
+twice. So *"Your offer was not accepted"* has never reached a provider.
+
+**Not fixed, correctly**: the routing is a product decision and changing it alters what several verify
+sections observe. **It wants a decision before it wants a row.**
+
+### §7's letters shift every wave, and 56 unlettered references cannot be shifted by a script
+
+**Wave 16 shifted the headings and did not touch the references**, which needs recording because it
+is a half-measure taken knowingly. §7 stood titled *"Wave 13 — what landed"* for two waves; it is now
+wave 16, with wave 13 at §7a and every letter moved down one.
+
+**The references were left alone and they are now one wave further out of date.** §7's own rule says a
+lettered reference decays predictably and **an unlettered `§7` inverts** — it means "the newest wave",
+so a renumber points it at the wrong wave outright. There are **63 unlettered `§7` references** in
+this file, counted after this pass's own additions — the figure was 56 before it, and the drift
+between those two numbers inside one edit is the argument in miniature. Each one's correct target
+depends on *when it was written*, which is not something a script can determine, and a pass that
+rewrote all of them by guess would be worse than one that rewrote none.
+
+**This is the third pass to defer the scheme decision and the first to quantify it.** The options are
+unchanged: cite the wave number instead of the letter, or give each wave a stable anchor that never
+moves. **The second costs one reconciliation and ends this permanently.**
 
 ### The contract gate reaches 4 of 86 routes, and it says so on every run
 
