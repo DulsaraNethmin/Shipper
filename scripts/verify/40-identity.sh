@@ -2199,15 +2199,25 @@ ok "the notification addresses are replaced and the device token is not"
 # with a contact column. This asks PostgreSQL for every text-shaped column in the public schema and
 # looks for the person in all of them, including columns that do not exist yet. It is the sweep that
 # found `notifications.address` in the first place.
+#
+# **The CTE is MATERIALIZED and that is load-bearing rather than tidy.** PostgreSQL does not promise
+# an evaluation order for `AND`, so with one flat `WHERE` the planner ran `query_to_xml` *before* the
+# schema filter and asked `select count(*) from public.pg_proc` — a catalogue table, in the wrong
+# schema, with the `public.` this query used to hard-code. The fence makes the column list a finished
+# set before anything is run against it, and the schema is now interpolated rather than assumed.
 pseudonym_survivors() {
   "$PSQL" "$DATABASE_URL" -tAc "
+    with cols as materialized (
+      select table_schema, table_name, column_name
+        from information_schema.columns
+       where table_schema = 'public'
+         and (data_type = 'text' or udt_name = 'citext')
+    )
     select coalesce(string_agg(format('%I.%I', table_name, column_name), ', '), '')
-      from information_schema.columns c
-     where c.table_schema = 'public'
-       and (c.data_type = 'text' or c.udt_name = 'citext')
-       and (xpath('/row/c/text()',
-                  query_to_xml(format('select count(*) as c from public.%I where strpos(%I::text, %L) > 0',
-                                      c.table_name, c.column_name, '$1'),
+      from cols
+     where (xpath('/row/c/text()',
+                  query_to_xml(format('select count(*) as c from %I.%I where strpos(%I::text, %L) > 0',
+                                      table_schema, table_name, column_name, '$1'),
                                false, true, '')))[1]::text::int > 0;"
 }
 
