@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,8 @@ import (
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/getkin/kin-openapi/routers"
 	"github.com/getkin/kin-openapi/routers/gorillamux"
+
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
 
 // The published contract, checked against the running service (SHIP-17a).
@@ -420,4 +423,179 @@ func validateAgainstContract(t *testing.T, router routers.Router, req *http.Requ
 		t.Errorf("%s %s (status %d) does not match the contract: %v\n  body: %s",
 			req.Method, req.URL.Path, rec.Code, err, rec.Body)
 	}
+}
+
+// TestDocumentExpiryIsInTheContract pins the one pair that has already drifted (SHIP-159).
+//
+// # Why this is written by hand when TestResponsesMatchTheContract exists
+//
+// That test is SHIP-17a's criterion and it does the real thing — it drives the router and validates
+// the bytes. Its exercisable() filter skips every non-GET, every authenticated route and every
+// parameterised path, which on today's manifest is **82 of 86 routes**: it reaches /health,
+// /v1/app/minimum-version, /v1/app/policy and /v1/{$}, and nothing else. It says so in its own log
+// output every run rather than narrowing silently, which is the right behaviour and is also why
+// nobody noticed that SHIP-159 added expires_at to the Go structs and to admin.yaml and not to this
+// fragment. The service accepted a field the contract forbade, and answered with one, for a wave.
+//
+// Closing that hole generally is SHIP-17b. This is not that. This validates two literal bodies
+// against the two schemas that drifted, which is narrow, and it is deliberately narrow: the general
+// fix needs a fixture per authenticated route and that is a ticket, not a repair.
+//
+// **The bodies are literals rather than marshalled structs, and that is the limitation rather than a
+// shortcut.** profiles.documentSubmission and profiles.documentResponse are unexported, so no test
+// in this package can reflect over them — which is the same wall SHIP-17b has to get over.
+//
+// # The rejection cases are the part that matters
+//
+// A schema check that only feeds it valid bodies passes just as well when validation is switched off
+// entirely. Each half therefore asserts a body the contract must **refuse**, and an undeclared field
+// is the one that proves additionalProperties: false is being enforced rather than merely written.
+func TestDocumentExpiryIsInTheContract(t *testing.T) {
+	doc := loadContract(t)
+
+	router, err := gorillamux.NewRouter(doc)
+	if err != nil {
+		t.Fatalf("building a router from the contract: %v", err)
+	}
+
+	const path = "/v1/provider/verification/documents"
+
+	newRequest := func(t *testing.T, body string) (*http.Request, *routers.Route, map[string]string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, serverBase+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		// No credential: NoopAuthenticationFunc below means the security requirement is not
+		// evaluated here, and a header nothing reads would only suggest it was.
+		req.Header.Set(httpx.HeaderIdempotencyKey, "0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1")
+
+		route, pathParams, err := router.FindRoute(req)
+		if err != nil {
+			t.Fatalf("the contract has no operation for POST %s: %v", path, err)
+		}
+		return req, route, pathParams
+	}
+
+	validateRequest := func(t *testing.T, body string) error {
+		t.Helper()
+		req, route, pathParams := newRequest(t, body)
+		return openapi3filter.ValidateRequest(req.Context(), &openapi3filter.RequestValidationInput{
+			Request:    req,
+			PathParams: pathParams,
+			Route:      route,
+			Options: &openapi3filter.Options{
+				// The credential is SHIP-44's business and is checked by the service. What is
+				// under test here is the shape of the body.
+				AuthenticationFunc: openapi3filter.NoopAuthenticationFunc,
+			},
+		})
+	}
+
+	validateResponse := func(t *testing.T, body string) error {
+		t.Helper()
+		req, route, pathParams := newRequest(t, `{"kind":"licence","object_key":"verification/a/b"}`)
+		header := http.Header{}
+		header.Set("Content-Type", "application/json")
+		return openapi3filter.ValidateResponse(req.Context(), &openapi3filter.ResponseValidationInput{
+			RequestValidationInput: &openapi3filter.RequestValidationInput{
+				Request:    req,
+				PathParams: pathParams,
+				Route:      route,
+				Options: &openapi3filter.Options{
+					AuthenticationFunc: openapi3filter.NoopAuthenticationFunc,
+				},
+			},
+			Status: http.StatusCreated,
+			Header: header,
+			Body:   io.NopCloser(strings.NewReader(body)),
+			Options: &openapi3filter.Options{
+				IncludeResponseStatus: true,
+			},
+		})
+	}
+
+	// A recorded submission, as documentResponse writes it: no download URL on the 201, and
+	// expires_at present because the Go field carries no omitempty (internal/profiles/http.go).
+	const recorded = `{
+		"id": "0198f2c1-8b10-7c33-9e52-4f9c6d73ba05",
+		"kind": "insurance",
+		"content_type": "image/jpeg",
+		"content_length": 1874233,
+		"submitted_at": "2026-08-18T04:15:00.000Z",
+		"expires_at": %s
+	}`
+
+	t.Run("request", func(t *testing.T) {
+		for _, c := range []struct {
+			name   string
+			body   string
+			accept bool
+		}{
+			{
+				name:   "carrying an expiry, which is what SHIP-159 added and the contract forbade",
+				body:   `{"kind":"insurance","object_key":"verification/a/b","expires_at":"2027-07-01T00:00:00Z"}`,
+				accept: true,
+			},
+			{
+				// Optional because X-4 has not settled which documents must be renewed. An ABN
+				// extract does not lapse at all.
+				name:   "omitting the expiry, which stays legal",
+				body:   `{"kind":"abn_evidence","object_key":"verification/a/b"}`,
+				accept: true,
+			},
+			{
+				name:   "naming a field the contract does not declare",
+				body:   `{"kind":"licence","object_key":"verification/a/b","issued_at":"2020-01-01T00:00:00Z"}`,
+				accept: false,
+			},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				err := validateRequest(t, c.body)
+				switch {
+				case c.accept && err != nil:
+					t.Errorf("the contract refuses a body the service accepts: %v\n  body: %s", err, c.body)
+				case !c.accept && err == nil:
+					t.Errorf("the contract accepts a body it should refuse — additionalProperties: "+
+						"false is not being enforced, so every case above passes vacuously.\n  body: %s", c.body)
+				}
+			})
+		}
+	})
+
+	t.Run("response", func(t *testing.T) {
+		for _, c := range []struct {
+			name   string
+			body   string
+			accept bool
+		}{
+			{
+				name:   "stating an expiry",
+				body:   fmt.Sprintf(recorded, `"2027-07-01T00:00:00Z"`),
+				accept: true,
+			},
+			{
+				// null is a distinct answer: the platform was never told. It is not the same as
+				// the field being absent, which is why the schema is nullable and required.
+				name:   "stating that it was never told",
+				body:   fmt.Sprintf(recorded, `null`),
+				accept: true,
+			},
+			{
+				name: "omitting the field the handler always writes",
+				body: `{"id":"0198f2c1-8b10-7c33-9e52-4f9c6d73ba05","kind":"insurance",` +
+					`"content_type":"image/jpeg","content_length":1874233,` +
+					`"submitted_at":"2026-08-18T04:15:00.000Z"}`,
+				accept: false,
+			},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				err := validateResponse(t, c.body)
+				switch {
+				case c.accept && err != nil:
+					t.Errorf("the contract refuses a response the service sends: %v\n  body: %s", err, c.body)
+				case !c.accept && err == nil:
+					t.Errorf("the contract accepts a response it should refuse.\n  body: %s", c.body)
+				}
+			})
+		}
+	})
 }

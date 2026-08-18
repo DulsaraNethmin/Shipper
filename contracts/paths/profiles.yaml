@@ -557,6 +557,22 @@ DocumentSubmission:
         The `object_key` the upload response gave you, unchanged. A key issued to another provider
         answers `422`.
       example: verification/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1/0198f2c1-7a30-7b52-8d41-3e8b5c62a9f4
+    expires_at:
+      type: string
+      format: date-time
+      nullable: true
+      description: |
+        When the document itself lapses, as printed on it.
+
+        **Optional, and optional deliberately.** Docs/04 §3's open question — which documents must be
+        renewed and how often, Track-X row X-4 — is unanswered, and requiring a date for every kind
+        would be the platform demanding an answer nobody has settled. An ABN extract does not lapse
+        at all; an insurance certificate does, and the date is printed on it.
+
+        It is stated here or it is never stated. `provider_verification_documents` is append-only, so
+        a mistyped renewal date is corrected by re-photographing the document — a second submission,
+        which is what a correction already is here.
+      example: '2027-07-01T00:00:00Z'
 
 DocumentKind:
   type: string
@@ -577,7 +593,7 @@ DocumentKind:
 Document:
   type: object
   additionalProperties: false
-  required: [id, kind, content_type, content_length, submitted_at]
+  required: [id, kind, content_type, content_length, expires_at, submitted_at]
   description: |
     One submitted document.
 
@@ -608,6 +624,22 @@ Document:
       format: date-time
       description: When the platform recorded the submission, in UTC.
       example: '2026-08-18T04:15:00.000Z'
+    expires_at:
+      type: string
+      format: date-time
+      nullable: true
+      description: |
+        When the document itself lapses, as stated at submission, in UTC.
+
+        **`null` is an answer, and it is not the same as the field being absent**: it means the
+        platform was never told. It is sent on every read for that reason. A provider whose insurance
+        certificate carries no expiry here has not told the platform when it runs out, and their own
+        screen is where they would find that out.
+
+        Deliberately spelled differently from `download_expires_at` below. One is a fact about a
+        document that lasts years; the other is a credential that lasts minutes, and a client that
+        confused them would show somebody their licence expiring this afternoon.
+      example: '2027-07-01T00:00:00Z'
     download_url:
       type: string
       format: uri
