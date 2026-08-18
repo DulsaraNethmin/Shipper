@@ -251,7 +251,7 @@ func NewService(c clock.Clock) *Service {
 // r is a reader rather than a transaction. One statement, no write, nothing to keep consistent with
 // anything else.
 func (s *Service) VerificationFor(ctx context.Context, r db.Runner, providerID uuid.UUID) (Verification, error) {
-	if err := s.mustBeProvider(ctx, r, providerID); err != nil {
+	if err := mustBeProvider(ctx, s.store, r, providerID); err != nil {
 		return Verification{}, err
 	}
 	return s.store.verification(ctx, r, providerID)
@@ -264,11 +264,16 @@ func (s *Service) VerificationFor(ctx context.Context, r db.Runner, providerID u
 // already permitted to read. It reads `users.role` rather than the token's claim, which is the
 // distinction SHIP-78a settled: the claim is evidence about the token and the column is the fact.
 //
+// **A package-level function rather than a method, since SHIP-81b.** [Documents] is a second type in
+// this package that has to ask the same question of the same table, and a method on [Service] would
+// have made "is this caller a provider" reachable only by holding a service that can also move a
+// verification state. One refusal, one implementation, and neither type has to own the other.
+//
 // The nil identifier cannot match a row, so it is the same refusal as a customer's. A request with no
 // subject cannot reach a handler in any case — `RequireUser` is what puts one in the context — so
 // this is the guard against a caller inside the service passing the zero value.
-func (s *Service) mustBeProvider(ctx context.Context, r db.Runner, providerID uuid.UUID) error {
-	provider, err := s.store.isProvider(ctx, r, providerID)
+func mustBeProvider(ctx context.Context, store postgresStore, r db.Runner, providerID uuid.UUID) error {
+	provider, err := store.isProvider(ctx, r, providerID)
 	if err != nil {
 		return err
 	}

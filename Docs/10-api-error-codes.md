@@ -94,4 +94,7 @@ them where the call is made, beside the thing the user was trying to do.
 | `jobs_not_extendable` | The job's expiry cannot be extended. Either it is not being offered to providers any more, or its pickup date is what is ending it — and no amount of extra listing time keeps a job alive past the date its goods were to be collected. |
 | `notifications_category_essential` | This kind of notification cannot be switched off. Docs/01 §4.5 lists the events every account is told about. |
 | `notifications_no_device_session` | That credential does not name a device session, so there is nothing to register a push token against. Sign in again. |
+| `profiles_document_already_recorded` | That image has already been submitted. Ask for a new upload URL and send it again. |
+| `profiles_document_not_uploaded` | That document is not in the store yet. Finish uploading it to the URL you were given, then submit it again. |
+| `profiles_document_rejected` | That file is not a document this platform accepts. Photograph it again, and compress it if it is large. |
 | `profiles_provider_only` | Only a provider account has a verification record. Customers publish jobs; they are not verified to bid. |

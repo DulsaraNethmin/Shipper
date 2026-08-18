@@ -208,6 +208,100 @@ func (postgresStore) awaitingReview(ctx context.Context, r db.Runner, q QueueQue
 	return out, nil
 }
 
+// recordDocument writes one submitted document and reports it as stored (SHIP-81b).
+//
+// # It returns the row rather than the argument, and the difference is `submitted_at`
+//
+// The clock is the database's `DEFAULT now()`, which is what every other append-only table in this
+// schema uses, so the only way for the caller to learn it is to be told. `RETURNING` is one round
+// trip and a second SELECT would be two, with a window between them in which the row could be read
+// by somebody else and nothing in it could have changed anyway.
+//
+// **There is no UPDATE and no upsert here, and there must not be one.** `000201` is append-only and
+// enforces it with a trigger; a second submission of the same kind is a second row, and the newest
+// of a kind is the current document. An `ON CONFLICT (provider_id, kind) DO UPDATE` would be
+// refused by the trigger, and if the trigger were ever removed it would silently destroy the image
+// an administrator had already reviewed.
+func (postgresStore) recordDocument(ctx context.Context, r db.Runner, d Document) (Document, error) {
+	const q = `
+		INSERT INTO provider_verification_documents
+			(id, provider_id, kind, object_key, content_type, content_length, etag)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING submitted_at`
+
+	err := r.QueryRow(ctx, q,
+		d.ID, d.ProviderID, string(d.Kind), d.ObjectKey,
+		d.ContentType, d.ContentLength, d.ETag,
+	).Scan(&d.SubmittedAt)
+
+	if err != nil {
+		return Document{}, fmt.Errorf("profiles: recording a %s document for %s: %w",
+			d.Kind, d.ProviderID, alreadyRecorded(err))
+	}
+	return d, nil
+}
+
+// alreadyRecorded turns the object-key index's refusal into this domain's own error.
+//
+// Named by constraint rather than by SQLSTATE alone, for `fleet.duplicate`'s reason: a unique
+// violation from some future index reported as "that image is already somebody's evidence" would be
+// a message telling a provider to re-photograph a document that was never the problem.
+//
+// `uq_provider_verification_documents_object_key` is access control rather than tidiness — one
+// object is evidence for at most one provider — so this is the layer underneath
+// [keyBelongsToProvider] rather than a duplicate of it. They refuse different things: that one
+// refuses a key minted for somebody else, and this one refuses a key already spent.
+func alreadyRecorded(err error) error {
+	if db.IsUniqueViolation(err, "uq_provider_verification_documents_object_key") {
+		return ErrDocumentAlreadyRecorded
+	}
+	return err
+}
+
+// documentsFor reads every document one provider has submitted, newest first within each kind.
+//
+// # The ordering is `(kind, submitted_at DESC)` and it is what makes "current" answerable
+//
+// `000201` is append-only, so a retake is a second row of the same kind and the newest of a kind is
+// the current document. Ordering by the kind first groups a provider's file the way both readers
+// want it — their own list, and SHIP-155's administrator opening a submission — and
+// `idx_provider_verification_documents_provider` serves the whole of it in one scan.
+//
+// `id` breaks the tie on `submitted_at`, because `DEFAULT now()` is the transaction's clock and two
+// documents submitted in one transaction would share it. Nothing does that today; an ordering that
+// is total regardless costs one column and removes a class of intermittent test failure.
+//
+// **No pagination.** There are four kinds and a provider retakes each a handful of times at most, so
+// this is bounded by how many times somebody re-photographs their licence rather than by anything
+// that grows with the platform. `internal/pagination` exists for the feeds where that is not true.
+func (postgresStore) documentsFor(ctx context.Context, r db.Runner, providerID uuid.UUID) ([]Document, error) {
+	const q = `
+		SELECT id, provider_id, kind, object_key, content_type, content_length, etag, submitted_at
+		FROM provider_verification_documents
+		WHERE provider_id = $1
+		ORDER BY kind, submitted_at DESC, id DESC`
+
+	rows, err := r.Query(ctx, q, providerID)
+	if err != nil {
+		return nil, fmt.Errorf("profiles: reading the documents of %s: %w", providerID, err)
+	}
+	defer rows.Close()
+
+	out := []Document{}
+	for rows.Next() {
+		var d Document
+		if err := rows.Scan(&d.ID, &d.ProviderID, &d.Kind, &d.ObjectKey,
+			&d.ContentType, &d.ContentLength, &d.ETag, &d.SubmittedAt); err != nil {
+			return nil, fmt.Errorf("profiles: reading a document of %s: %w", providerID, err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("profiles: reading the documents of %s: %w", providerID, err)
+	}
+	return out, nil
+}
+
 // isProvider reports whether the account exists and is a provider account.
 //
 // This domain reading `users` is sanctioned rather than a boundary crossed, the reading

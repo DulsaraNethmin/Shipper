@@ -128,3 +128,527 @@ Verification:
         "how long have I been waiting" is measured from, and what an administrator's review queue is
         ordered by.
       example: '2026-08-15T22:31:00Z'
+
+IdempotencyKey:
+  name: Idempotency-Key
+  in: header
+  required: true
+  description: |
+    A client-generated value, one per action, reused for every retry of that action. Every
+    state-changing request carries one and is refused without it (SHIP-15) — a handset that retries
+    after a dropped connection must not end up having submitted one licence twice.
+  schema:
+    type: string
+    maxLength: 255
+  example: 6c1f2ab4-6f2a-4f0c-8b0e-9a53c1f21b8d
+
+ProviderVerificationDocumentUploads:
+  post:
+    operationId: presignVerificationDocumentUpload
+    summary: Get somewhere to upload a verification document
+    tags: [Profiles]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Answers with a short-lived, pre-signed URL you PUT one document image to — **directly to
+      object storage, not to this API** (SHIP-81b). Docs/04 §3.1 requires it: verification images
+      are photographed in the app, compressed on the device, and uploaded straight to private
+      storage. The platform never sees the bytes (Docs/06 §5.2).
+
+      Only a provider account may call it. A customer answers `403 profiles_provider_only`.
+
+      ## What to do with the response
+
+      One request:
+
+      ```http
+      PUT {upload_url}
+      Content-Type: {content_type}
+      Content-Length: {content_length}
+
+      <the image>
+      ```
+
+      Send **exactly** the `content_type` and `content_length` you were given. Both are inside the
+      signature, so an upload that changes either is refused by the store with
+      `403 SignatureDoesNotMatch` — which is what makes the platform's size limit and format list
+      enforceable on the request that actually carries the bytes.
+
+      `content_type` may come back spelled differently from what you sent — it is lower-cased and
+      trimmed before it is signed. Use what you were given.
+
+      A successful PUT answers `200` with an empty body. Keep the `object_key`: it is how you tell
+      the platform which object holds which document.
+
+      ## There is no `kind` here
+
+      Which of Docs/04 §3's four documents an image is does not affect the signature and is not
+      carried in the object key, so it is supplied when you submit the document rather than when you
+      ask for somewhere to put it. That is also what lets a client photograph first and label
+      afterwards.
+
+      ## The URL is short-lived, and nothing can revoke it
+
+      `expires_at` is when the store stops honouring it. It is a credential — anybody holding it can
+      write that object until then — so do not log it or put it in a URL bar. Its lifetime is
+      configuration and may be shortened without notice; read `expires_at` rather than assuming a
+      number.
+
+      ## What a retry gets
+
+      Retrying with the same `Idempotency-Key` returns the identical URL and the identical
+      `expires_at`, already running down. One intent buys one upload slot. If you want a second slot
+      — because the first expired before the upload finished — send a **new** key, and you will get
+      a new URL and a new `object_key`.
+
+      ## What this does not do
+
+      It records nothing. An object in the store is evidence of nothing until it is submitted as one
+      of the four documents, and until then no administrator can see it.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/DocumentUploadRequest'
+    responses:
+      '200':
+        description: |
+          A URL you may upload one document image to.
+
+          `200` rather than `201` because nothing was created: the platform holds no record of this
+          URL and the store holds no object until you PUT one.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DocumentUpload'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '403':
+        description: |
+          The account is not a provider account (`profiles_provider_only`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          An identical request is still being handled (`idempotency_request_in_progress`). Retry in
+          a moment.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The upload was refused before anything was signed (`validation_failed`). `error.details`
+          names `content_type` when the format is not one the platform accepts, and `content_length`
+          when the image is larger than it allows — and the message carries the current limit, which
+          is the only place a client can learn it. Compress and ask again.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ProviderVerificationDocuments:
+  post:
+    operationId: submitVerificationDocument
+    summary: Submit an uploaded image as one of the four verification documents
+    tags: [Profiles]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Records that the object you uploaded is your licence, vehicle registration, insurance
+      certificate or ABN evidence (Docs/04 §3, SHIP-81b). Until this succeeds the image is bytes in a
+      bucket and no administrator can see it.
+
+      **The platform asks the store what it holds before it writes anything.** It is not in the
+      upload path, so it cannot know an upload happened until it asks — and a record asserting that
+      a licence was submitted, held by a platform that never looked, is not the evidence trail
+      Docs/04 §1 requires. If the PUT has not finished, this answers `409
+      profiles_document_not_uploaded`; finish it and submit again.
+
+      `content_type` and `content_length` on the response are what the **store** reported, not what
+      you declared when you asked for the URL. They are usually the same and this is the copy that
+      is right when they are not.
+
+      ## Each kind is independent, and a retake is a new submission
+
+      Submit the four in any order, and re-submit any of them as often as you need: an administrator
+      may refuse an image as illegible or out of date (Docs/04 §3), and `Restricted` explicitly
+      covers "document renewal" (§4). Every submission is kept — the newest of each kind is the
+      current document and the ones behind it are what was reviewed before. Nothing is overwritten
+      and nothing is deleted.
+
+      ## One image, one document
+
+      An `object_key` that has already been submitted answers `409
+      profiles_document_already_recorded`. Ask for a new upload URL, which is always a new object.
+
+      An `object_key` issued to a different provider answers `422` naming `object_key`: the platform
+      chooses every key and prefixes it with the provider it was issued to, so a key naming somebody
+      else is one you were never given.
+    parameters:
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/DocumentSubmission'
+    responses:
+      '201':
+        description: |
+          The document was recorded against your verification record.
+
+          It carries no download URL: this response is stored by the idempotency middleware and
+          replayed on a retry, and a credential in it would be one at rest with a clock nobody was
+          watching. Read the list to get a fresh one.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Document'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '403':
+        description: |
+          The account is not a provider account (`profiles_provider_only`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '409':
+        description: |
+          The submission cannot stand as it is. `error.code` says which:
+
+          | Code | What happened |
+          |---|---|
+          | `profiles_document_not_uploaded` | The store holds nothing under that key. Finish the PUT and submit again |
+          | `profiles_document_rejected` | The stored object is not something the platform accepts. Photograph it again |
+          | `profiles_document_already_recorded` | That image is already a submitted document. Ask for a new upload URL |
+          | `idempotency_request_in_progress` | An identical request is still being handled |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The submission was refused (`validation_failed`). `error.details` names `kind` when it is
+          not one of Docs/04 §3's four, and `object_key` when the key was issued to a different
+          provider or is missing.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+  get:
+    operationId: listVerificationDocuments
+    summary: The calling provider's submitted verification documents
+    tags: [Profiles]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Every document you have submitted, each with a **freshly signed** URL to read it at
+      (SHIP-81b). Newest first within each kind, so the current licence is the first `licence` entry
+      and the ones after it are what was reviewed before.
+
+      There is no parameter for whose: another provider's evidence is not refused here, it is never
+      selected.
+
+      ## The URLs are minted on this request and are not stored
+
+      Nothing on the platform holds a download URL — there is no column one could come out of — so
+      `download_url` stops working at `download_expires_at` and a later read gets a different one.
+      Do not cache them, do not log them, and re-read the list rather than holding one.
+
+      Verification images are private evidence: there is no public read path to the bucket, and an
+      unsigned request for the same object is refused.
+
+      ## What is not here
+
+      Whether an administrator has looked at any of it. That is your verification *state*, which
+      `GET /v1/provider/verification` answers, and it is one answer about the whole record rather
+      than one per image (Docs/04 §4).
+    responses:
+      '200':
+        description: |
+          Your submitted documents, with a signed URL each.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/DocumentList'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '403':
+        description: |
+          The account is not a provider account (`profiles_provider_only`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+DocumentUploadRequest:
+  type: object
+  additionalProperties: false
+  required: [content_type, content_length]
+  description: |
+    What you are about to upload. Unknown fields are refused — in particular there is no
+    `object_key`, because a client that could name the object it writes to could name one that
+    already holds somebody else's licence.
+  properties:
+    content_type:
+      type: string
+      maxLength: 128
+      description: |
+        The image's media type. The accepted set is server-side and may change without an app
+        release; a value outside it answers `422` with the current list in the message.
+
+        It is matched case-insensitively and **signed in lower case** — send back whatever the
+        response gives you, not what you sent here.
+      example: image/jpeg
+    content_length:
+      type: integer
+      format: int64
+      minimum: 1
+      description: |
+        The image's exact size in bytes — not an estimate and not a maximum. It is signed, so the
+        store accepts a body of exactly this length and no other.
+
+        The platform's limit is server-side and moves; a larger value answers `422` with the current
+        limit in the message. Compress on the device before you ask (Docs/04 §3.1).
+      example: 1874233
+
+DocumentUpload:
+  type: object
+  additionalProperties: false
+  required: [object_key, upload_url, method, content_type, content_length, expires_at]
+  description: |
+    One place to put one document image.
+
+    **`upload_url` is a credential.** It is the whole of the authorisation to write that object, it
+    reaches nobody but you, and nothing can revoke it before `expires_at`.
+  properties:
+    object_key:
+      type: string
+      description: |
+        Where the image will live in the store. Keep it: it is what you send when you submit the
+        document, and it cannot be recovered from `upload_url` without parsing one.
+
+        A fresh key every time. It is not derived from your idempotency key, so a URL issued today
+        can never overwrite an object that already holds evidence somebody has reviewed.
+      example: verification/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1/0198f2c1-7a30-7b52-8d41-3e8b5c62a9f4
+    upload_url:
+      type: string
+      format: uri
+      description: |
+        PUT the image here. It is not a route on this API and must never be treated as one.
+      example: https://store.example.com/shipper/verification/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1/0198f2c1-7a30-7b52-8d41-3e8b5c62a9f4?X-Amz-Algorithm=AWS4-HMAC-SHA256
+    method:
+      type: string
+      enum: [PUT]
+      description: The HTTP method the URL was signed for.
+      example: PUT
+    content_type:
+      type: string
+      description: |
+        Send exactly this as the `Content-Type` header. It is inside the signature.
+      example: image/jpeg
+    content_length:
+      type: integer
+      format: int64
+      description: |
+        Send exactly this many bytes. It is inside the signature, and it is the only bound the store
+        has on the size of what you upload.
+      example: 1874233
+    expires_at:
+      type: string
+      format: date-time
+      description: |
+        When the store stops honouring the URL, in UTC. Minutes rather than hours, deliberately.
+      example: '2026-08-18T04:30:00.000Z'
+
+DocumentSubmission:
+  type: object
+  additionalProperties: false
+  required: [kind, object_key]
+  description: |
+    Which of Docs/04 §3's four documents the object you uploaded is.
+
+    There is no `provider_id`: it is your token. An identifier in the body would be an authorisation
+    decision made from client input, which the platform does not accept (Docs/07 §3).
+  properties:
+    kind:
+      $ref: '#/DocumentKind'
+    object_key:
+      type: string
+      maxLength: 1024
+      description: |
+        The `object_key` the upload response gave you, unchanged. A key issued to another provider
+        answers `422`.
+      example: verification/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1/0198f2c1-7a30-7b52-8d41-3e8b5c62a9f4
+
+DocumentKind:
+  type: string
+  enum: [licence, registration, insurance, abn_evidence]
+  description: |
+    Docs/04 §3's four collected documents.
+
+    | Kind | What it is |
+    |---|---|
+    | `licence` | The provider's driver licence |
+    | `registration` | The vehicle's registration certificate |
+    | `insurance` | The insurance certificate |
+    | `abn_evidence` | Evidence of the ABN — a registration extract or a tax invoice showing it |
+
+    Australian spelling: `licence`, the noun.
+  example: licence
+
+Document:
+  type: object
+  additionalProperties: false
+  required: [id, kind, content_type, content_length, submitted_at]
+  description: |
+    One submitted document.
+
+    **There is no object key here.** It is a durable handle into the bucket holding identity
+    documents, you have no operation that takes one you did not just receive, and every read is
+    answered with a short-lived URL instead.
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: The submission's identifier.
+      example: 0198f2c1-8b10-7c33-9e52-4f9c6d73ba05
+    kind:
+      $ref: '#/DocumentKind'
+    content_type:
+      type: string
+      description: |
+        What the object store reported after the upload, not what you said you would send.
+      example: image/jpeg
+    content_length:
+      type: integer
+      format: int64
+      description: |
+        The stored object's size in bytes, as the store reported it.
+      example: 1874233
+    submitted_at:
+      type: string
+      format: date-time
+      description: When the platform recorded the submission, in UTC.
+      example: '2026-08-18T04:15:00.000Z'
+    download_url:
+      type: string
+      format: uri
+      description: |
+        A freshly signed URL to the image. Present when you read the list, absent on the `201` that
+        records a submission — that response is replayed on a retry, and a credential in it would
+        outlive the request that asked for it.
+
+        It is short-lived and unrevocable. Do not cache it or log it.
+      example: https://store.example.com/shipper/verification/0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1/0198f2c1-7a30-7b52-8d41-3e8b5c62a9f4?X-Amz-Algorithm=AWS4-HMAC-SHA256
+    download_expires_at:
+      type: string
+      format: date-time
+      description: |
+        When `download_url` stops working, in UTC. Absent when `download_url` is.
+      example: '2026-08-18T04:20:00.000Z'
+
+DocumentList:
+  type: object
+  additionalProperties: false
+  required: [data, next_cursor, has_more]
+  description: |
+    Your submitted documents.
+
+    `next_cursor` is always `null` and `has_more` always `false`: there are four kinds and a handful
+    of retakes, so this is bounded by the domain rather than by a page size. The envelope is here so
+    that a collection has the same shape everywhere.
+  properties:
+    data:
+      type: array
+      description: |
+        Newest first within each kind. Empty for a provider who has submitted nothing, which is
+        every provider on the day they register.
+      items:
+        $ref: '#/Document'
+    next_cursor:
+      type: string
+      nullable: true
+      description: Always `null` — there is never another page.
+      example: null
+    has_more:
+      type: boolean
+      description: Always `false`.
+      example: false

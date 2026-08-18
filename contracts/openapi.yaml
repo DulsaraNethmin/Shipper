@@ -316,6 +316,10 @@ paths:
     $ref: './paths/notifications.yaml#/Preferences'
   /v1/provider/verification:
     $ref: './paths/profiles.yaml#/ProviderVerification'
+  /v1/provider/verification/documents:
+    $ref: './paths/profiles.yaml#/ProviderVerificationDocuments'
+  /v1/provider/verification/documents/uploads:
+    $ref: './paths/profiles.yaml#/ProviderVerificationDocumentUploads'
 
 components:
   schemas:

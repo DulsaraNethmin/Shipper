@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/platform/storage"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/profiles"
 )
 
@@ -43,6 +44,40 @@ func init() {
 			Auth:    RequireUser,
 			Handler: func(d Deps) http.Handler { return profilesHandler(d).Verification() },
 		},
+
+		// SHIP-81b's three, and they are one path pair rather than three.
+		//
+		// `/documents` is the collection: a provider submits to it and reads it back. `/uploads`
+		// under it is the credential-issuing step, and it is a sub-resource rather than a query
+		// parameter or a second verb on the collection because what it answers with is not a
+		// document — it is permission to create one, and nothing is written when it is called.
+		// `delivery`'s `POST /v1/jobs/{id}/proof-uploads` is the same arrangement one level up.
+		//
+		// Four segments under `/v1` with no wildcard anywhere, so none of the `ServeMux`
+		// registration hazards Docs/11 §3 records apply: there is no `{id}` slot for a literal to
+		// collide with, and `/provider/verification` and `/provider/verification/documents` are
+		// two distinct literal patterns.
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/provider/verification/documents/uploads",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return profilesHandler(d).PresignDocumentUpload() },
+		},
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/provider/verification/documents",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return profilesHandler(d).SubmitDocument() },
+		},
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/provider/verification/documents",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Handler: func(d Deps) http.Handler { return profilesHandler(d).ProviderDocuments() },
+		},
 	)
 }
 
@@ -57,9 +92,71 @@ func init() {
 // not checked — it may be nil because the database was unreachable at startup, which is a transient
 // condition the service is built to survive.
 func profilesHandler(d Deps) *profiles.Handler {
-	handler, err := profiles.NewHandler(profiles.NewService(d.Clock), d.Pool, d.Logger)
+	store := profileDocuments(d)
+
+	documents := profiles.NewDocuments(d.Clock, store, store, profiles.DocumentPolicy{
+		MaxBytes:             d.Config.Storage.MaxUploadBytes,
+		AcceptedContentTypes: d.Config.Storage.AcceptedContentTypes,
+		UploadTTL:            d.Config.Storage.PresignTTL,
+		DownloadTTL:          d.Config.Storage.DownloadTTL,
+	})
+
+	handler, err := profiles.NewHandler(profiles.NewService(d.Clock), documents, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: profiles handler: " + err.Error())
 	}
 	return handler
 }
+
+// profileDocuments builds the signer behind the verification-document endpoints (SHIP-81b).
+//
+// # This is the only place the domain and the adapter meet, and neither names the other
+//
+// `profiles` declares [profiles.DocumentUploads] and [profiles.DocumentObjects] in its own ports.go
+// and imports nothing from `internal/platform`; `storage` knows what a bucket is and has never heard
+// of a verification record — its doc.go named this consumer in advance: "The interface this package
+// satisfies is declared by the domain that needs a file stored — delivery for proof, **profiles for
+// verification documents** — never here." Go satisfies the interfaces structurally, so the two are
+// joined by the assignment above and by the compile-time assertion at the foot of this file, which
+// is the only place in the build where that can be established at all.
+//
+// # It is a second signer over the same bucket, not a second bucket
+//
+// The same six configured values `proofUploads` reads, so a deployment has one object store, one
+// credential and one endpoint. The two kinds of object are kept apart by their key prefix —
+// `proof/…` and `verification/…` — which is what `internal/config`'s Storage section describes and
+// what `delivery`'s `proofKeyPrefix` comment predicted. **Two `storage.S3` values rather than one
+// shared between the domains** because `Deps` carries neither today and threading one through would
+// be a field on a shared struct that two domains would then both have to agree about; the value
+// holds configuration and no connection, so a second is a struct, not a resource.
+//
+// It panics for the reason `proofUploads` does: it runs during attach, from a Handler closure with
+// nowhere to put an error, and every failure it can report is a configuration fault that will still
+// be there after a restart.
+func profileDocuments(d Deps) *storage.S3 {
+	signer, err := storage.NewS3(storage.Options{
+		Endpoint:        d.Config.Storage.Endpoint,
+		Bucket:          d.Config.Storage.Bucket,
+		Region:          d.Config.Storage.Region,
+		AccessKeyID:     d.Config.Storage.AccessKeyID,
+		SecretAccessKey: d.Config.Storage.SecretAccessKey,
+		UsePathStyle:    d.Config.Storage.UsePathStyle,
+		Clock:           d.Clock,
+	})
+	if err != nil {
+		panic("cmd/api: verification document signer: " + err.Error())
+	}
+	return signer
+}
+
+// Compile-time proof that the adapter satisfies the ports `profiles` declared, which is the only
+// place in the build where that can be established — `profiles` names none of these types and none
+// of them names `profiles`, so nothing else links them.
+//
+// *storage.S3 appears twice on purpose. `profiles` declares upload signing and object reading as two
+// ports — so that a caller reading somebody's licence cannot thereby mint permission to write one —
+// and this is where one value is shown to satisfy both.
+var (
+	_ profiles.DocumentUploads = (*storage.S3)(nil)
+	_ profiles.DocumentObjects = (*storage.S3)(nil)
+)
