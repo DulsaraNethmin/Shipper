@@ -113,7 +113,7 @@ dependencies:
   # `NSMicrophoneUsageDescription` beside the camera string. This build passes `enableAudio: false`,
   # so no microphone is ever opened, and neither string nor Android's `RECORD_AUDIO` is declared — a
   # purpose string for a microphone the app does not use is worse than its absence, to a reviewer and
-  # to the person reading the prompt. `proof_never_reaches_the_gallery_test.dart` holds all three
+  # to the person reading the prompt. `test/nothing_captured_reaches_the_gallery_test.dart` holds all three
   # facts together. If App Review ever asks for the string, that is the moment to add it, and the
   # test says where. CameraX needs minSdk 21, below this project's floor of 24, so the floor that
   # exists for `flutter_secure_storage` does not move.
@@ -122,7 +122,7 @@ dependencies:
   #
   # A native compressor is a method channel with nothing behind it in a host test, and the
   # *Done when*'s "compressed" clause would then be an assertion about a mock. `image` is pure Dart,
-  # so `proof_image_test.dart` decodes and re-encodes real JPEGs on the host and measures the result
+  # so `test/core/capture/captured_image_test.dart` decodes and re-encodes real JPEGs on the host and measures the result
   # — including that the EXIF block, coordinates included, does not survive. It has **no native
   # footprint at all**, so unlike `camera` it moves neither store declaration.
   #

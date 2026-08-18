@@ -178,6 +178,21 @@ class _ProviderShortcuts extends StatelessWidget {
           icon: const Icon(Icons.gavel_outlined),
           label: const Text('Your bids'),
         ),
+        OutlinedButton.icon(
+          // SHIP-81c. The verification screen lives in `features/profile/` and this button lives
+          // here, and the two never meet: what connects them is `Routes.verificationDocuments`, a
+          // constant in `core/routing/`. That is the same arrangement `manage-vehicles` above has
+          // with `features/fleet/`, and it is what `Docs/07` §2's no-cross-feature-import rule
+          // leaves available — a route name is not an import.
+          //
+          // It is on the provider feed because `Docs/04` §3 collects these before anybody can bid,
+          // so the screen a provider looking for work lands on is exactly where the outstanding
+          // documents should be reachable from.
+          key: const Key('verification-documents-entry'),
+          onPressed: () => context.push(Routes.verificationDocuments),
+          icon: const Icon(Icons.badge_outlined),
+          label: const Text('Your documents'),
+        ),
       ],
     );
   }

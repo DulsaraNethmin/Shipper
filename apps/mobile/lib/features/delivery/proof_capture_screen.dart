@@ -8,7 +8,7 @@ import 'package:shipper/core/auth/provider_only.dart';
 import 'package:shipper/core/permissions/permission_copy.dart';
 import 'package:shipper/features/delivery/capture_proof_controller.dart';
 import 'package:shipper/features/delivery/milestone.dart';
-import 'package:shipper/features/delivery/proof_camera.dart';
+import 'package:shipper/core/capture/capture_camera.dart';
 import 'package:shipper/features/delivery/proof_exception_reason.dart';
 
 /// Photographing the delivery (SHIP-130).
@@ -62,8 +62,8 @@ class ProofCaptureScreen extends ConsumerStatefulWidget {
 }
 
 class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
-  ProofCamera? _camera;
-  ProofCameraProblem? _problem;
+  CaptureCamera? _camera;
+  CameraProblem? _problem;
   var _opening = true;
 
   /// Whether the driver has asked to record a reason instead of photographing (SHIP-131).
@@ -98,7 +98,7 @@ class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
   }
 
   Future<void> _open() async {
-    final camera = ref.read(proofCameraProvider)();
+    final camera = ref.read(captureCameraProvider)();
 
     try {
       await camera.start();
@@ -110,7 +110,7 @@ class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
         _camera = camera;
         _opening = false;
       });
-    } on ProofCameraUnavailable catch (e) {
+    } on CameraUnavailable catch (e) {
       if (!mounted) return;
       setState(() {
         _problem = e.problem;
@@ -122,7 +122,7 @@ class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
       // least tells the driver where they stand and, from SHIP-131, offers them a way on.
       if (!mounted) return;
       setState(() {
-        _problem = ProofCameraProblem.unavailable;
+        _problem = CameraProblem.unavailable;
         _opening = false;
       });
     }
@@ -135,7 +135,7 @@ class _ProofCaptureScreenState extends ConsumerState<ProofCaptureScreen> {
     final Uint8List bytes;
     try {
       bytes = await camera.capture();
-    } on ProofCameraUnavailable catch (e) {
+    } on CameraUnavailable catch (e) {
       if (!mounted) return;
       setState(() => _problem = e.problem);
       return;
@@ -226,7 +226,7 @@ class _CameraOrOpening extends StatelessWidget {
   });
 
   final bool opening;
-  final ProofCamera? camera;
+  final CaptureCamera? camera;
   final String? failure;
   final Future<void> Function() onShutter;
   final VoidCallback onCannotPhotograph;

@@ -11,10 +11,10 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as img;
+import 'package:shipper/core/capture/captured_image.dart';
 import 'package:shipper/core/queue/queued_operation.dart';
-import 'package:shipper/features/delivery/proof_image.dart';
 
-import 'proof_fixture.dart';
+import '../../support/capture_fixture.dart';
 
 void main() {
   group('the compression', () {
@@ -23,8 +23,8 @@ void main() {
     setUpAll(() => original = photograph());
 
     test('makes a phone photograph small enough for a metered connection', () {
-      const policy = ProofImagePolicy();
-      final compressed = compressProofSync(original, policy: policy);
+      const policy = CapturedImagePolicy();
+      final compressed = compressCaptureSync(original, policy: policy);
 
       expect(
         compressed.length,
@@ -45,10 +45,10 @@ void main() {
       // passed the input format through would produce a signature failure on a handset and nothing
       // anywhere else.
       final png = img.encodePng(img.decodeJpg(original)!);
-      final compressed = compressProofSync(png);
+      final compressed = compressCaptureSync(png);
 
       expect(img.findFormatForData(compressed.bytes), img.ImageFormat.jpg);
-      expect(proofContentType, 'image/jpeg');
+      expect(capturedImageContentType, 'image/jpeg');
     });
 
     test('drops the metadata block, on the resized path and on the untouched one', () {
@@ -75,7 +75,7 @@ void main() {
           reason: 'the ${size.width}px fixture carries metadata to begin with',
         );
 
-        final out = img.decodeJpg(compressProofSync(input).bytes)!;
+        final out = img.decodeJpg(compressCaptureSync(input).bytes)!;
         expect(out.exif.isEmpty, isTrue, reason: 'the ${size.width}px image kept its metadata');
       }
     });
@@ -88,12 +88,12 @@ void main() {
       // worst input a JPEG encoder can be given — a real photograph of a pallet compresses to a
       // small fraction of these numbers, which is why the shipped default is 1 MiB and these are
       // megabytes.
-      const generous = ProofImagePolicy(maxBytes: 1024 * 1024 * 8);
-      const tight = ProofImagePolicy(maxBytes: 1300 * 1024);
+      const generous = CapturedImagePolicy(maxBytes: 1024 * 1024 * 8);
+      const tight = CapturedImagePolicy(maxBytes: 1300 * 1024);
 
-      expect(compressProofSync(original, policy: generous).quality, 82);
+      expect(compressCaptureSync(original, policy: generous).quality, 82);
 
-      final squeezed = compressProofSync(original, policy: tight);
+      final squeezed = compressCaptureSync(original, policy: tight);
       expect(squeezed.quality, greaterThan(40), reason: 'not the bottom rung for this image');
       expect(squeezed.quality, lessThan(82), reason: 'and not the top one either');
       expect(squeezed.length, lessThanOrEqualTo(tight.maxBytes));
@@ -103,8 +103,8 @@ void main() {
       // Docs/01 §4.4: a job cannot reach Delivered without proof. An image that overshoots a
       // *client-side* budget is uploaded anyway; the platform's bound is fifteen times larger and is
       // the thing that actually refuses one.
-      const impossible = ProofImagePolicy(maxBytes: 1);
-      final compressed = compressProofSync(original, policy: impossible);
+      const impossible = CapturedImagePolicy(maxBytes: 1);
+      final compressed = compressCaptureSync(original, policy: impossible);
 
       expect(compressed.quality, 40, reason: 'the bottom rung');
       expect(compressed.length, greaterThan(1));
@@ -112,7 +112,7 @@ void main() {
 
     test('leaves an image already inside the budget at its own size', () {
       final small = img.encodeJpg(img.Image(width: 400, height: 300), quality: 90);
-      final compressed = compressProofSync(small);
+      final compressed = compressCaptureSync(small);
 
       expect(compressed.width, 400);
       expect(compressed.height, 300);
@@ -123,8 +123,8 @@ void main() {
       // image will not become one on the next attempt, and the screen says so rather than offering
       // to try again.
       expect(
-        () => compressProofSync(Uint8List.fromList(const [0, 1, 2, 3, 4])),
-        throwsA(isA<ProofImageUnreadable>()),
+        () => compressCaptureSync(Uint8List.fromList(const [0, 1, 2, 3, 4])),
+        throwsA(isA<CapturedImageUnreadable>()),
       );
     });
 
@@ -133,23 +133,23 @@ void main() {
       // the media type `OperationKind.proof` declares to `POST /v1/jobs/{id}/proof-uploads` — which
       // is **signed into the URL**. A compressor quietly emitting PNG would fail only on a handset,
       // as a signature error with no explanation.
-      expect(OperationKind.proof.attachmentContentType, proofContentType);
+      expect(OperationKind.proof.attachmentContentType, capturedImageContentType);
       expect(OperationKind.milestone.attachmentContentType, isNull);
     });
   });
 
   group('where the compressed photograph is written', () {
     late Directory root;
-    late ProofStore store;
-    late ProofImage image;
+    late CapturedImageStore store;
+    late CapturedImage image;
 
     setUp(() {
       root = Directory.systemTemp.createTempSync('shipper_proof_store');
       addTearDown(() {
         if (root.existsSync()) root.deleteSync(recursive: true);
       });
-      store = ProofStore(root);
-      image = compressProofSync(photograph(width: 200, height: 150));
+      store = CapturedImageStore(root, folder: CaptureFolder.proof);
+      image = compressCaptureSync(photograph(width: 200, height: 150));
     });
 
     test('inside this application’s own directory and nowhere else', () async {
@@ -173,10 +173,32 @@ void main() {
       ]) {
         await expectLater(
           store.write(image, name: name),
-          throwsA(isA<ProofStoreOutsideItsRoot>()),
+          throwsA(isA<CapturedImageStoreOutsideItsRoot>()),
           reason: '"$name" named a destination outside the store',
         );
       }
+    });
+
+    test('and the resolved-path check refuses an escape on its own', () {
+      // **The second layer, tested without the first.** `write` refuses a name carrying a separator
+      // or a `..` before it computes anything, so every assertion above passes whether or not the
+      // resolved-path check underneath does anything at all — which is how the previous one stayed
+      // inert: it compared the *joined* string, and `<folder>/../x` starts with `<folder>`.
+      //
+      // SHIP-81c's mutation run found it. Deleting the name guard's `..` clause was refused only by
+      // the operating system, with a `PathNotFoundException` — which on a handset where the
+      // directory happens to exist is a photograph written outside the store rather than a refusal.
+      final folder = store.directory;
+
+      for (final escape in <String>['../elsewhere.jpg', '../../DCIM/Camera/licence.jpg']) {
+        expect(
+          CapturedImageStore.isInside(File('${folder.path}/$escape'), folder),
+          isFalse,
+          reason: '"$escape" resolves outside the store and was accepted',
+        );
+      }
+
+      expect(CapturedImageStore.isInside(File('${folder.path}/a4f21c9e.jpg'), folder), isTrue);
     });
 
     test('and discarding one that is already gone is not an error', () async {

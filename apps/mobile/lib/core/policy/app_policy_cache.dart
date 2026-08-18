@@ -19,7 +19,7 @@
 ///   "how long before I nudge" would tie the launch path to the store the sync worker owns, which
 ///   is the coupling `queue_watch.dart` inverted a provider to avoid.
 ///
-/// So: one small JSON file, in the same directory `ProofStore` writes to and for the same reason —
+/// So: one small JSON file, in the same directory `CapturedImageStore` writes under and for the same reason —
 /// `getApplicationSupportDirectory()` is private to this application on both platforms and, unlike
 /// the cache directory, is **not purgeable by the operating system.** A policy the OS deleted
 /// overnight would put a device that has been online for months back on the compiled default,
@@ -66,7 +66,7 @@ final class FileAppPolicyCache implements AppPolicyCache {
 
   /// The file name, under [root].
   ///
-  /// Flat rather than in a folder of its own, unlike `ProofStore`: there is exactly one of these
+  /// Flat rather than in a folder of its own, unlike `CapturedImageStore`: there is exactly one of these
   /// and there will not be a second, so a directory would be a container for one file forever.
   static const fileName = 'app_policy.json';
 

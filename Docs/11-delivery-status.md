@@ -15850,6 +15850,66 @@ The section starts its worker with `KAFKA_BROKERS=localhost:1`, `61-bidding.sh`'
 - **Notifications to a pseudonymised account are not suppressed.** A person who is still party to a retained job can be a recipient of a later `job.status_changed`; the row would be written with the pseudonym as its address and would fail to dispatch, legibly, climbing `attempts`. It has no ticket. `internal/notifications` is nobody's this wave and the fix is that domain's, not a statement in `cmd/worker`.
 - **The retention period for the pseudonymised transaction records is still X-4's.** `Docs/05` §3.1 calls it *"the one genuinely open element"* and it does not block this ticket: the **split** — what is deleted and what is retained under a pseudonym — is settled in that document as a design decision, and how long the retained side persists is the open question. Nothing here shortens or lengthens anything.
 
+### SHIP-81c — the client half of `Docs/04` §3.1, and the move that made it possible (wave 16)
+
+Wave 14's SHIP-81b built the platform half and recorded, in this section, exactly why it stopped there: the capture experience *"is not built"*, `apps/mobile/lib/features/verification/**` **cannot exist**, and reusing what delivery already had *"requires moving all three to `core/`… which is a refactor of another feature's directory, with no ticket"*. Wave 15's `ship-15af-ship-81c-decision` closed the first half by writing the decision into `Docs/07` §2. This ticket is the second half, and the move is most of it.
+
+#### The move, and the one API decision inside it
+
+`ProofCamera` and `PlatformProofCamera` (`features/delivery/proof_camera.dart`), and `ProofImagePolicy`, `ProofImage` and `ProofStore` (`proof_image.dart`), are now `core/capture/capture_camera.dart` and `core/capture/captured_image.dart` — renamed to `CaptureCamera`, `PlatformCaptureCamera`, `CapturedImagePolicy`, `CapturedImage` and `CapturedImageStore`, with every paragraph rewritten. The precedent is `ProviderOnly`, moved to `core/auth/` at SHIP-100, and `provider_only.dart:67-80` is the template the copy rewrite followed: *"The copy generalised in the move, deliberately."* A class that kept a doc comment about proof of delivery while a provider's licence went through it is documentation that is wrong about the code, which is worse than documentation that is missing.
+
+**`ProofStore.folder` was `static const folder = 'proof'`, and that is the one substantive API decision the move took.** A driver licence must not land under `proof/`, and the *Done when* says so. Three ways to parameterise it were available: a `String folder` field, which makes the destination a parameter and `'../../DCIM'` a string, when the whole of the class's guarantee is that the destination is *not* one; a validated `String`, which closes that and leaves the set of directories open to grep alone; and **a closed `CaptureFolder` enum, which is what was written** — the same move `OperationKind` makes with a private constructor in `core/queue`, so an unlisted destination does not compile and the two places this application writes images are in one readable list. The names are the platform's own: the object key `POST /v1/provider/verification/documents/uploads` mints is `verification/<provider>/<uuid>`, so the handset's directory and the bucket's prefix read the same word.
+
+The two providers that are genuinely shared — the compression budget and the compressor — moved to `core/capture/capture_providers.dart`. The **store** providers did not: each caller names its own folder, so `proofStoreProvider` stays in `features/delivery/` and `verificationStoreProvider` is in `features/profile/`, one line each.
+
+#### It is `features/profile/`, and there is no eighth feature
+
+`Docs/07` §2 assigns verification evidence to `profile/` — *"capture as well as display"* — and `architecture_test.dart` holds `lib/features` to the closed list of seven. The stub was an eight-line `library;`. It now holds five files and its own doc comment saying what each is for, plus a sixth from SHIP-81d.
+
+The entry point is a button on the **provider feed**, in `features/jobs/`, which imports nothing from `features/profile/`: what connects them is `Routes.verificationDocuments`, a constant in `core/routing/`. That is the arrangement `manage-vehicles` already has with `features/fleet/`, and it is what §2's rule leaves available — a route name is not an import.
+
+#### The upload does not go through the offline queue, and that is a decision
+
+Wave 14 measured the mechanical obstacle and it is real: `OperationKind`'s constructor is private, so this would need a third kind, and `ApiOperationSender._sendWithProof` derives its presign path by chopping the last segment off `/v1/jobs/{id}/milestones` — which for this pair of nested routes gives `/v1/provider/verification/uploads`, served by nothing. **The product reason is the one that decided it.** `Docs/07` §4 puts the queue where it is needed — *"pickup bays, warehouses and rural routes have no usable signal"* — and verification is onboarding; the queue's guarantee is FIFO within an ordering key and a document submission is ordered against nothing; and a queued submission would confirm the wrong thing, because the provider's next question is "may I bid yet" and an object with no row is *"evidence of nothing"*. What is kept from the queue's design is the half that matters: the compressed file survives a failure, and the idempotency key belongs to the action rather than to the attempt.
+
+So `VerificationRepository.submit` performs all three requests as one operation — presign, PUT to the store on `ObjectUploader`'s own transport, submit — because two of the three are useless alone and a caller that could reach the middle could leave somebody's licence in a bucket with no row, which is the one outcome invisible from both ends.
+
+#### `Docs/04` §3.1's three guarantees, and which line holds each
+
+- **Never written to the photo library** — unchanged, and deliberately so. It was SHIP-130's property and it moved with the code rather than being rewritten. The guard did too: `proof_never_reaches_the_gallery_test.dart` is now `test/nothing_captured_reaches_the_gallery_test.dart`, at the root beside `architecture_test.dart`, because **every assertion in it was already whole-client** — the move changed no `Directory` and no glob.
+- **Compressed on the device** — `submit` takes a `CapturedImage` rather than bytes, so the compressor is not something it can be called without having run, and `content_length` is signed against the compressed size.
+- **Cleared from app storage once uploaded** — discarded after the submission returns, and **only after**. Every failing path leaves the file, which is what makes a retry a second *upload* rather than a second photograph, and it is why the image is written down instead of held in memory.
+
+#### The camera purpose string was widened, and that supersedes SHIP-179
+
+SHIP-179 wrote *"Shipper uses the camera to photograph goods at pickup and delivery, as proof the job was completed…"* when proof of delivery was the only use. It is now the two-use string naming the licence, registration and insurance documents first — in `PermissionCopy.cameraPurpose` **and** in `ios/Runner/Info.plist`, which `permission_copy_test.dart` already held byte-for-byte together and now also holds to naming all three documents. **A shipped string changing is worth a sentence**: Apple requires the purpose string to cover every use of the camera, and a reviewer meeting the onboarding flow while the string described a delivery would have found a discrepancy. Verification is named first because it is the first time most providers meet the prompt — `Docs/04` §3 collects the documents before anybody can bid.
+
+#### No `expires_at`, and that is a refusal rather than an omission
+
+`DocumentSubmission` gained an optional `expires_at` in wave 16's Phase 0 and this client does not collect one. `Docs/04` §3's *Decision required* — which documents must be renewed and how often, Track-X row **X-4** — is owned by legal and insurance advisers and *"remains genuinely outside engineering's competence to settle"*. A screen asking every provider for a date would be this application answering it four times over, and getting one of the four wrong by construction: an ABN extract does not lapse. The field is stated at submission or never and the table is append-only, so collecting it later is a text field and a second submission; collecting it now and being wrong is a data-cleanup.
+
+#### The mutation, and the guard it found inert
+
+**Two mutations, both killed, and the second is the finding.**
+
+*`CaptureFolder.verification('verification')` → `('proof')`* — a driver licence filed under the delivery folder. Killed by one assertion, in `verification_repository_test.dart`, on the store's own directory path. That is the layer that holds it: the enum makes an *unlisted* destination uncompilable and says nothing about what the listed ones are called, so a test on the name is the only thing between the two.
+
+*The name guard in `CapturedImageStore.write` reduced to `name.isEmpty`* — killed by `captured_image_test.dart`'s "a destination is never a parameter", but **read the failure**: the refusal came from `PathNotFoundException` out of `writeAsBytes`, not from the store. The "belt and braces beside the check above, and the one that survives a change to it" was **inert**, inherited verbatim from `ProofStore`: it compared `file.absolute.path.startsWith(folder.absolute.path)` on the *joined* string, and `/tmp/root/verification/../x.jpg` starts with `/tmp/root/verification`. Probed directly, all three of an absolute path, `../x.jpg` and `../../DCIM/x.jpg` passed it. So the store had one guard wearing a two-layer disguise, and on a handset where the target directory happens to exist the mutation would have written the photograph outside the store rather than failing.
+
+It is closed. `CapturedImageStore.isInside` normalises both paths with `Uri.normalizePath` before comparing, is **public so it can be tested without going through the name guard** — a second layer only reachable through the first is a second layer nobody can demonstrate, which is exactly how the previous one survived every test this store has had — and reverting it to the inert form fails its own test by name.
+
+#### What this does not build
+
+- **The file-upload fallback `Docs/04` §3.1 requires**, which is SHIP-81d. `PermissionCopy.verificationCameraDeclined` is honestly short of it in this ticket and offers settings alone, because copy promising a button that is not there is worse than copy that says where the provider stands.
+- **Any rendering of a submitted image.** `download_url` is a credential with a lifetime of minutes and the contract says not to cache one, so `VerificationDocument` does not model it. The screen that reviews these images is the administrator's, SHIP-155, on the administrator's own credential.
+- **`GET /v1/provider/verification`** — the *state*. `Docs/04` §4's five outcomes are a different question from evidence, and a screen showing "3 of 4 sent" beside a state would invite reading the first as progress towards the second. Nothing here says a document arriving is a decision being taken.
+
+**No Go, no migration, no route, no contract change** — `git diff --name-only develop...HEAD` is `apps/mobile/**` and `Docs/11` alone, so there is no constraint to sweep `scripts/verify/*.sh` for and `make verify` has nothing of this ticket's to exercise.
+
+| Surface | What |
+|---|---|
+| SHIP-81c | `core/capture/` — `CaptureCamera`, `CapturedImage{,Policy,Store}` and `CaptureFolder`, moved out of `features/delivery/` and renamed; `features/profile/` grows five files — the four kinds, the three-request repository, the capture controller, the list screen and the camera screen; two routes and their `_signedIn*` entries; the camera purpose string widened in both places, superseding SHIP-179's; `CapturedImageStore.isInside` replaces an inert path check; the gallery guard moved to the test root and its hard-coded source path replaced by a sweep for `CameraController(`; 22 Dart tests |
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

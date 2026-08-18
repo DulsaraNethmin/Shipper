@@ -20,9 +20,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/errors/api_failure.dart';
 import 'package:shipper/core/permissions/permission_copy.dart';
 import 'package:shipper/core/queue/queued_operation.dart';
-import 'package:shipper/features/delivery/proof_camera.dart';
+import 'package:shipper/core/capture/capture_camera.dart';
 import 'package:shipper/features/delivery/proof_exception_reason.dart';
-import 'package:shipper/features/delivery/proof_image.dart';
+import 'package:shipper/core/capture/captured_image.dart';
 
 import '../../core/sync/sync_fixture.dart';
 import 'delivery_app.dart';
@@ -36,12 +36,12 @@ void main() {
   /// Supplied even to the tests that never write a file, because `withDevice` is what puts the fake
   /// camera in and the store comes with it. **Nothing here writes one** — that is the whole point of
   /// the exception path: no object is created and the object store is never contacted.
-  ProofStore store() {
+  CapturedImageStore store() {
     final directory = Directory.systemTemp.createTempSync('shipper_proof_exception');
     addTearDown(() {
       if (directory.existsSync()) directory.deleteSync(recursive: true);
     });
-    return ProofStore(directory);
+    return CapturedImageStore(directory, folder: CaptureFolder.proof);
   }
 
   /// A queue nothing may empty.
@@ -52,7 +52,7 @@ void main() {
       SyncHarness.create(sender: ScriptedSender(thereafter: const ApiUnreachable()));
 
   testWidgets('a refused camera offers the three reasons rather than a dead end', (tester) async {
-    final camera = FakeProofCamera(problem: ProofCameraProblem.refused);
+    final camera = FakeCaptureCamera(problem: CameraProblem.refused);
     final harness = stuckQueue();
 
     await openDelivery(
@@ -90,7 +90,7 @@ void main() {
 
   testWidgets('choosing a reason and recording it queues the milestone the platform accepts',
       (tester) async {
-    final camera = FakeProofCamera(problem: ProofCameraProblem.refused);
+    final camera = FakeCaptureCamera(problem: CameraProblem.refused);
     final harness = stuckQueue();
 
     await openDelivery(
@@ -165,7 +165,7 @@ void main() {
 
   testWidgets('the way back to the delivery is the same one the photograph path uses',
       (tester) async {
-    final camera = FakeProofCamera(problem: ProofCameraProblem.refused);
+    final camera = FakeCaptureCamera(problem: CameraProblem.refused);
     final harness = stuckQueue();
 
     await openDelivery(
@@ -200,7 +200,7 @@ void main() {
     // Only `camera_unavailable` is about the camera. A driver whose recipient objects, or who is
     // standing somewhere unlit, has the same problem SHIP-131 exists to solve and a perfectly good
     // camera in their hand.
-    final camera = FakeProofCamera(bytes: photograph(width: 40, height: 30));
+    final camera = FakeCaptureCamera(bytes: photograph(width: 40, height: 30));
     final harness = stuckQueue();
 
     await openDelivery(
@@ -238,7 +238,7 @@ void main() {
   // queued body rather than on the field, because a note the driver can see and the platform never
   // receives is the whole defect this ticket exists to close.
   testWidgets('a note is recorded beside the selected reason, not instead of one', (tester) async {
-    final camera = FakeProofCamera(problem: ProofCameraProblem.refused);
+    final camera = FakeCaptureCamera(problem: CameraProblem.refused);
     final harness = stuckQueue();
 
     await openDelivery(
@@ -286,7 +286,7 @@ void main() {
 
   testWidgets('a reason with no note is recorded exactly as it was before the field existed',
       (tester) async {
-    final camera = FakeProofCamera(problem: ProofCameraProblem.refused);
+    final camera = FakeCaptureCamera(problem: CameraProblem.refused);
     final harness = stuckQueue();
 
     await openDelivery(
@@ -319,7 +319,7 @@ void main() {
 
   testWidgets('a refused camera offers no way back to a shutter that does not exist',
       (tester) async {
-    final camera = FakeProofCamera(problem: ProofCameraProblem.unavailable);
+    final camera = FakeCaptureCamera(problem: CameraProblem.unavailable);
     final harness = stuckQueue();
 
     await openDelivery(

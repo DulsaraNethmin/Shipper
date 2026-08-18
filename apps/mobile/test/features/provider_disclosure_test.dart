@@ -522,6 +522,10 @@ const _feedCopy = <String>{
       'eligible for.',
   'Your vehicles',
   'Your bids',
+  // SHIP-81c's entry point to `features/profile/`. Recorded here because it is a string the feed
+  // puts in front of a provider, and it says nothing about any job — which is the question this
+  // set exists to force somebody to answer about every one of them.
+  'Your documents',
   'Picked up in',
   'Built from the jobs shown below.',
   'Bidding',
