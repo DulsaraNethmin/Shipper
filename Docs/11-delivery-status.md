@@ -20235,6 +20235,55 @@ move is SHIP-81c's to make.**
 **SHIP-81c was not scheduled into wave 15.** The owner unblocked it and chose a two-lane wave without
 it. It is startable, not started, and it is the first row a client-side wave should take.
 
+### `freezed` copies doc comments, so a renamed file can make generated code stale — and no local gate sees it
+
+**`develop` shipped red for the wave-16 merge and every gate the wave ran was green.** The Flutter
+workflow failed on `52e314b` — run **32129467628**, 1m21s, at the step *"generated model code is up
+to date"* — while the Go workflow passed. The diff was **two lines in one file**,
+`apps/mobile/lib/core/policy/app_policy.freezed.dart`, and both are the same doc comment in the two
+positions `freezed` emits it: the mixin and the concrete class.
+
+**The cause is a class of staleness that no model change produces.** SHIP-81c renamed
+`proof_image.dart` to `core/capture/captured_image.dart`, and the doc comment on
+`AppPolicy.proofCompressionBudgetBytes` names that file while arguing why the compression budget is
+not `STORAGE_MAX_UPLOAD_BYTES`. `freezed` copies doc comments into its output, so **a rename anywhere
+that a doc comment points invalidates generated code with no field, type or annotation touched** —
+and the stale copy then names a path that is not on disk, which is the form it took here.
+
+**The gap is that the check exists only in CI, and it is the exact failure the workflow beside it
+warns about.** `make flutter-check` is `flutter-analyze flutter-test flutter-test-defines`; the
+staleness assertion is an inline `run:` block in `.github/workflows/flutter.yml` and is in no make
+target. So wave 16's Lane C ran `make flutter-check` to **exit 0**, the merged trial `b92de39` ran it
+to **exit 0**, and neither could have caught this — the gate `CLAUDE.md` names after wave 14 was run,
+twice, and does not contain the check that failed. **The workflow's own comment on the *next* step
+says it calls `make flutter-check` rather than a list of steps because *"the check that gets dropped
+is always the one only CI was running"*.** The step immediately above it is a list of steps only CI
+runs.
+
+**The obvious fix is already argued against, in this repository, in writing.** `mk/codegen.mk`
+refuses to put a regenerating target in `CHECKS` on two grounds: it rewrites the working tree, and
+`CLAUDE.md` records what a tree-rewriting gate did to wave 5 — a false failure on a clean tree and a
+false pass that shipped; and a `git diff` of tracked files cannot see a generated file that has been
+**deleted**. Its answer for the Go side is a **read-only** test, `TestGeneratedFilesAreCurrent`,
+which renders the specification in memory and compares. **That answer does not transfer.**
+`statusgen` is a bespoke generator; nothing can render `freezed`'s output in memory without running
+`build_runner`, so the read-only form is unavailable here rather than merely unwritten.
+
+**So this is recorded rather than resolved, and the three options are named so whoever decides has
+both sides.** *One*: `flutter-check` gains a `flutter-codegen-check` prerequisite and the Flutter
+side accepts a tree-rewriting gate. The wave-5 hazard is narrower than it reads — it is about a gate
+racing a **merge**, and `CLAUDE.md` already forbids committing or merging while a gate runs — but the
+deleted-file blindness is a genuine residual. *Two*: leave it CI-only and accept that this class is
+found after the merge, which has now happened once and cost a red `develop`. *Three*: a read-only
+test asserting that every path named in a `.freezed.dart` doc comment exists on disk — cheap, and it
+catches this instance rather than the class.
+
+**It wants a `Docs/09` row rather than a drive-by edit**, because option one contradicts a decision
+`mk/codegen.mk` argued and closed, and `CLAUDE.md` is explicit that a contradiction is not resolved
+silently in code. The repair itself is on `ship-15al-flutter-codegen-staleness` and is two
+regenerated lines; **the gate is what is open.**
+
+
 ## 10. The done list, in a form a script can read
 
 **The list is `Docs/11-done.txt`**, one ticket per line. It is still authoritative and it is
