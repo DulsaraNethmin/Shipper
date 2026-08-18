@@ -15563,6 +15563,134 @@ the guard exists at both layers. **Restored by the recipe** — copy taken befor
 |---|---|
 | SHIP-155 | `GET /v1/admin/verifications/{id}/documents` — a provider's evidence with a fresh signed URL per image and per read; `admin.Evidence` + the `ProviderEvidence` port + `cmd/api`'s `providerEvidence` adapter over `profiles.Documents`; `verification.evidence_viewed`, the catalogue's first audited read, written in the read's own transaction; `auditedAdminReads` as the route-side tripwire; 8 Go tests and 9 harness checks |
 
+### SHIP-159 — the expiry queue, and a column with a path into it (wave 15)
+
+> **Done when:** Expiring and expired provider documents surface ahead of time.
+
+**Both halves demonstrated, and the second only because a number was configured.**
+`GET /v1/admin/moderation/expiring-documents` is Docs/04 §5's **seventh and last** queue. A document
+that has lapsed is on it under every configuration; a document that has not lapsed but is inside its
+kind's configured horizon is on it too, and reads as not-expired.
+
+`000201` pre-authorised this migration in its own header and `000202` is the one-line `ALTER TABLE …
+ADD COLUMN expires_at timestamptz` it named. Docs/04 §1 requires the verification record hold "every
+review, evidence item, decision, **and expiry date**"; the first three arrived in wave 14 and this is
+the fourth.
+
+#### The column has a path into it, which is the clause this ticket was most at risk of failing
+
+The table is append-only — two triggers refuse UPDATE and DELETE outright — so **an expiry can be
+written at INSERT or not at all.** It is therefore stated by the provider on
+`POST /v1/provider/verification/documents`, beside the kind and the object key, as an optional
+`expires_at`. A mistyped renewal date is corrected by re-photographing the document, which is a
+second row, which is what `000201` already says a correction is.
+
+**Every fixture on the harness's queue got its date through that endpoint with `curl`** — minted,
+uploaded to MinIO, submitted. No row on that queue was written with SQL. That was the condition the
+lane was given and it is the reason the shape is what it is: a column nothing in the running system
+can populate is a dead column, not a feature.
+
+SHIP-81c — the Flutter capture — is unstarted, so **no shipping client sends the field yet**. That is
+a client gap rather than a dead column: the platform accepts it, records it, and answers on it today,
+and `Docs/11` §4 is where the client half belongs.
+
+#### What is configuration and what is not, because they are easy to run together
+
+| | Where it comes from | Default |
+|---|---|---|
+| **When a document lapses** | the provider, at submission, in `expires_at` | none — NULL means "the platform was never told" |
+| **How far *ahead* it is chased** | `VERIFICATION_EXPIRY_LEAD_TIMES`, per document kind | **none, deliberately** |
+
+Docs/04 §3's open question — *"which documents are legally required rather than merely prudent, and
+**how often each must be renewed**"*, owner: legal and insurance advisers, Track-X row X-4 — is
+unanswered, and §3 permits building first. So the binding constraint was **not to enforce a number
+nobody decided**, and it lands in three places: no default in `internal/config`, no `DEFAULT` and no
+computed expiry in `000202`, and no constant in either domain.
+
+**The absent-configuration behaviour, stated because it is the shipping behaviour:** with nothing
+set, every kind's horizon is *now*. The queue reports documents that have actually lapsed and not a
+day before — the "expiring" half is empty by construction, and that is correct rather than a gap. A
+document that states no expiry never appears under any configuration.
+
+`lead_times` is on the response for that reason: **"nothing is due" and "nobody has configured a
+horizon for insurance certificates yet" are the same empty page and different facts**, and only the
+second is a reason to go and ask legal. It is read back off the domain rather than out of
+configuration a second time, so the legend cannot describe a different page from the one beside it.
+
+#### Three decisions worth carrying
+
+**Only the current document of a kind is on the queue**, and this is a property of the query rather
+than of the data. `000201` is append-only, so a re-photographed licence leaves a superseded row with
+a date that has passed and which nothing can ever delete. A queue reading every row would ask an
+administrator to chase a renewal that has already happened — every time it was opened, for ever,
+growing by one entry per retake. `DISTINCT ON (provider_id, kind)` runs *before* the horizon filter,
+and the `expires_at IS NOT NULL` test runs *after* it, so an older submission cannot pull a current
+document with no stated expiry onto the queue.
+
+**No CHECK that the expiry is in the future**, which is the constraint everybody reaches for first.
+`expires_at > submitted_at` would refuse the submission this queue most wants: Docs/04 §3 has an
+administrator refusing an image that is "visibly expired", so the schema has to be able to hold one
+long enough for somebody to look at it. What *is* refused is a value that is not a date — the zero
+time, and a year outside `timestamptz`'s range — which is a bound on what a timestamp is rather than
+on how long a document may last.
+
+**Under `/v1/admin/moderation/` rather than `/v1/admin/verifications/`.** The two existing queues at
+that prefix are §5's fourth and fifth, `moderation.read` is the permission `permissions.go` already
+names SHIP-159 for, and `/admin/verifications` is a queue of *providers* while this is a list of
+*documents*. It also kept a literal out of the `{id}` slot the decision and the evidence viewer both
+use.
+
+#### The two tripwires, deleted and replaced
+
+Both said in their own text that SHIP-159 would delete them. Deleting an assertion of absence and
+putting nothing in its place leaves a file weaker than it was, so each was replaced with the positive
+property the column has to have:
+
+| Deleted | Replaced by |
+|---|---|
+| `internal/profiles/documents_test.go`'s `TestThereIsNoExpiryColumn` | `TestTheExpiryColumnIsWritableOnlyAtInsert` — the column exists, is **nullable**, a stated expiry round-trips through `Submit` and `For`, and an `UPDATE` of it from the pool is refused by the append-only trigger. Plus `TestADocumentWithNoStatedExpiryRecordsNone` and `TestAnExpiryThatIsNotADateIsRefusedAndOneInThePastIsNot` |
+| `scripts/verify/62-profiles.sh`'s "no expiry column" check | a positive block: the column is nullable; a licence submitted with `expires_at` reaches the row and the provider's own read; a document submitted without one reads back `null`; the document's expiry and the URL's expiry are asserted **different values**; and an `UPDATE` from a `psql` prompt is refused and leaves the date unmoved |
+
+#### One rename the compiler caught, which is a hazard worth naming
+
+`DocumentLink` embeds `Document`, so putting `ExpiresAt` on `Document` made it **shadowed** by
+`DocumentLink.ExpiresAt` — the signed URL's lifetime. Those are a credential that lasts five minutes
+and a licence's renewal date that lasts five years, and a caller reading the shadowed field would
+have shown a provider their insurance expiring this afternoon. The URL's field is now
+`URLExpiresAt`. The compiler caught it once; the name is what stops it arriving again, and the
+harness asserts the two values differ on the wire.
+
+#### What was declined
+
+**No scheduled sweep and no worker task.** `cmd/api/routes_admin.go` anticipated that
+`profiles.ActorSystem` would first be supplied by "SHIP-159's expiry sweep"; that comment is now
+wrong and is corrected in place. A sweep that moved a provider to `Restricted` when their insurance
+lapsed would be the platform enforcing X-4's unanswered cadence as a *state change* rather than as a
+queue entry — the strongest form of the thing this ticket is built not to do — and `cmd/worker` was
+another lane's this wave. The queue surfaces; a person decides, through SHIP-154.
+
+**No notification.** Same reasoning: telling a provider their certificate expires in thirty days
+asserts that thirty days is the number.
+
+**No filter on verification state.** A suspended provider's lapsed insurance is not worth chasing and
+a verified provider's is urgent, but which of Docs/04 §4's five deserve attention is a triage
+decision an administrator makes. The state is on the entry; filtering by it is not offered.
+
+#### The constraint sweep
+
+`000202` adds a nullable column with no CHECK, no NOT NULL and no trigger, so it cannot refuse a row
+any fixture writes — but the sweep was run rather than reasoned. `grep -rln
+"provider_verification_documents" scripts/` returns **two files, both this lane's** (`62-profiles.sh`
+and `90-admin.sh`). No `SELECT *` against the table anywhere in `scripts/` or `services/`; no fixture
+inserts into it directly in either tree, so every row goes through the domain. The five other
+`information_schema.columns` assertions in `scripts/verify/*.sh` scope to `device_sessions`, `jobs`,
+`notifications`, a `password|secret|passphrase` name match, and this table's own `%url%`/`%link%`
+check — none matches `expires_at`. `migrations/schema_test.go`'s sweep is over `updated_at`.
+
+| Surface | What |
+|---|---|
+| SHIP-159 | `000202` adds a nullable `expires_at` written only at INSERT, with a partial `(expires_at, id)` index; `expires_at` on `POST /v1/provider/verification/documents` and on both reads; `profiles.Expiry` with per-kind horizons from `VERIFICATION_EXPIRY_LEAD_TIMES` (**no default**); `GET /v1/admin/moderation/expiring-documents` on `moderation.read`, cursor paged, carrying the horizons it used; both SHIP-81b tripwires deleted and replaced with positive assertions; 11 Go tests and 5 harness checks |
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

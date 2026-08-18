@@ -3446,6 +3446,270 @@ ok "an account with no verification record is a plain 404 that writes nothing, a
 admin_clear_limits
 
 # ==========================================================================================
+# SHIP-159 — the expiry queue: Docs/04 §5's seventh and last.
+#
+# # What this section demonstrates that no Go test can
+#
+#   1. **The column is populated by the platform rather than by SQL.** Every document below reaches
+#      the queue through `POST /v1/provider/verification/documents` with an `expires_at` on the body
+#      — minted, uploaded, submitted. A column nothing in the running system can write is a dead
+#      column, and the whole point of this check is that there is a path.
+#   2. **The adapter under test is the one that ships.** `expiringDocuments` and
+#      `verificationLeadTimes` live in package main, where no test has a database to reach.
+#   3. **The configuration is the deployment's.** `VERIFICATION_EXPIRY_LEAD_TIMES` reaches the
+#      running service through `deploy/.env`, and this section reads the same value to place its
+#      fixtures — so the horizon being asserted is the one the server is actually using.
+#
+# # The fixtures are placed relative to the configured horizon, and that is deliberate
+#
+# The lead time has **no default**: Docs/04 §3 gives the renewal cadence to legal and insurance
+# advisers (Track-X row X-4) and it is unanswered, so a tree with no `deploy/.env` line runs every
+# kind at a horizon of *now*. Rather than skip half the section there — a conditional check is a
+# check that can be quietly vacuous — each fixture is written at `horizon ± a margin`, so the same
+# four assertions run in both configurations and mean the same thing in both. With a lead time set
+# they exercise "expiring ahead of time"; with none they exercise the same boundary at zero.
+#
+# `internal/profiles/expiry_test.go` drives a configured horizon unconditionally, which is the half
+# no harness can guarantee on a machine whose `deploy/.env` it does not own.
+
+ticket "SHIP-159  expiring and expired provider documents surface ahead of time"
+
+admin_clear_limits
+
+# The horizon this deployment applies to an insurance certificate, in seconds, taken from the same
+# variable the server was started with. Zero when nothing is configured, which is the shipping
+# default and is a number rather than a special case.
+expq_lead="$(python3 - "${VERIFICATION_EXPIRY_LEAD_TIMES:-}" <<'EXPLEAD'
+import re, sys
+units = {"s": 1, "m": 60, "h": 3600}
+for pair in sys.argv[1].split(","):
+    name, _, raw = pair.partition("=")
+    if name.strip() != "insurance" or not raw:
+        continue
+    total = 0
+    for value, unit in re.findall(r"([0-9.]+)([a-z]+)", raw.strip()):
+        total += float(value) * units.get(unit, 0)
+    print(int(total))
+    break
+else:
+    print(0)
+EXPLEAD
+)"
+
+# expq_provider <suffix> <name> <phone-digit> — a registered provider, answering with its id.
+expq_provider() {
+  local out="$WORKDIR/expq-provider-$1.json" code
+  code="$(post_json "verify-adm159-reg-$1-$$" /v1/auth/register \
+    "{\"name\":\"$2\",\"email\":\"verify-expq-$1-$$@example.com\",\"phone\":\"04193$3$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+    "$out")"
+  [[ "$code" == "201" ]] || { cat "$out"; fail "could not register the provider $1: $code"; }
+  json "$out" '["id"]'
+}
+
+# expq_submit <token> <kind> <n> <expires-at-or-empty> — one document through the platform's own
+# three endpoints, leaving its record in $WORKDIR/expq-<n>.json.
+#
+# A global rather than a printed value, and called directly rather than in a command substitution:
+# `fail` exits, and inside `$( … )` that exits only the subshell.
+expq_submit() {
+  local token="$1" kind="$2" n="$3" expires="$4" url key code body
+  code="$(curl -s -X POST -o "$WORKDIR/expq-url-$n.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $token" -H "Idempotency-Key: verify-adm159-url-$n-$$" \
+    -H 'Content-Type: application/json' -d '{"content_type":"image/jpeg","content_length":52}' \
+    "http://localhost:$VERIFY_PORT/v1/provider/verification/documents/uploads")"
+  [[ "$code" == "200" ]] || { cat "$WORKDIR/expq-url-$n.json"; fail "minting a URL for $n answered $code"; }
+
+  key="$(json "$WORKDIR/expq-url-$n.json" '["object_key"]')"
+  url="$(json "$WORKDIR/expq-url-$n.json" '["upload_url"]')"
+
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Content-Type: image/jpeg" \
+    --data-binary "@$WORKDIR/adm-evidence.bin" "$url")"
+  [[ "$code" == "200" ]] || fail "uploading $n answered $code"
+
+  if [[ -n "$expires" ]]; then
+    body="{\"kind\":\"$kind\",\"object_key\":\"$key\",\"expires_at\":\"$expires\"}"
+  else
+    body="{\"kind\":\"$kind\",\"object_key\":\"$key\"}"
+  fi
+
+  code="$(curl -s -X POST -o "$WORKDIR/expq-$n.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $token" -H "Idempotency-Key: verify-adm159-rec-$n-$$" \
+    -H 'Content-Type: application/json' -d "$body" \
+    "http://localhost:$VERIFY_PORT/v1/provider/verification/documents")"
+  [[ "$code" == "201" ]] || { cat "$WORKDIR/expq-$n.json"; fail "submitting $n answered $code"; }
+}
+
+# expq_at <offset-seconds> — an RFC 3339 instant that far from now, in UTC.
+#
+# Derived from the same clock the assertions are made against rather than transcribed, because a
+# hard-coded time asserts a timezone and this machine is not UTC.
+expq_at() {
+  python3 -c "
+import datetime, sys
+at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=int(sys.argv[1]))
+print(at.strftime('%Y-%m-%dT%H:%M:%SZ'))" "$1"
+}
+
+expq_margin=86400
+
+# Three providers, because the three horizon-sensitive fixtures are all **insurance certificates**
+# and `000201` is append-only: the newest row of a kind is the current document, so two of them on
+# one provider would reduce to one and the assertion would silently be about a different fixture.
+# They are all the same kind on purpose — the horizon read below is insurance's, and placing a
+# fixture at that boundary while recording it under a different kind would compare two numbers a
+# deployment can set independently.
+expq_one="$(expq_provider one "Marisol Quintanilha" 1)"
+expq_two="$(expq_provider two "Anselm Rutherglen" 2)"
+expq_three="$(expq_provider three "Kealoha Brennanmoor" 3)"
+expq_one_token="$(mint_token "$expq_one")"
+expq_two_token="$(mint_token "$expq_two")"
+expq_three_token="$(mint_token "$expq_three")"
+
+# Lapsed a month ago: on the queue under every configuration, and the reason the "expired" half
+# needs no answer from X-4 at all.
+expq_submit "$expq_one_token" insurance lapsed "$(expq_at -2592000)"
+expq_lapsed_id="$(json "$WORKDIR/expq-lapsed.json" '["id"]')"
+
+# Just inside this deployment's horizon for an insurance certificate. With a lead time configured
+# this is a document that has *not* lapsed and is nonetheless due; with none it is one that lapsed a
+# day ago. Both are the same assertion about the same boundary.
+expq_submit "$expq_two_token" insurance inside "$(expq_at $((expq_lead - expq_margin)))"
+expq_inside_id="$(json "$WORKDIR/expq-inside.json" '["id"]')"
+
+# Just outside it, which must not be on the queue in either configuration.
+expq_submit "$expq_three_token" insurance outside "$(expq_at $((expq_lead + expq_margin)))"
+expq_outside_id="$(json "$WORKDIR/expq-outside.json" '["id"]')"
+
+# States no expiry at all: never on the queue, because NULL means the platform was never told.
+expq_submit "$expq_one_token" abn_evidence silent ""
+expq_silent_id="$(json "$WORKDIR/expq-silent.json" '["id"]')"
+
+# A retake: the superseded row lapsed last week and the current one does not lapse for years. Only
+# the current document of a kind is on the queue — `000201` is append-only and nothing can delete the
+# old row, so a queue that read every row would chase a renewal that has already happened, for ever.
+expq_submit "$expq_one_token" licence superseded "$(expq_at -604800)"
+expq_superseded_id="$(json "$WORKDIR/expq-superseded.json" '["id"]')"
+# A century out, rather than a decade: this is the one fixture whose absence depends on no lead
+# time being longer than the gap, and a licence horizon nobody would configure is cheaper than a
+# second variable to read.
+expq_submit "$expq_one_token" licence current "$(expq_at 3153600000)"
+expq_current_id="$(json "$WORKDIR/expq-current.json" '["id"]')"
+
+# --- who may read it -----------------------------------------------------------------------------
+
+status="$(curl -s -o "$WORKDIR/expq-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/admin/moderation/expiring-documents")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/expq-anon.json"; fail "the queue answered $status without a credential, want 401"; }
+
+status="$(admin_get "/v1/admin/moderation/expiring-documents" "$expq_one_token" expq-usertoken)"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/admin-expq-usertoken.json"; fail "a user token reached the queue and got $status, want 401"; }
+ok "the expiry queue is on the administrator credential alone — an anonymous caller and a mobile token are both refused"
+
+# --- the queue itself ----------------------------------------------------------------------------
+
+status="$(admin_get "/v1/admin/moderation/expiring-documents?limit=100" "$verif_sup_token" expq-page)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/admin-expq-page.json"; fail "a support administrator could not read the queue: $status"; }
+
+python3 - "$WORKDIR/admin-expq-page.json" "$expq_lapsed_id" "$expq_inside_id" "$expq_outside_id" \
+  "$expq_silent_id" "$expq_superseded_id" "$expq_current_id" "$expq_lead" \
+  <<'EXPQPAGE' || fail "the expiry queue does not surface the right documents"
+import json, sys
+page = json.load(open(sys.argv[1]))
+lapsed, inside, outside, silent, superseded, current = sys.argv[2:8]
+lead = int(sys.argv[8])
+
+rows = page.get("data")
+if rows is None:
+    print("data is null"); sys.exit(1)
+by_id = {r["document_id"]: r for r in rows}
+
+if lapsed not in by_id:
+    print("a document that lapsed a month ago is not on the queue"); sys.exit(1)
+if not by_id[lapsed]["expired"]:
+    print("the lapsed document does not read as expired"); sys.exit(1)
+
+if inside not in by_id:
+    print("a document inside this deployment's horizon is not on the queue"); sys.exit(1)
+if lead > 0 and by_id[inside]["expired"]:
+    print("a document that has not lapsed reads as expired, so the two halves of the queue "
+          "cannot be told apart"); sys.exit(1)
+
+for absent, why in ((outside, "beyond every configured horizon"),
+                    (silent, "stating no expiry at all"),
+                    (superseded, "superseded by a later submission of the same kind")):
+    if absent in by_id:
+        print("a document", why, "is on the queue"); sys.exit(1)
+if current in by_id:
+    print("the current licence is on the queue and does not lapse for ten years"); sys.exit(1)
+
+# Soonest first: the entry that has been out of date longest is at the top.
+dates = [r["expires_at"] for r in rows]
+if dates != sorted(dates):
+    print("the queue is not soonest first:", dates[:5]); sys.exit(1)
+
+# The horizons the query used, so an empty "expiring" half can be told from an unconfigured one.
+if page.get("lead_times") is None:
+    print("lead_times is null"); sys.exit(1)
+if lead > 0 and page["lead_times"].get("insurance") != lead:
+    print("lead_times[insurance] is", page["lead_times"].get("insurance"), "and the deployment "
+          "was configured with", lead); sys.exit(1)
+EXPQPAGE
+ok "expired documents and documents inside this deployment's horizon are both on the queue, soonest first — and one beyond it, one stating no expiry, and one superseded by a retake are on none of it"
+
+# The entry's shape: ten keys, nothing commercial, and no credential. A reviewer who wants to look
+# at the image opens SHIP-155's viewer, which writes an access entry; a URL here would make every
+# load of this queue an unlogged read of everybody's identity documents at once.
+python3 - "$WORKDIR/admin-expq-page.json" "$expq_lapsed_id" <<'EXPQSHAPE' || fail "the expiry queue entry shape is wrong"
+import json, sys
+page = json.load(open(sys.argv[1]))
+entry = next(r for r in page["data"] if r["document_id"] == sys.argv[2])
+allowed = {"document_id", "provider_id", "name", "email", "phone",
+           "verification_state", "kind", "expires_at", "expired", "submitted_at"}
+extra, missing = set(entry) - allowed, allowed - set(entry)
+if extra:
+    print("the entry carries", sorted(extra)); sys.exit(1)
+if missing:
+    print("the entry is missing", sorted(missing)); sys.exit(1)
+if entry["name"] != "Marisol Quintanilha":
+    print("the entry does not name the provider:", entry["name"]); sys.exit(1)
+if entry["kind"] != "insurance":
+    print("the entry does not name the document:", entry["kind"]); sys.exit(1)
+if entry["verification_state"] != "Pending":
+    print("the entry does not carry the provider's standing:", entry["verification_state"])
+    sys.exit(1)
+EXPQSHAPE
+ok "an entry names the provider, the document and their standing — ten keys, no shape to put a budget in, and no credential to the image"
+
+# --- paging, and that reading the queue writes nothing --------------------------------------------
+
+status="$(admin_get "/v1/admin/moderation/expiring-documents?limit=1" "$verif_mod_token" expq-first)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-expq-first.json"; fail "a page of one answered $status"; }
+expq_cursor="$(json "$WORKDIR/admin-expq-first.json" '["next_cursor"]')"
+[[ -n "$expq_cursor" ]] || { cat "$WORKDIR/admin-expq-first.json"; fail "a page of one carried no cursor and there is more than one document due"; }
+
+status="$(admin_get "/v1/admin/moderation/expiring-documents?limit=1&cursor=$expq_cursor" "$verif_mod_token" expq-second)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-expq-second.json"; fail "the second page answered $status"; }
+[[ "$(json "$WORKDIR/admin-expq-first.json" '["data"][0]["document_id"]')" \
+   != "$(json "$WORKDIR/admin-expq-second.json" '["data"][0]["document_id"]')" ]] \
+  || fail "the cursor returned the same document twice — a queue that repeats a row is one that skips another"
+
+status="$(admin_get "/v1/admin/moderation/expiring-documents?cursor=not-a-cursor" "$verif_mod_token" expq-badcursor)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/admin-expq-badcursor.json"; fail "a cursor this endpoint never issued answered $status, want 400"; }
+
+expq_audit_before="$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from audit_log;")"
+status="$(admin_get "/v1/admin/moderation/expiring-documents?limit=100" "$verif_sup_token" expq-again)"
+[[ "$status" == "200" ]] || fail "re-reading the queue answered $status"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from audit_log;")" == "$expq_audit_before" ]] \
+  || fail "reading the expiry queue wrote an audit entry — an entry per queue load buries the actions in the reads"
+ok "the queue pages without repeating a row, refuses a cursor it never issued, and writes nothing — unlike the evidence viewer one queue over, which hands over a credential"
+
+admin_clear_limits
+
+admin_clear_limits
+
+# ==========================================================================================
 # SHIP-164 — the dispute workflow: investigation, and the outcome that unfreezes the job.
 #
 # # What this section demonstrates that no Go test can

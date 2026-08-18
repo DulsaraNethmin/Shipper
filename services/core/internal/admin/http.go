@@ -69,6 +69,7 @@ type Handler struct {
 	suspensions   *Suspensions
 	verifications *Verifications
 	evidence      *Evidence
+	expiry        *ExpiryQueue
 	disputes      *DisputeWorkflow
 	pool          *pgxpool.Pool
 	log           *slog.Logger
@@ -128,6 +129,10 @@ type HandlerServices struct {
 	// console that can open somebody's licence must not thereby be able to decide their
 	// standing, and the reason it cannot is that they are two services taking two ports.
 	Evidence *Evidence
+
+	// Expiry is Docs/04 §5's seventh queue — provider documents that have lapsed or are
+	// about to (SHIP-159).
+	Expiry *ExpiryQueue
 
 	// DisputeWorkflow is Docs/04 §7's investigation and outcome stages (SHIP-164).
 	//
@@ -220,6 +225,13 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// where the cause is visible.
 		return nil, errors.New("admin: a handler needs the verification document viewer")
 	}
+	if s.Expiry == nil {
+		// SHIP-159. The same argument once more, and here it guards a queue of things running
+		// out: a nil discovered at the first request is a console reporting that nobody's
+		// paperwork is expiring, which is indistinguishable from a supply side whose paperwork
+		// is all current and silent for exactly as long as nobody checks.
+		return nil, errors.New("admin: a handler needs the document expiry queue")
+	}
 	if s.DisputeWorkflow == nil {
 		// SHIP-164. The same argument once more, and here it guards the endpoints that unfreeze
 		// a job: a nil discovered at the first request is a delivery frozen by a complaint with
@@ -242,6 +254,7 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		suspensions:   s.Suspensions,
 		verifications: s.Verifications,
 		evidence:      s.Evidence,
+		expiry:        s.Expiry,
 		disputes:      s.DisputeWorkflow,
 		pool:          pool,
 		log:           log,
@@ -3143,6 +3156,195 @@ func (h *Handler) VerificationEvidence() http.Handler {
 		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, ""))
 		return nil
 	})
+}
+
+// --- SHIP-159: Docs/04 §5's expiry queue ---------------------------------------------------------
+
+// expiringDocumentResponse is one current document that has lapsed or is about to.
+//
+// **No download URL and no object key.** This is a list of dates, not of images: a reviewer who
+// wants to look opens SHIP-155's viewer, which writes an access entry. A credential here would make
+// every load of this queue an unlogged read of everybody's identity documents at once.
+type expiringDocumentResponse struct {
+	DocumentID string `json:"document_id"`
+	ProviderID string `json:"provider_id"`
+
+	// Name is what the account holder is called (SHIP-30a). Empty for an account created before
+	// `000006` — a name cannot be backfilled, so the console shows the absence.
+	Name  string `json:"name"`
+	Email string `json:"email"`
+	Phone string `json:"phone"`
+
+	// VerificationState is where the provider stands, one of Docs/04 §4's five.
+	//
+	// Carried and **not** filtered on: a suspended provider's lapsed insurance is not worth
+	// chasing and a verified provider's is urgent, and which of the five deserves attention is a
+	// triage decision an administrator makes rather than one this platform makes for them.
+	VerificationState string `json:"verification_state"`
+
+	Kind string `json:"kind"`
+
+	// ExpiresAt is the date the document itself states, and Expired is whether it has passed.
+	//
+	// Both, rather than leaving the console to compare: the boundary is decided once for the
+	// whole page against the platform's clock, so a page cannot be rendered with the line moving
+	// through it. It is also the difference between the two halves of Docs/04 §5's queue — the
+	// expired ones and the expiring ones — in one field a client can group on.
+	ExpiresAt time.Time `json:"expires_at"`
+	Expired   bool      `json:"expired"`
+
+	SubmittedAt time.Time `json:"submitted_at"`
+}
+
+func expiringDocumentFrom(e ExpiringDocumentEntry) expiringDocumentResponse {
+	return expiringDocumentResponse{
+		DocumentID:        e.DocumentID.String(),
+		ProviderID:        e.ProviderID.String(),
+		Name:              e.Name,
+		Email:             e.Email,
+		Phone:             e.Phone,
+		VerificationState: e.VerificationState,
+		Kind:              e.Kind,
+		ExpiresAt:         e.ExpiresAt,
+		Expired:           e.Expired,
+		SubmittedAt:       e.SubmittedAt,
+	}
+}
+
+// ExpiringDocumentsQueue handles GET /v1/admin/moderation/expiring-documents (SHIP-159).
+//
+// Docs/04 §5's **seventh** queue — "expiring or expired provider verification records" — and the
+// last of the seven to be built. Under `/admin/moderation/` beside the delivery exceptions and the
+// post-award cancellations, on `moderation.read`, which permissions.go already names SHIP-159 for.
+//
+// # What the `lead_times` field is for, and why an empty page is ambiguous without it
+//
+// Docs/04 §3 gives "how often each must be renewed" to legal and insurance advisers (Track-X row
+// X-4) and it is unanswered. The lead time that makes a document *expiring* rather than merely
+// *expired* is therefore configuration with no default — and with none configured, the "expiring"
+// half of this queue is empty by construction.
+//
+// **That empty half means two different things and only one of them is a problem.** "Nothing is due"
+// and "nobody has configured a lead time for insurance certificates yet" render identically, and
+// only the second is a reason to go and ask legal. So the response says which horizons the platform
+// used, in seconds, keyed by document kind — a kind absent from that object has no configured lead
+// time and surfaces only once it has actually lapsed.
+//
+// # No filter, unlike the verification queue
+//
+// [VerificationQuery] requires a `state` because every provider has a record and "no state" would be
+// the whole supply side wearing a queue's name. This queue is already narrow: only current documents
+// that state an expiry and have reached their horizon. There is no unfiltered answer to refuse.
+func (h *Handler) ExpiringDocumentsQueue() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionModerationRead); err != nil {
+			return err
+		}
+
+		query, err := documentExpiryQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so that "is there another page" is answered by the rows
+		// rather than by a second COUNT — the same arrangement every other queue here uses.
+		query.Limit++
+
+		entries, err := h.expiry.Due(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(entries) == query.Limit {
+			last := entries[len(entries)-2]
+			next = pagination.Cursor{
+				timestamp(last.ExpiresAt),
+				last.DocumentID.String(),
+			}.Encode()
+			entries = entries[:len(entries)-1]
+		}
+
+		out := make([]expiringDocumentResponse, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, expiringDocumentFrom(e))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, expiringDocumentsPage{
+			Page:      pagination.NewPage(out, next),
+			LeadTimes: leadTimeSeconds(h.expiry.LeadTimes()),
+		})
+		return nil
+	})
+}
+
+// expiringDocumentsPage is the collection envelope with the horizons that produced it.
+//
+// The envelope is embedded rather than copied, so `data`, `next_cursor` and `has_more` keep the
+// shape Docs/10 §4.5 gives every collection and a client's paging code is unchanged. The extra field
+// is beside them because it describes the *query*, not an entry — repeating it on every row would be
+// the same fact once per document.
+type expiringDocumentsPage struct {
+	pagination.Page[expiringDocumentResponse]
+
+	// LeadTimes is how far ahead of its expiry each kind of document surfaces, in seconds.
+	//
+	// Seconds rather than a Go duration string, because `720h` is a Go spelling and a contract
+	// should not oblige a TypeScript console to parse one. Never null: an empty object is the
+	// honest report that no lead time is configured, and it is the shipping default.
+	LeadTimes map[string]int64 `json:"lead_times"`
+}
+
+// leadTimeSeconds renders the configured horizons for the wire.
+func leadTimeSeconds(lead map[string]time.Duration) map[string]int64 {
+	out := make(map[string]int64, len(lead))
+	for kind, ahead := range lead {
+		out[kind] = int64(ahead / time.Second)
+	}
+	return out
+}
+
+// documentExpiryQueryFrom reads the page parameters.
+func documentExpiryQueryFrom(r *http.Request) (DocumentExpiryQuery, error) {
+	values := r.URL.Query()
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return DocumentExpiryQuery{}, err
+	}
+
+	after, err := decodeDocumentExpiryCursor(values.Get("cursor"))
+	if err != nil {
+		return DocumentExpiryQuery{}, err
+	}
+
+	return DocumentExpiryQuery{Limit: limit, After: after}, nil
+}
+
+// decodeDocumentExpiryCursor reads the two fields the queue's ordering is total on.
+func decodeDocumentExpiryCursor(raw string) (DocumentExpiryCursor, error) {
+	if raw == "" {
+		return DocumentExpiryCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return DocumentExpiryCursor{}, err
+	}
+
+	expiresAt, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return DocumentExpiryCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	documentID, err := uuid.Parse(fields[1])
+	if err != nil {
+		return DocumentExpiryCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return DocumentExpiryCursor{ExpiresAt: expiresAt, DocumentID: documentID}, nil
 }
 
 // decideVerificationRequest is the body of POST /v1/admin/verifications/{id}/decision.

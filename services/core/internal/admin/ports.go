@@ -958,3 +958,59 @@ type EvidenceDocument struct {
 	URL       string
 	ExpiresAt time.Time
 }
+
+// --- SHIP-159: Docs/04 §5's expiry queue ---------------------------------------------------------
+
+// ExpiringDocuments is the verification documents that have lapsed or are about to.
+//
+// # Why this is a third port over the same domain rather than a method on one of the other two
+//
+// [ProviderVerifications] moves a *state* and [ProviderEvidence] hands over an *image*. This answers
+// a question about *dates* and needs neither capability — and that is the point rather than a
+// technicality: a queue that could mint a download URL while listing whose insurance has lapsed
+// would be an unlogged read of everybody's identity documents at once. SHIP-155's viewer writes an
+// access entry precisely because it hands over a credential; keeping the two apart is what lets this
+// one correctly write nothing.
+//
+// **The implementation is an adapter over `internal/profiles` rather than SQL in cmd/api**, on
+// [ProviderVerifications]' division: the statement touches one domain's tables plus `users`, so it
+// stays with the domain that owns the rows and what lives in the composition root is a translation.
+//
+// # The renewal cadence is not in this package and must not arrive in it
+//
+// Docs/04 §3 gives "how often each must be renewed" to legal and insurance advisers (Track-X row
+// X-4) and it is unanswered. The lead time that makes a document "expiring" rather than merely
+// "expired" is `internal/config`'s, with no default, and it is applied by the domain that owns the
+// table. A constant here would be this console enforcing a number nobody decided, in the package
+// furthest from where it could be reviewed.
+type ExpiringDocuments interface {
+	// DocumentsNearingExpiry returns one page of current documents at or past their horizon,
+	// soonest first.
+	//
+	// Soonest first because the queue's purpose is that something is running out: the entry at
+	// the top has been out of date longest. [ProviderVerifications.VerificationsAwaitingReview]
+	// orders oldest-first for the same reason and [Users.Search] newest-first for the opposite
+	// one.
+	//
+	// **Only the current document of a kind appears.** `000201` is append-only, so a
+	// re-photographed licence leaves a superseded row whose date has passed and which nothing can
+	// delete — putting it on a queue would ask an administrator to chase a renewal that has
+	// already happened, for ever. The domain's `DISTINCT ON` is where that is enforced.
+	//
+	// A document that states no expiry never appears, under any configuration. NULL means the
+	// platform was never told, which is not the same as "does not expire".
+	DocumentsNearingExpiry(ctx context.Context, r db.Runner, q DocumentExpiryQuery) ([]ExpiringDocumentEntry, error)
+
+	// ExpiryLeadTimes is the configured horizon per document kind, keyed by the kind's stored
+	// spelling, as a fresh map.
+	//
+	// On the port rather than passed to [NewExpiryQueue] as a value, because it is the same fact
+	// the query is answered with and two copies of it could disagree — the console would then
+	// report a horizon the queue had not used. A kind with no entry has no configured lead time
+	// and surfaces only once it has actually lapsed.
+	//
+	// It exists so a response can carry it: **an empty "expiring" half means "nothing is due" or
+	// "nobody has configured a lead time for that kind yet", and those are the same empty page and
+	// different facts.** Only one of them is a reason to go and ask legal for X-4's answer.
+	ExpiryLeadTimes() map[string]time.Duration
+}

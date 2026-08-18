@@ -144,6 +144,16 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		t.Fatalf("building the document viewer: %v", err)
 	}
 
+	// SHIP-159. The real `internal/profiles` reader again, over a **configured** lead time
+	// rather than an empty one: an empty map is the shipping default and would make every
+	// "expiring" assertion vacuous, and expiry_test.go is where both configurations are driven
+	// deliberately. The clock is the fixture's, because the boundary between expired and
+	// expiring is measured against it.
+	expiry, err := NewExpiryQueue(testExpiringDocuments(clk), pool)
+	if err != nil {
+		t.Fatalf("building the expiry queue: %v", err)
+	}
+
 	// SHIP-164. The real lifecycle adapter over the real guard, like enforcement above: the
 	// resolution moves a job out of `Disputed` through `jobs.Transition`, so a stub here would
 	// prove that `admin` writes an outcome and nothing about whether the job unfroze.
@@ -166,6 +176,7 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		Suspensions:   suspensions,
 		Verifications: verifications,
 		Evidence:      evidence,
+		Expiry:        expiry,
 
 		DisputeWorkflow: disputeWorkflow,
 	}

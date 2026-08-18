@@ -274,6 +274,18 @@ func (h *Handler) PresignDocumentUpload() http.Handler {
 type documentSubmission struct {
 	Kind      string `json:"kind"`
 	ObjectKey string `json:"object_key"`
+
+	// ExpiresAt is when the document lapses, and it is **optional** (SHIP-159).
+	//
+	// Optional rather than required for every kind, because Docs/04 §3's open question — which
+	// documents must be renewed and how often, Track-X row X-4 — is unanswered, and requiring a
+	// date would be the platform demanding an answer nobody has settled. An ABN extract does not
+	// lapse at all; an insurance certificate does, and the date is printed on it.
+	//
+	// It is stated here or it is never stated: `provider_verification_documents` is append-only,
+	// so a mistyped renewal date is corrected by re-photographing the document, which is a second
+	// row and which is what this table already says a correction is.
+	ExpiresAt *time.Time `json:"expires_at"`
 }
 
 // documentResponse is one submitted document.
@@ -297,6 +309,18 @@ type documentResponse struct {
 
 	SubmittedAt time.Time `json:"submitted_at"`
 
+	// ExpiresAt is when the document itself lapses, as stated at submission (SHIP-159).
+	//
+	// **Null is a distinct answer and is not the same as the field being absent from a client's
+	// model**: it means the platform was never told, which is why this is not `omitempty`. A
+	// provider whose insurance certificate carries no expiry here has not told the platform when
+	// it runs out, and their own screen is where they would find that out.
+	//
+	// Deliberately spelled differently from DownloadExpiresAt below. One is a fact about a
+	// document that lasts years; the other is a credential that lasts minutes, and a client that
+	// confused them would show somebody their licence expiring this afternoon.
+	ExpiresAt *time.Time `json:"expires_at"`
+
 	// DownloadURL is a freshly signed URL to the image, and DownloadExpiresAt is when it stops
 	// working.
 	//
@@ -315,12 +339,13 @@ func documentFrom(d Document) documentResponse {
 		ContentType:   d.ContentType,
 		ContentLength: d.ContentLength,
 		SubmittedAt:   d.SubmittedAt,
+		ExpiresAt:     d.ExpiresAt,
 	}
 }
 
 func documentLinkFrom(l DocumentLink) documentResponse {
 	out := documentFrom(l.Document)
-	expires := l.ExpiresAt
+	expires := l.URLExpiresAt
 	out.DownloadURL = l.URL
 	out.DownloadExpiresAt = &expires
 	return out
@@ -377,7 +402,8 @@ func (h *Handler) SubmitDocument() http.Handler {
 			return err
 		}
 
-		document, err := h.docs.Submit(r.Context(), pool, providerID, Kind(req.Kind), req.ObjectKey)
+		document, err := h.docs.Submit(
+			r.Context(), pool, providerID, Kind(req.Kind), req.ObjectKey, req.ExpiresAt)
 		if err != nil {
 			return apiError(err)
 		}

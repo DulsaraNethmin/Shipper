@@ -583,12 +583,92 @@ done
   || fail "ck_provider_verification_documents_kind accepts something other than exactly four kinds: $doc_accepted"
 ok "the database accepts Docs/04 §3's four documents and no fifth"
 
-# **No expiry column, deliberately.** Docs/04 §3 gives the renewal cadence to legal and insurance
-# advisers (Track-X row X-4) and says it "remains genuinely outside engineering's competence to
-# settle". SHIP-159 is the ticket that adds it, with that answer in front of it.
+# --- the expiry the document itself states (SHIP-159) -------------------------------------------
+#
+# **This replaces the tripwire that asserted the column's absence**, which SHIP-81b wrote to be
+# deleted by SHIP-159 — "the renewal cadence is X-4's, and SHIP-159 is the ticket". A check that
+# asserted an absence and was then merely removed would leave this file weaker than it was, so what
+# stands here now is the positive property the column has to have.
+#
+# The constraint that shapes the whole feature: `provider_verification_documents_no_update` refuses
+# every UPDATE, so **an expiry is stated at submission or it is never stated at all.** A provider
+# whose renewal date was mistyped re-photographs the document, which is a second row, which is what
+# this table already says a correction is.
+
+prof_expiry_nullable="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select is_nullable from information_schema.columns
+    where table_name = 'provider_verification_documents' and column_name = 'expires_at';")"
+[[ "$prof_expiry_nullable" == "YES" ]] \
+  || fail "provider_verification_documents.expires_at is '$prof_expiry_nullable', want a nullable column — NULL is 'the platform was never told', and NOT NULL would demand the renewal cadence X-4 has not answered"
+
+# A licence that lapses in 2027, stated on the way in and read back on the way out. The date is
+# fixed rather than derived from `date`, because what is being checked is that the value the
+# provider sent is the value the platform holds — not arithmetic.
+prof_submit_kind_expiring() {
+  local kind="$1" expires="$2" url
+  prof_submissions=$((prof_submissions + 1))
+
+  status="$(prof_post "$prof_provider_token" "verify-prof-exp-url-$kind-$prof_submissions-$$" \
+    '{"content_type":"image/jpeg","content_length":52}' \
+    "$WORKDIR/prof-exp-url-$kind.json" "/uploads")"
+  [[ "$status" == "200" ]] \
+    || { cat "$WORKDIR/prof-exp-url-$kind.json"; fail "minting a URL for the $kind expiry check answered $status"; }
+
+  prof_last_key="$(json "$WORKDIR/prof-exp-url-$kind.json" '["object_key"]')"
+  url="$(json "$WORKDIR/prof-exp-url-$kind.json" '["upload_url"]')"
+
+  put_status="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Content-Type: image/jpeg" \
+    --data-binary "@$WORKDIR/prof-doc.bin" "$url")"
+  [[ "$put_status" == "200" ]] || fail "uploading the $kind for the expiry check answered $put_status"
+
+  status="$(prof_post "$prof_provider_token" "verify-prof-exp-rec-$kind-$prof_submissions-$$" \
+    "{\"kind\":\"$kind\",\"object_key\":\"$prof_last_key\",\"expires_at\":\"$expires\"}" \
+    "$WORKDIR/prof-exp-$kind.json" "")"
+  [[ "$status" == "201" ]] \
+    || { cat "$WORKDIR/prof-exp-$kind.json"; fail "submitting the $kind with an expiry answered $status"; }
+}
+
+prof_submit_kind_expiring licence "2027-03-01T00:00:00Z"
+prof_expiring_id="$(json "$WORKDIR/prof-exp-licence.json" '["id"]')"
+
 [[ "$("$PSQL" "$DATABASE_URL" -tAc \
-      "select count(*) from information_schema.columns
-        where table_name = 'provider_verification_documents'
-          and (column_name like '%expir%' or column_name like '%renew%');")" == "0" ]] \
-  || fail "provider_verification_documents carries an expiry column, which X-4 has not answered"
-ok "and no expiry column was invented — the renewal cadence is X-4's, and SHIP-159 is the ticket"
+      "select expires_at at time zone 'UTC' from provider_verification_documents
+        where id = '$prof_expiring_id';")" == "2027-03-01 00:00:00" ]] \
+  || fail "the stated expiry did not reach the row"
+
+status="$(curl -s -o "$WORKDIR/prof-exp-read.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $prof_provider_token" \
+  "http://localhost:$VERIFY_PORT/v1/provider/verification/documents")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/prof-exp-read.json"; fail "reading the documents back answered $status"; }
+
+python3 - "$WORKDIR/prof-exp-read.json" "$prof_expiring_id" <<'PROFEXP' || fail "the provider's own read does not carry the expiry they stated"
+import json, sys
+docs = {d["id"]: d for d in json.load(open(sys.argv[1]))["data"]}
+stated = docs.get(sys.argv[2])
+if stated is None:
+    print("the submitted document is not on the provider's own list"); sys.exit(1)
+if stated.get("expires_at") != "2027-03-01T00:00:00Z":
+    print("expires_at reads", stated.get("expires_at")); sys.exit(1)
+# The credential's clock and the document's clock are two different facts, and a client that
+# confused them would show somebody their licence expiring this afternoon.
+if stated["expires_at"] == stated["download_expires_at"]:
+    print("the document's expiry and the URL's expiry are the same value"); sys.exit(1)
+if not any(d.get("expires_at") is None for d in docs.values()):
+    print("every document states an expiry, so 'null means never told' is not being exercised")
+    sys.exit(1)
+PROFEXP
+ok "a document states when it lapses, the platform records exactly that, and a document that states nothing records null"
+
+# The append-only trigger, from a database prompt rather than through the service — the layer that
+# is true of a `psql` session as well as of this API, and the reason the value travels on the
+# submission rather than through an endpoint of its own.
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+     "update provider_verification_documents set expires_at = timestamptz '2030-01-01 00:00:00Z'
+       where id = '$prof_expiring_id';" >/dev/null 2>&1; then
+  fail "an expiry was rewritten after the fact — the image an administrator reviewed would keep a date it did not have"
+fi
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+      "select expires_at at time zone 'UTC' from provider_verification_documents
+        where id = '$prof_expiring_id';")" == "2027-03-01 00:00:00" ]] \
+  || fail "the expiry moved despite the refusal"
+ok "and an expiry can only ever be written at INSERT — a mistyped renewal date is corrected by re-photographing the document, which is a second row"

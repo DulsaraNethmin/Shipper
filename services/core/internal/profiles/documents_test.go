@@ -161,7 +161,7 @@ func submitted(
 	key := upload(t, docs, pool, provider, 4096)
 	store.put(key, 4096)
 
-	document, err := docs.Submit(t.Context(), pool, provider, kind, key)
+	document, err := docs.Submit(t.Context(), pool, provider, kind, key, nil)
 	if err != nil {
 		t.Fatalf("submitting a %s for %s: %v", kind, provider, err)
 	}
@@ -369,7 +369,7 @@ func TestASubmittedDocumentRecordsWhatTheStoreReportedRatherThanWhatTheClientSai
 	key := upload(t, docs, pool, provider, 4096)
 	store.put(key, 5120)
 
-	document, err := docs.Submit(t.Context(), pool, provider, KindLicence, key)
+	document, err := docs.Submit(t.Context(), pool, provider, KindLicence, key, nil)
 	if err != nil {
 		t.Fatalf("submitting the licence: %v", err)
 	}
@@ -438,7 +438,7 @@ func TestADocumentIsNeverRecordedAgainstAnotherProvidersVerificationRecord(t *te
 
 	// Mallory holds Alice's key — a key is easy to pass on, which is exactly why prefixing it with
 	// its owner is a control and not a convenience — and submits it as her own insurance.
-	_, err := docs.Submit(t.Context(), pool, mallory, KindInsurance, alicesKey)
+	_, err := docs.Submit(t.Context(), pool, mallory, KindInsurance, alicesKey, nil)
 	if !errors.Is(err, ErrDocumentNotForThisProvider) {
 		t.Errorf("submitting another provider's object answered %v, want ErrDocumentNotForThisProvider", err)
 	}
@@ -477,7 +477,7 @@ func TestADocumentIsNeverRecordedAgainstAnotherProvidersVerificationRecord(t *te
 
 	// Alice can still submit her own document, so the refusal above is about ownership rather than
 	// about the object having been touched.
-	if _, err := docs.Submit(t.Context(), pool, alice, KindLicence, alicesKey); err != nil {
+	if _, err := docs.Submit(t.Context(), pool, alice, KindLicence, alicesKey, nil); err != nil {
 		t.Fatalf("alice could not submit her own document afterwards: %v", err)
 	}
 	if n := documentCount(t, pool, alice); n != 1 {
@@ -501,11 +501,11 @@ func TestOneObjectIsEvidenceForAtMostOneProvider(t *testing.T) {
 	key := upload(t, docs, pool, provider, 4096)
 	store.put(key, 4096)
 
-	if _, err := docs.Submit(t.Context(), pool, provider, KindLicence, key); err != nil {
+	if _, err := docs.Submit(t.Context(), pool, provider, KindLicence, key, nil); err != nil {
 		t.Fatalf("submitting the licence: %v", err)
 	}
 
-	_, err := docs.Submit(t.Context(), pool, provider, KindInsurance, key)
+	_, err := docs.Submit(t.Context(), pool, provider, KindInsurance, key, nil)
 	if !errors.Is(err, ErrDocumentAlreadyRecorded) {
 		t.Errorf("recording one object as two documents answered %v, want ErrDocumentAlreadyRecorded", err)
 	}
@@ -598,7 +598,7 @@ func TestADocumentIsReachableOnlyByAFreshSignedUrl(t *testing.T) {
 		t.Errorf("two reads produced the same URL %q — a stored credential is one nobody is "+
 			"watching the clock on", first[0].URL)
 	}
-	if got, want := first[0].ExpiresAt, testInstant.Add(testDocumentPolicy().DownloadTTL); !got.Equal(want) {
+	if got, want := first[0].URLExpiresAt, testInstant.Add(testDocumentPolicy().DownloadTTL); !got.Equal(want) {
 		t.Errorf("the download expires at %s, want %s", got, want)
 	}
 	if len(store.downloadsSigned) != 2 {
@@ -670,7 +670,7 @@ func TestAnObjectTheStoreDoesNotHoldIsNotRecorded(t *testing.T) {
 	key := upload(t, docs, pool, provider, 4096)
 
 	// The URL was issued and the PUT never happened, or failed halfway.
-	_, err := docs.Submit(t.Context(), pool, provider, KindLicence, key)
+	_, err := docs.Submit(t.Context(), pool, provider, KindLicence, key, nil)
 	if !errors.Is(err, ErrDocumentNotUploaded) {
 		t.Errorf("submitting an object the store does not hold answered %v, want ErrDocumentNotUploaded", err)
 	}
@@ -717,7 +717,7 @@ func TestAnObjectOutsideThePolicyIsNotRecorded(t *testing.T) {
 			store.held[key] = c.object
 			store.mu.Unlock()
 
-			_, err := docs.Submit(t.Context(), pool, provider, KindLicence, key)
+			_, err := docs.Submit(t.Context(), pool, provider, KindLicence, key, nil)
 			if !errors.Is(err, ErrDocumentRejected) {
 				t.Errorf("err = %v, want ErrDocumentRejected", err)
 			}
@@ -741,7 +741,7 @@ func TestAKindDocs04DoesNotHaveIsRefusedWithTheFieldNamed(t *testing.T) {
 	key := upload(t, docs, pool, provider, 4096)
 	store.put(key, 4096)
 
-	_, err := docs.Submit(t.Context(), pool, provider, Kind("passport"), key)
+	_, err := docs.Submit(t.Context(), pool, provider, Kind("passport"), key, nil)
 
 	var apiErr *httpx.Error
 	if !errors.As(err, &apiErr) {
@@ -782,39 +782,161 @@ func TestTheDocumentTrailIsAppendOnly(t *testing.T) {
 	}
 }
 
-// TestThereIsNoExpiryColumn.
+// TestTheExpiryColumnIsWritableOnlyAtInsert.
 //
-// Docs/04 §3 gives the renewal cadence to legal and insurance advisers — Track-X row X-4 — and says
-// it "remains genuinely outside engineering's competence to settle". SHIP-81b's *Done when* does not
-// mention expiry, so guessing one here would be the platform enforcing a number nobody decided.
+// **This replaces TestThereIsNoExpiryColumn, which SHIP-81b wrote to be deleted by this ticket.**
+// Its own doc comment said so — "whoever adds the column is the person who has X-4's answer in front
+// of them" — and deleting a test that asserted an absence leaves the file weaker than it was unless
+// something positive stands where it stood. This is that.
 //
-// **This test exists to be deleted by SHIP-159**, deliberately: whoever adds the column is the
-// person who has X-4's answer in front of them, and a failing test is where they will read why the
-// column was left out rather than forgotten.
-func TestThereIsNoExpiryColumn(t *testing.T) {
+// Three claims, and the second is the one that shapes the whole feature:
+//
+//  1. **The column exists and is nullable.** NULL means the platform was never told, which is not
+//     the same as "does not expire". Docs/04 §3's renewal cadence is Track-X row X-4 and is
+//     unanswered, so NOT NULL would be the platform requiring an answer nobody has settled.
+//  2. **It can only ever be written at INSERT.** `provider_verification_documents_no_update` refuses
+//     every UPDATE, so a correction is a second document rather than an edit — which is what
+//     `000201` already says a correction is, and which is why the value travels on
+//     [Documents.Submit] rather than through an endpoint of its own.
+//  3. **A stated expiry round-trips.** The value the provider sent is the value the reader gets
+//     back, in the same instant, which is what makes the queue's boundary meaningful at all.
+func TestTheExpiryColumnIsWritableOnlyAtInsert(t *testing.T) {
 	pool := pgtest.DB(t)
 
-	var columns []string
-	rows, err := pool.Query(t.Context(),
-		`SELECT column_name FROM information_schema.columns
-		  WHERE table_name = 'provider_verification_documents'
-		    AND (column_name LIKE '%expir%' OR column_name LIKE '%renew%')`)
+	var nullable string
+	if err := pool.QueryRow(t.Context(),
+		`SELECT is_nullable FROM information_schema.columns
+		  WHERE table_name = 'provider_verification_documents' AND column_name = 'expires_at'`,
+	).Scan(&nullable); err != nil {
+		t.Fatalf("provider_verification_documents has no expires_at column: %v\n"+
+			"SHIP-159 adds it in `000202`; Docs/04 §1 requires the record hold every "+
+			"\"review, evidence item, decision, and expiry date\"", err)
+	}
+	if nullable != "YES" {
+		t.Errorf("expires_at is %s-nullable. It must stay nullable: NULL is \"the platform was "+
+			"never told\", and NOT NULL would make every submission state a renewal date that "+
+			"Docs/04 §3 gives to X-4 and nobody has answered", nullable)
+	}
+
+	store := newFakeObjects()
+	docs := newTestDocuments(store)
+	provider := newProvider(t, pool, "documents-expiry-insert@example.com", "0415000159")
+
+	lapses := time.Date(2027, 3, 1, 0, 0, 0, 0, time.UTC)
+
+	key := upload(t, docs, pool, provider, 4096)
+	store.put(key, 4096)
+	document, err := docs.Submit(t.Context(), pool, provider, KindInsurance, key, &lapses)
 	if err != nil {
-		t.Fatalf("reading the table's columns: %v", err)
+		t.Fatalf("submitting a document with an expiry: %v", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var column string
-		if err := rows.Scan(&column); err != nil {
-			t.Fatalf("scanning a column name: %v", err)
+	if document.ExpiresAt == nil || !document.ExpiresAt.Equal(lapses) {
+		t.Fatalf("the recorded expiry is %v, want %s", document.ExpiresAt, lapses)
+	}
+
+	links, err := docs.For(t.Context(), pool, provider)
+	if err != nil {
+		t.Fatalf("reading the documents back: %v", err)
+	}
+	var read *time.Time
+	for _, link := range links {
+		if link.ID == document.ID {
+			read = link.ExpiresAt
 		}
-		columns = append(columns, column)
 	}
-	if len(columns) != 0 {
-		t.Errorf("provider_verification_documents carries %v. Docs/04 §3 gives the renewal cadence "+
-			"to X-4; SHIP-159 is the ticket that adds this, and deleting this test is part of it",
-			columns)
+	if read == nil || !read.Equal(lapses) {
+		t.Fatalf("the reader answered %v, want the stated %s", read, lapses)
 	}
+
+	// The append-only trigger, from the pool rather than through the domain — the layer that is
+	// true of a `psql` prompt as well as of this service.
+	if _, err := pool.Exec(t.Context(),
+		`UPDATE provider_verification_documents SET expires_at = $2 WHERE id = $1`,
+		document.ID, lapses.AddDate(1, 0, 0)); err == nil {
+		t.Error("an expiry was rewritten after the fact. The table is append-only, so a mistyped " +
+			"renewal date is corrected by re-photographing the document — an UPDATE would " +
+			"change what an administrator had already reviewed with nothing in the record to " +
+			"say so")
+	}
+}
+
+// TestADocumentWithNoStatedExpiryRecordsNone.
+//
+// The other half of the pair, and the one that keeps the platform out of X-4's way: leaving the
+// field out records NULL rather than a date the platform chose. An ABN extract does not lapse, and
+// nothing here computes `submitted_at + something` for the ones that do.
+func TestADocumentWithNoStatedExpiryRecordsNone(t *testing.T) {
+	pool := pgtest.DB(t)
+	store := newFakeObjects()
+	docs := newTestDocuments(store)
+	provider := newProvider(t, pool, "documents-expiry-none@example.com", "0415000160")
+
+	key := upload(t, docs, pool, provider, 4096)
+	store.put(key, 4096)
+	document, err := docs.Submit(t.Context(), pool, provider, KindABNEvidence, key, nil)
+	if err != nil {
+		t.Fatalf("submitting a document with no expiry: %v", err)
+	}
+	if document.ExpiresAt != nil {
+		t.Errorf("the platform recorded an expiry of %s for a document that stated none",
+			document.ExpiresAt)
+	}
+
+	var stored *time.Time
+	if err := pool.QueryRow(t.Context(),
+		`SELECT expires_at FROM provider_verification_documents WHERE id = $1`,
+		document.ID).Scan(&stored); err != nil {
+		t.Fatalf("reading the row back: %v", err)
+	}
+	if stored != nil {
+		t.Errorf("the column holds %s. A default or a computed expiry would be the renewal "+
+			"cadence Docs/04 §3 gives to legal and insurance advisers, invented in a migration",
+			stored)
+	}
+}
+
+// TestAnExpiryThatIsNotADateIsRefusedAndOneInThePastIsNot.
+//
+// The bound is on what a timestamp *is*, not on how long a document may last — see [checkExpiry].
+// **A date in the past is accepted deliberately**: Docs/04 §3 has an administrator refusing an image
+// that is "visibly expired", which means the platform has to be able to hold one long enough for
+// somebody to look at it, and it is exactly the row Docs/04 §5's queue exists to surface.
+func TestAnExpiryThatIsNotADateIsRefusedAndOneInThePastIsNot(t *testing.T) {
+	pool := pgtest.DB(t)
+	store := newFakeObjects()
+	docs := newTestDocuments(store)
+	provider := newProvider(t, pool, "documents-expiry-bounds@example.com", "0415000161")
+
+	uploaded := func(t *testing.T) string {
+		t.Helper()
+		key := upload(t, docs, pool, provider, 4096)
+		store.put(key, 4096)
+		return key
+	}
+
+	t.Run("the zero time is refused", func(t *testing.T) {
+		key := uploaded(t)
+		var zero time.Time
+		_, err := docs.Submit(t.Context(), pool, provider, KindLicence, key, &zero)
+
+		var apiErr *httpx.Error
+		if !errors.As(err, &apiErr) || !mentionsField(apiErr, "expires_at") {
+			t.Fatalf("err = %v, want a validation failure naming expires_at", err)
+		}
+	})
+
+	t.Run("a date in the past is recorded", func(t *testing.T) {
+		key := uploaded(t)
+		lapsed := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+
+		document, err := docs.Submit(t.Context(), pool, provider, KindRegistration, key, &lapsed)
+		if err != nil {
+			t.Fatalf("submitting a visibly expired document: %v", err)
+		}
+		if document.ExpiresAt == nil || !document.ExpiresAt.Equal(lapsed) {
+			t.Errorf("the recorded expiry is %v, want %s", document.ExpiresAt, lapsed)
+		}
+	})
 }
 
 // mentionsField reports whether an error contract failure names a field.

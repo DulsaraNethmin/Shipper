@@ -225,13 +225,13 @@ func (postgresStore) awaitingReview(ctx context.Context, r db.Runner, q QueueQue
 func (postgresStore) recordDocument(ctx context.Context, r db.Runner, d Document) (Document, error) {
 	const q = `
 		INSERT INTO provider_verification_documents
-			(id, provider_id, kind, object_key, content_type, content_length, etag)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+			(id, provider_id, kind, object_key, content_type, content_length, etag, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING submitted_at`
 
 	err := r.QueryRow(ctx, q,
 		d.ID, d.ProviderID, string(d.Kind), d.ObjectKey,
-		d.ContentType, d.ContentLength, d.ETag,
+		d.ContentType, d.ContentLength, d.ETag, d.ExpiresAt,
 	).Scan(&d.SubmittedAt)
 
 	if err != nil {
@@ -276,7 +276,8 @@ func alreadyRecorded(err error) error {
 // that grows with the platform. `internal/pagination` exists for the feeds where that is not true.
 func (postgresStore) documentsFor(ctx context.Context, r db.Runner, providerID uuid.UUID) ([]Document, error) {
 	const q = `
-		SELECT id, provider_id, kind, object_key, content_type, content_length, etag, submitted_at
+		SELECT id, provider_id, kind, object_key, content_type, content_length, etag,
+		       submitted_at, expires_at
 		FROM provider_verification_documents
 		WHERE provider_id = $1
 		ORDER BY kind, submitted_at DESC, id DESC`
@@ -291,7 +292,7 @@ func (postgresStore) documentsFor(ctx context.Context, r db.Runner, providerID u
 	for rows.Next() {
 		var d Document
 		if err := rows.Scan(&d.ID, &d.ProviderID, &d.Kind, &d.ObjectKey,
-			&d.ContentType, &d.ContentLength, &d.ETag, &d.SubmittedAt); err != nil {
+			&d.ContentType, &d.ContentLength, &d.ETag, &d.SubmittedAt, &d.ExpiresAt); err != nil {
 			return nil, fmt.Errorf("profiles: reading a document of %s: %w", providerID, err)
 		}
 		out = append(out, d)
@@ -324,4 +325,98 @@ func (postgresStore) isProvider(ctx context.Context, r db.Runner, id uuid.UUID) 
 		return false, fmt.Errorf("profiles: read the role of %s: %w", id, err)
 	}
 	return provider, nil
+}
+
+// documentsDue reads one page of the expiry queue, soonest first (SHIP-159).
+//
+// # `DISTINCT ON` first, then the horizon — and the order of those two is the whole query
+//
+// `000201` is append-only and the newest row of a kind is the current document, so the first thing
+// this has to do is reduce a provider's file to one row per kind. Filtering on `expires_at` *before*
+// that reduction would put superseded rows on the queue: a licence re-photographed with a later date
+// leaves behind a row whose date has passed, and nothing can ever delete it — so it would be an
+// entry asking an administrator to chase a renewal that has already happened, every time the queue
+// is opened, for ever.
+//
+// The `WHERE expires_at IS NOT NULL` predicate is applied *after* the reduction for the same reason
+// in reverse: a provider whose current licence states no expiry must not be pulled onto the queue by
+// an older submission that did.
+//
+// # The horizon arrives as two arrays rather than four parameters
+//
+// `unnest($1::text[], $2::timestamptz[])` pairs each kind with its own cutoff, computed in Go from
+// the injected clock and the configured lead time. Written as a join rather than as a `CASE`, so the
+// kinds the caller supplies are the kinds that can appear at all — a kind absent from the arrays is
+// absent from the answer, which is a property worth having if this list ever stops being all four.
+//
+// # Two joins, and neither can lose a row
+//
+// `fk_provider_verification_documents_verification` points at `provider_verifications`, which is
+// itself `ON DELETE RESTRICT` against `users`. So both joins are total, and an outer join would only
+// be insurance against foreign keys the schema does not permit to be violated.
+//
+// `name` is coalesced because `000006` made the column nullable deliberately — an account created
+// before it has none, a name cannot be backfilled, and the empty string is the honest report.
+//
+// # The cursor compares the row rather than the columns
+//
+// `(c.expires_at, c.id) > ($4, $5)` is a row comparison, which is what makes the ordering total: an
+// expiry date is printed on a document rather than generated, so two lapsing on the same day is the
+// ordinary case and a single-column cursor would either skip a row or repeat one. A skipped row here
+// is a provider whose lapsed insurance nobody chased.
+//
+// A NULL rather than a zero time for the first page: `> (NULL, …)` is NULL rather than true, so the
+// predicate is skipped rather than satisfied. Passing the zero time would work today and would stop
+// working the first time somebody backdated a fixture.
+func (postgresStore) documentsDue(
+	ctx context.Context,
+	r db.Runner,
+	kinds []string,
+	horizons []time.Time,
+	q ExpiryQuery,
+) ([]ExpiringDocument, error) {
+
+	const query = `
+		WITH current AS (
+			SELECT DISTINCT ON (provider_id, kind)
+			       id, provider_id, kind, expires_at, submitted_at
+			FROM provider_verification_documents
+			ORDER BY provider_id, kind, submitted_at DESC, id DESC
+		)
+		SELECT c.id, c.provider_id, coalesce(u.name, ''), u.email, u.phone,
+		       v.state, c.kind, c.expires_at, c.submitted_at
+		FROM current c
+		JOIN unnest($1::text[], $2::timestamptz[]) AS h(kind, horizon) ON h.kind = c.kind
+		JOIN users u ON u.id = c.provider_id
+		JOIN provider_verifications v ON v.provider_id = c.provider_id
+		WHERE c.expires_at IS NOT NULL
+		  AND c.expires_at <= h.horizon
+		  AND ($3::timestamptz IS NULL OR (c.expires_at, c.id) > ($3, $4))
+		ORDER BY c.expires_at, c.id
+		LIMIT $5`
+
+	var after, afterID any
+	if !q.After.Zero() {
+		after, afterID = q.After.ExpiresAt, q.After.DocumentID
+	}
+
+	rows, err := r.Query(ctx, query, kinds, horizons, after, afterID, q.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("profiles: reading the document expiry queue: %w", err)
+	}
+	defer rows.Close()
+
+	out := []ExpiringDocument{}
+	for rows.Next() {
+		var d ExpiringDocument
+		if err := rows.Scan(&d.DocumentID, &d.ProviderID, &d.Name, &d.Email, &d.Phone,
+			&d.VerificationState, &d.Kind, &d.ExpiresAt, &d.SubmittedAt); err != nil {
+			return nil, fmt.Errorf("profiles: reading an expiry queue entry: %w", err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("profiles: reading the document expiry queue: %w", err)
+	}
+	return out, nil
 }

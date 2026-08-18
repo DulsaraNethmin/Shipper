@@ -152,7 +152,7 @@ func (e testEvidence) EvidenceFor(
 			ETag:          link.ETag,
 			SubmittedAt:   link.SubmittedAt,
 			URL:           link.URL,
-			ExpiresAt:     link.ExpiresAt,
+			ExpiresAt:     link.URLExpiresAt,
 		})
 	}
 	return out, true, nil
@@ -259,7 +259,7 @@ func (f *evidenceFixture) submit(t *testing.T, provider uuid.UUID, kind profiles
 		t.Fatalf("minting an upload URL for %s: %v", kind, err)
 	}
 
-	document, err := f.documents.Submit(t.Context(), f.pool, provider, kind, upload.ObjectKey)
+	document, err := f.documents.Submit(t.Context(), f.pool, provider, kind, upload.ObjectKey, nil)
 	if err != nil {
 		t.Fatalf("submitting a %s: %v", kind, err)
 	}

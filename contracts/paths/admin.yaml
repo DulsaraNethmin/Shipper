@@ -3856,6 +3856,113 @@ AdminVerifications:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+AdminExpiringDocuments:
+  get:
+    operationId: adminExpiringDocuments
+    summary: Provider verification documents that have lapsed or are about to
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/04 §5's **seventh** moderation queue — "expiring or expired provider verification
+      records" (SHIP-159). Soonest first, so the entry at the top has been out of date longest.
+
+      **Two numbers decide what is here and they come from different places.** When a document
+      lapses is a fact the provider stated when they submitted the image; how far *ahead* of that
+      date it is worth chasing is a policy, and it is server-side configuration with **no default**
+      because Docs/04 §3 gives the renewal cadence to legal and insurance advisers and it is
+      unanswered. With nothing configured for a kind, its horizon is *now* — so this queue reports
+      documents that have actually lapsed and not a day before. `lead_times` says which horizons the
+      answer was computed with, so an empty "expiring" half can be told from an unconfigured one.
+
+      **Only the current document of a kind appears.** The document table is append-only, so a
+      re-photographed licence leaves a superseded row whose date has passed and which nothing can
+      delete; putting it here would be asking somebody to chase a renewal that has already happened.
+      A document that states no expiry never appears at all — that is "the platform was never told",
+      which is not the same as "does not expire".
+
+      **No image and no credential.** This is a list of dates. A reviewer who wants to look opens
+      `GET /v1/admin/verifications/{id}/documents`, which records who looked.
+    parameters:
+      - name: limit
+        in: query
+        required: false
+        description: How many entries to return.
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 20
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of documents at or past their horizon, soonest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ExpiringDocumentsPage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `moderation.read`
+          (`admin_permission_denied`). Every role holds it: reading a queue is what the
+          least-privileged role exists to be able to do.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          `limit` was outside the accepted range (`validation_failed`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 AdminVerificationEvidence:
   get:
     operationId: adminVerificationEvidence
@@ -4123,6 +4230,122 @@ AdminVerificationDecision:
           application/json:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
+
+ExpiringDocumentsPage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more, lead_times]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5), plus the horizons the answer was computed
+    with. `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/ExpiringDocument'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page. Absent when this is the last one.
+      example: MjAyNi0wNi0xMFQwODowMDowMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like.
+      example: false
+    lead_times:
+      type: object
+      additionalProperties:
+        type: integer
+        format: int64
+      description: |
+        How far ahead of its expiry each kind of document surfaces, in seconds, keyed by document
+        kind. **A kind that is absent has no configured lead time and surfaces only once it has
+        actually lapsed** — which is different from a lead time of zero, and the difference is
+        whether anybody has decided.
+
+        Here because an empty "expiring" half is ambiguous without it: "nothing is due" and "nobody
+        has configured a horizon for insurance certificates yet" render identically, and only the
+        second is a reason to go and ask. Always present; an empty object is the honest report that
+        nothing is configured, and it is the shipping default while Docs/04 §3's renewal cadence
+        remains unanswered.
+
+        Seconds rather than a duration string, so a console does not have to parse `720h`.
+      example:
+        insurance: 2592000
+
+ExpiringDocument:
+  type: object
+  additionalProperties: false
+  required: [document_id, provider_id, name, email, phone, verification_state, kind, expires_at, expired, submitted_at]
+  description: |
+    One current verification document at or past its horizon.
+
+    **No image, no download URL and no object key.** This is a list of dates; opening the image is
+    `GET /v1/admin/verifications/{id}/documents`, which records who looked. A credential here would
+    make every load of this queue an unlogged read of everybody's identity documents at once.
+
+    **Nothing commercial, and there is nowhere in this shape to put any** (Docs/01 §4.3).
+  properties:
+    document_id:
+      type: string
+      format: uuid
+      description: The document record. It is the queue's tie-break and part of the cursor.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    provider_id:
+      type: string
+      format: uuid
+      description: |
+        The provider's account identifier — the value to put in the document viewer's path, and the
+        one the verification decision endpoint takes.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    name:
+      type: string
+      description: |
+        What the account holder is called (SHIP-30a). **Empty for an account created before
+        `000006`** — a name cannot be backfilled.
+      example: Hana Osei
+    email:
+      type: string
+      format: email
+      example: hana@acme.example
+    phone:
+      type: string
+      description: E.164, as the account holds it.
+      example: '+61400111222'
+    verification_state:
+      type: string
+      enum: [Pending, Verified, Restricted, Rejected, Suspended]
+      description: |
+        Where the provider stands today (Docs/04 §4). **Carried and not filtered on**: a suspended
+        provider's lapsed insurance is not worth chasing and a verified provider's is urgent, and
+        which of the five deserves attention is a triage decision an administrator makes.
+      example: Verified
+    kind:
+      type: string
+      enum: [licence, registration, insurance, abn_evidence]
+      description: Which of Docs/04 §3's four documents this is.
+      example: insurance
+    expires_at:
+      type: string
+      format: date-time
+      description: |
+        The date the document itself states. Never null on this queue — a document that states no
+        expiry never appears here.
+      example: '2026-07-01T00:00:00Z'
+    expired:
+      type: boolean
+      description: |
+        Whether that date has passed. **Decided by the platform against one instant for the whole
+        page**, rather than left to the client, so a page cannot be rendered with the line moving
+        through it — and it is what separates the two halves of Docs/04 §5's queue.
+      example: false
+    submitted_at:
+      type: string
+      format: date-time
+      description: When the platform recorded the document.
+      example: '2026-01-10T08:00:00Z'
 
 VerificationEvidencePage:
   type: object

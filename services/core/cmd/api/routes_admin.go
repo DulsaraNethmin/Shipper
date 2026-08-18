@@ -290,6 +290,34 @@ func init() {
 
 		Route{
 			Method:  http.MethodGet,
+			Pattern: "/admin/moderation/expiring-documents",
+			Group:   GroupV1,
+
+			// Docs/04 §5's **seventh** and last queue (SHIP-159) — "expiring or expired
+			// provider verification records" — beside the delivery exceptions and the
+			// post-award cancellations, which are §5's fourth and fifth.
+			//
+			// **Under /admin/moderation/ rather than under /admin/verifications/**, which is
+			// where the ticket's neighbours might suggest it belongs. The two queues under this
+			// prefix are the precedent and `moderation.read` is the permission
+			// permissions.go already names SHIP-159 for; `/admin/verifications` is the review
+			// queue of *providers*, and this is a list of *documents* whose subject happens to
+			// be the same people. Putting it there would also have made it a literal sibling of
+			// the `{id}` slot the decision and the evidence viewer both use.
+			//
+			// RequireAdmin, and `moderation.read` inside the handler (SHIP-148). Every role
+			// holds it: reading a queue is what the least-privileged role exists to be able to
+			// do.
+			//
+			// **It writes nothing**, unlike the evidence viewer one queue over. This is dates
+			// and contact details, not images and not credentials — so it is under the rule
+			// admin.AuditActions states rather than the exception SHIP-155 argues for.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).ExpiringDocumentsQueue() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
 			Pattern: "/admin/notes",
 			Group:   GroupV1,
 
@@ -634,6 +662,18 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin verification document viewer: " + err.Error())
 	}
 
+	// SHIP-159. Docs/04 §5's seventh queue. The lead times come from `internal/config` with no
+	// default and are translated into this domain's own [profiles.Kind] here — the composition
+	// root, where both vocabularies are visible — because configuration is infrastructure and may
+	// not import a domain (SHIP-15c). `profiles.NewExpiry` refuses a kind the platform does not
+	// have, which is what stops a typo in the variable becoming configuration that silently does
+	// nothing.
+	expiry, err := admin.NewExpiryQueue(
+		expiringDocuments{expiry: profiles.NewExpiry(d.Clock, verificationLeadTimes(d))}, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin document expiry queue: " + err.Error())
+	}
+
 	// SHIP-164. It takes the same lifecycle adapter intake and enforcement do — one
 	// `admin.Jobs` implementation with a method per move this domain needs — and the auditor
 	// built above, so the dispute row, the job's transition and the audit entry all share the
@@ -657,6 +697,7 @@ func adminHandler(d Deps) *admin.Handler {
 		Suspensions:   suspensions,
 		Verifications: verifications,
 		Evidence:      evidence,
+		Expiry:        expiry,
 
 		DisputeWorkflow: disputeWorkflow,
 	}, d.Pool, d.Logger)
@@ -971,6 +1012,7 @@ var (
 	_ admin.JobDirectory          = jobDirectory{}
 	_ admin.ProviderVerifications = providerVerifications{}
 	_ admin.ProviderEvidence      = providerEvidence{}
+	_ admin.ExpiringDocuments     = expiringDocuments{}
 )
 
 // exceptionQueueLookup implements admin.ExceptionQueue over `delivery`s and `jobs`' rows
@@ -1620,8 +1662,11 @@ func scanAdminJob(row interface{ Scan(...any) error }) (admin.JobRecord, error) 
 //     ErrNoSuchProvider and ErrAlreadyInState become an admin.VerificationMove with a nil error.
 //     Everything else stays an error, because a failing database is not an answer.
 //   - **the actor.** `profiles.Actor` distinguishes an administrator from the platform acting as
-//     itself, and `admin` supplies only the first — SHIP-159's expiry sweep is what will supply the
-//     second, from wherever it runs.
+//     itself, and `admin` supplies only the first. **This comment used to say SHIP-159's expiry
+//     sweep would supply the second, and SHIP-159 built no sweep** — deliberately: moving a
+//     provider to `Restricted` because a date passed would be the platform enforcing Docs/04 §3's
+//     renewal cadence, which is Track-X row X-4 and is unanswered. That ticket surfaces expiring
+//     documents on a queue and a person decides. Nothing supplies `ActorSystem` today.
 //
 // # Why the domain service is built here rather than shared with profilesHandler
 //
@@ -1795,8 +1840,110 @@ func (p providerEvidence) EvidenceFor(
 			ETag:          link.ETag,
 			SubmittedAt:   link.SubmittedAt,
 			URL:           link.URL,
-			ExpiresAt:     link.ExpiresAt,
+			ExpiresAt:     link.URLExpiresAt,
 		})
 	}
 	return out, true, nil
+}
+
+// --- SHIP-159: Docs/04 §5's expiry queue ---------------------------------------------------------
+
+// verificationLeadTimes turns the configured horizons into this domain's own vocabulary.
+//
+// `internal/config` keys them by string because it is infrastructure and may not import a domain
+// (SHIP-15c); `internal/profiles` keys them by [profiles.Kind] because that is the closed list held
+// to `ck_provider_verification_documents_kind` by a test in both directions. **This is the only
+// place in the build that knows the two correspond**, which is the same arrangement the verification
+// states are already under one function up.
+//
+// A kind the platform does not have is *not* dropped here. It is passed through and refused by
+// `profiles.NewExpiry`, which panics at startup naming the value — because a typo silently ignored
+// is configuration set in staging that changes nothing, and the obvious conclusion is that the
+// feature is broken rather than that the name was wrong.
+func verificationLeadTimes(d Deps) map[profiles.Kind]time.Duration {
+	out := make(map[profiles.Kind]time.Duration, len(d.Config.Verification.ExpiryLeadTimes))
+	for kind, ahead := range d.Config.Verification.ExpiryLeadTimes {
+		out[profiles.Kind(kind)] = ahead
+	}
+	return out
+}
+
+// expiringDocuments implements admin.ExpiringDocuments over `internal/profiles`.
+//
+// # It holds an expiry reader and no signer, which is the property the port exists for
+//
+// `profiles.Expiry` cannot mint a download URL — it takes neither of the two object-store ports —
+// so a console listing whose insurance has lapsed cannot thereby read anybody's insurance. The
+// viewer that can (SHIP-155) writes an access entry on every read; this queue correctly writes
+// nothing, and the reason those two facts are consistent is that they are two types.
+//
+// # The translation, and there are two of them
+//
+//   - **the shapes.** `profiles.ExpiringDocument` and `admin.ExpiringDocumentEntry` are two
+//     packages' own types and neither may name the other's. Go satisfies the interface structurally,
+//     so this file is the only thing in the build that knows they correspond.
+//   - **the vocabulary.** The document kind and the verification state are closed types in
+//     `profiles` and plain strings in `admin`, which is [providerVerifications]' division and the
+//     reason there is no copy of either list in the console.
+//
+// There is no refusal to translate. Everything this read can fail at is a failing database, and a
+// failing database is not an answer.
+type expiringDocuments struct {
+	expiry *profiles.Expiry
+}
+
+// DocumentsNearingExpiry is one page of current documents at or past their horizon, soonest first.
+//
+// The Runner is the caller's — a pool, because a queue is a read that owns no invariant and opens no
+// transaction (admin.ExpiryQueue.Due records why).
+func (e expiringDocuments) DocumentsNearingExpiry(
+	ctx context.Context,
+	r db.Runner,
+	q admin.DocumentExpiryQuery,
+) ([]admin.ExpiringDocumentEntry, error) {
+
+	found, err := e.expiry.Due(ctx, r, profiles.ExpiryQuery{
+		Limit: q.Limit,
+		After: profiles.ExpiryCursor{
+			ExpiresAt:  q.After.ExpiresAt,
+			DocumentID: q.After.DocumentID,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the document expiry queue: %w", err)
+	}
+
+	out := make([]admin.ExpiringDocumentEntry, 0, len(found))
+	for _, d := range found {
+		out = append(out, admin.ExpiringDocumentEntry{
+			DocumentID:        d.DocumentID,
+			ProviderID:        d.ProviderID,
+			Name:              d.Name,
+			Email:             d.Email,
+			Phone:             d.Phone,
+			VerificationState: string(d.VerificationState),
+			Kind:              string(d.Kind),
+			ExpiresAt:         d.ExpiresAt,
+			Expired:           d.Expired,
+			SubmittedAt:       d.SubmittedAt,
+		})
+	}
+	return out, nil
+}
+
+// ExpiryLeadTimes is the configured horizon per document kind, keyed by the stored spelling.
+//
+// Read back off the domain rather than off `Deps`, deliberately: it is the same map the query was
+// answered with, so the console cannot be shown a horizon the queue did not use. Two reads of
+// `internal/config` would be two copies of one fact that could disagree after a refactor, and the
+// disagreement would be invisible — a page of entries beside a legend that explains a different
+// page.
+func (e expiringDocuments) ExpiryLeadTimes() map[string]time.Duration {
+	held := e.expiry.LeadTimes()
+
+	out := make(map[string]time.Duration, len(held))
+	for kind, ahead := range held {
+		out[string(kind)] = ahead
+	}
+	return out
 }

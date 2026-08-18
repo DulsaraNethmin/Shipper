@@ -49,23 +49,68 @@ func (e Environment) valid() bool {
 
 // Config is the whole of the service's configuration.
 type Config struct {
-	Env         Environment
-	HTTP        HTTP
-	Log         Log
-	Database    Database
-	Redis       Redis
-	Kafka       Kafka
-	Idempotency Idempotency
-	Passwords   Passwords
-	Identity    Identity
-	Delivery    Delivery
-	Email       Email
-	SMS         SMS
-	Push        Push
-	Geocoding   Geocoding
-	Pagination  Pagination
-	Storage     Storage
-	App         App
+	Env          Environment
+	HTTP         HTTP
+	Log          Log
+	Database     Database
+	Redis        Redis
+	Kafka        Kafka
+	Idempotency  Idempotency
+	Passwords    Passwords
+	Identity     Identity
+	Delivery     Delivery
+	Email        Email
+	SMS          SMS
+	Push         Push
+	Geocoding    Geocoding
+	Pagination   Pagination
+	Storage      Storage
+	Verification Verification
+	App          App
+}
+
+// Verification configures Docs/04 §3's provider verification documents (SHIP-159).
+//
+// # One value, and it is deliberately allowed to be empty
+//
+// Docs/04 §3 states an open question and gives it to somebody else: "which documents are *legally*
+// required rather than merely prudent, and **how often each must be renewed**. Owner: legal and
+// insurance advisers… This determines expiry tracking (§5) and retention obligations, and remains
+// genuinely outside engineering's competence to settle." It is Track-X row X-4 and it is unanswered.
+//
+// §3 permits building before the answer arrives — "needed before pilot users are invited, not before
+// build begins" — so the constraint on this struct is not that it wait, but that **the platform must
+// not enforce a number nobody decided.** Hence: no default, and an empty map is a valid, shipping
+// configuration.
+//
+// # What is configuration here and what is not
+//
+// **When a document lapses is not configuration.** It is a fact stated at submission and held in
+// `provider_verification_documents.expires_at`, and a document that states none never appears on the
+// expiry queue at all. Nothing here computes an expiry from a submission date.
+//
+// **How far ahead of that date a document is worth chasing is.** With no lead time configured for a
+// kind, its horizon is *now* — so the queue reports documents that have actually lapsed and not a
+// day before. Setting a lead time moves that boundary earlier, and that number is the policy X-4
+// owns.
+//
+// This is `Docs/06` §5.3 applied to a value that has not been decided rather than to one that moves:
+// the reason it is server-side is the same, and the reason it has no default is that a default here
+// would be the platform answering a question it was asked not to.
+type Verification struct {
+	// ExpiryLeadTimes is how far ahead of its expiry a document of each kind is worth chasing,
+	// keyed by the kind's stored spelling — `licence`, `registration`, `insurance`,
+	// `abn_evidence`.
+	//
+	// **Keyed by string rather than by a document-kind type**, and that is forced rather than
+	// stylistic: `internal/config` is infrastructure and may not import a domain (SHIP-15c), so
+	// `profiles.Kind` cannot appear here. `cmd/api` translates, and `profiles.NewExpiry` refuses a
+	// kind the platform does not have — which is what stops a typo becoming configuration that
+	// silently does nothing.
+	//
+	// Empty by default. See the type's own note: that is X-4 being unanswered, not a value
+	// somebody forgot.
+	ExpiryLeadTimes map[string]time.Duration
 }
 
 // Storage configures the private object store that holds proof-of-delivery photographs and
@@ -814,6 +859,11 @@ func Load() (*Config, error) {
 			AcceptedContentTypes: l.csv("STORAGE_ACCEPTED_CONTENT_TYPES",
 				[]string{"image/jpeg", "image/png", "image/heic"}),
 		},
+		Verification: Verification{
+			// No default, and the nil map is the shipping configuration until X-4 is
+			// answered. See [Verification].
+			ExpiryLeadTimes: l.durations("VERIFICATION_EXPIRY_LEAD_TIMES", nil),
+		},
 		App: App{
 			MinimumIOSBuild:     l.positiveInt("MIN_SUPPORTED_IOS_BUILD", 1),
 			MinimumAndroidBuild: l.positiveInt("MIN_SUPPORTED_ANDROID_BUILD", 1),
@@ -888,6 +938,7 @@ func (c Config) LogValue() slog.Value {
 		slog.Bool("storage_path_style", c.Storage.UsePathStyle),
 		slog.Duration("storage_presign_ttl", c.Storage.PresignTTL),
 		slog.Duration("storage_download_ttl", c.Storage.DownloadTTL),
+		slog.Int("verification_expiry_lead_times", len(c.Verification.ExpiryLeadTimes)),
 		slog.Int64("storage_max_upload_bytes", c.Storage.MaxUploadBytes),
 	)
 }
@@ -1101,6 +1152,65 @@ func (l *loader) duration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// durations reads a set of named durations written as comma-separated `name=duration` pairs.
+//
+// `insurance=720h,registration=2160h`. One variable rather than one per name, on
+// [loader.signingKeys]' reasoning: the set of names is the domain's rather than this package's, and a
+// scheme that needs a new variable to add a name is a scheme somebody works around.
+//
+// **An empty value is not the same as an absent one.** Absent returns the default, which for the
+// only caller is nil. `VERIFICATION_EXPIRY_LEAD_TIMES=` — set and empty — returns an empty non-nil
+// map, so a deployment can state "no lead times, deliberately" and have it read back as a decision
+// rather than as a variable somebody forgot to set.
+//
+// The names are not validated here and cannot be: they belong to a domain this package may not
+// import (SHIP-15c). What is validated is the shape — a pair, a name, and a duration that is not
+// negative — because those are failures a startup message can name precisely and a domain's panic
+// cannot.
+//
+// A **zero** duration is accepted and a negative one is not. Zero is a horizon of "now", which is
+// the same as saying nothing and is a legitimate thing to write down explicitly. Negative is a
+// horizon in the past, which would hide documents that have already lapsed — a queue quietly
+// under-reporting is the failure that looks exactly like a quiet week.
+func (l *loader) durations(key string, def map[string]time.Duration) map[string]time.Duration {
+	v, ok := l.lookup(key)
+	if !ok {
+		return def
+	}
+
+	out := map[string]time.Duration{}
+	for _, pair := range strings.Split(v, ",") {
+		if pair = strings.TrimSpace(pair); pair == "" {
+			continue
+		}
+
+		name, raw, separated := strings.Cut(pair, "=")
+		name = strings.TrimSpace(name)
+		if !separated || name == "" {
+			l.errf("%s: %q is not a name=duration pair", key, pair)
+			continue
+		}
+		if _, repeated := out[name]; repeated {
+			l.errf("%s: %q is named twice, and which one applies would depend on the order",
+				key, name)
+			continue
+		}
+
+		d, err := time.ParseDuration(strings.TrimSpace(raw))
+		if err != nil {
+			l.errf("%s: %q is not a duration (try 720h)", key, name)
+			continue
+		}
+		if d < 0 {
+			l.errf("%s: %s is %s; a negative value would hide what has already lapsed",
+				key, name, d)
+			continue
+		}
+		out[name] = d
+	}
+	return out
 }
 
 func (l *loader) level(key string, def slog.Level) slog.Level {

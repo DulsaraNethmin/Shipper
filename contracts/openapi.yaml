@@ -200,6 +200,8 @@ paths:
     $ref: './paths/admin.yaml#/AdminCancellationQueue'
   /v1/admin/moderation/exceptions:
     $ref: './paths/admin.yaml#/AdminExceptionQueue'
+  /v1/admin/moderation/expiring-documents:
+    $ref: './paths/admin.yaml#/AdminExpiringDocuments'
   /v1/admin/notes:
     $ref: './paths/admin.yaml#/AdminNotes'
   /v1/admin/sessions:
