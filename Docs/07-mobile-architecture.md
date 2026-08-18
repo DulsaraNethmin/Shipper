@@ -26,7 +26,7 @@ lib/
   core/            networking, auth, storage, error handling, offline queue
   features/
     identity/      registration, sign-in, verification, role selection
-    profile/       customer and provider profiles
+    profile/       customer and provider profiles, and verification evidence
     fleet/         vehicles and eligibility
     jobs/          creation, publication, discovery, detail
     bidding/       bids, counter-offers, negotiation, award
@@ -38,6 +38,20 @@ lib/
 Rules that keep this from decaying:
 
 - Features do not import from one another. Shared behaviour moves to `core` or `shared`.
+- **The list above is closed, and `apps/mobile/test/architecture_test.dart` holds `lib/features` to
+  exactly it.** A folder that appeared is not a feature; a feature is a decision recorded here first.
+  This is the same arrangement `internal/boundaries` gives the Go side, where a new package under
+  `internal/` fails the lint until somebody classifies it.
+- **Verification evidence belongs to `profile/`, capture as well as display.** `Docs/04` §3.1 puts
+  the camera in the app and §3 puts the reviewing in the administrator's hands; the provider-facing
+  half of that is a profile concern and not an eighth feature. Decided rather than assumed, because
+  the alternative — a `verification/` feature — reads as the tidier answer right up until it
+  duplicates what `profile/` is already for.
+- **Reuse across features is what `core/` is for, and moving is the mechanism.** `ProofCamera`,
+  `ProofImagePolicy` and `ProofStore` were written inside `delivery/` for proof of delivery and are
+  wanted unchanged for verification capture, so they move to `core/` rather than being imported
+  across the boundary or copied. The precedent is `ProviderOnly`, moved to `core/auth/` by SHIP-100
+  for the same reason. **A second caller is the signal; the move is the answer.**
 - No business rule is authoritative on the device. The app may hide, disable, or pre-validate, but the platform decides. A client-side check is a convenience, never a control.
 - The API client is generated from or validated against the published API contract, so a breaking platform change fails at build time rather than in the field.
 

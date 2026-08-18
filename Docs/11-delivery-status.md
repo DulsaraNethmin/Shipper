@@ -18851,10 +18851,18 @@ post-fix file exits **1**.
 
 ### `Docs/09`'s SHIP-81b bundles a platform half and a client half, and closing it would close M3 falsely
 
-**This entry is a proposal, not a change. The rows below are not in `Docs/09`** — this branch was
-refused permission to edit that file and did not edit it, so `make status`, the milestone tables in
-§1 and §6's arithmetic all still read the unsplit backlog. **Do not cite SHIP-81c as though it
-exists.**
+**This entry was written as a proposal and the proposal has since been applied.** The lane that
+wrote it was refused permission to edit `Docs/09` and correctly did not work around the refusal; the
+wave-14 orchestrator, whose own permissions allowed it and who had the approval directly, made the
+edit. **`Docs/09` now carries both rows** — SHIP-81b narrowed to the clauses that were demonstrated,
+and SHIP-81c for `Docs/04` §3.1's capture experience — and `make status`, §1's totals and §6's
+arithmetic all read the **split** backlog at **232 tickets and 717 points**. The paragraphs below are
+kept in their original form because the reasoning is the record; only this note is new.
+
+**So SHIP-81c may be cited: it exists.** The sentence that used to stand here said the opposite, and
+it is exactly the failure shape §9 already names one entry above — *a finding correct when written,
+invalidated by the change that closed it, with nothing to detect it.* This is the second instance,
+found by re-measuring the claim rather than repeating it.
 
 **The hazard, stated first because it is the part with a deadline.** SHIP-81b's *Done when* opens *"A
 provider photographs each of `Docs/04` §3's four documents … **in the app**"* and then describes the
@@ -18921,13 +18929,21 @@ state is displayed here and decided nowhere near here."* **It is a 292-byte stub
 else.** So **a new `features/verification/` directory is probably the wrong answer** and
 `features/profile/` is probably the right one — but whether `Docs/07` §2's list gains an entry or
 `profile/` becomes the home is a document decision, **and `Docs/07` is not this branch's to edit.**
-Recorded as an owner decision, unresolved.
 
-**`Docs/09` is not this branch's to edit either, and this pass was refused permission to try.** The
-proposal above is complete enough to apply verbatim. **Until it is applied, §1's totals, §6's
-arithmetic and `make status` all describe the unsplit backlog and are correct about it** — this entry
-is the only place in the file that describes the split, and it says throughout that the split has not
-happened.
+**The owner took this decision at wave 15's opening, and took it the way the paragraph above
+predicted.** `Docs/07` §2's list does **not** gain an eighth entry: verification evidence capture
+lives in **`features/profile/`**, which is where §2 already assigns it and where the stub's own doc
+comment already says verification attaches. `Docs/07` §2 now records that explicitly so the next lane
+does not have to re-derive it from a stub comment.
+
+**The second half of the blocker was confirmed rather than dismissed.** `ProofCamera`,
+`ProofImagePolicy` and `ProofStore` do have to move from `features/delivery/` to `core/`, on
+`ProviderOnly`'s precedent — and that is §2's existing rule *"Features do not import from one
+another. Shared behaviour moves to `core` or `shared`"* being applied, not an exception to it. **The
+move is SHIP-81c's to make.**
+
+**SHIP-81c was not scheduled into wave 15.** The owner unblocked it and chose a two-lane wave without
+it. It is startable, not started, and it is the first row a client-side wave should take.
 
 ## 10. The done list, in a form a script can read
 
