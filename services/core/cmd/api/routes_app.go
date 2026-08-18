@@ -29,6 +29,7 @@ func init() {
 		Pattern: "/app/minimum-version",
 		Group:   GroupV1,
 		Auth:    Public,
+		Limit:   LimitPublicRead,
 		Handler: minimumVersionHandler,
 	})
 
@@ -40,6 +41,7 @@ func init() {
 		Pattern: "/app/policy",
 		Group:   GroupV1,
 		Auth:    Public,
+		Limit:   LimitPublicRead,
 		Handler: appPolicyHandler,
 	})
 }

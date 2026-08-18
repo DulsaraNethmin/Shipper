@@ -156,6 +156,54 @@ func (l *Limiter) Spend(ctx context.Context, key string, b Bucket) (Decision, er
 	return l.take(ctx, key, b, 1)
 }
 
+// Clear discards key's bucket, so the next caller finds the allowance full (SHIP-183a).
+//
+// # What it is for, and the one thing it must not be used on
+//
+// Docs/12 §6 decided that a successful sign-in clears the bucket its own failures filled. That
+// bounds the worst case of a lockout somebody else triggered: the victim needs one token to get
+// in rather than a full refill, so the wait falls from capacity × interval to interval.
+//
+// **It belongs on a bucket keyed by the thing that just proved itself, and nowhere near one keyed
+// by a network address.** Clearing an address bucket on success would hand a caller holding one
+// valid credential an unlimited supply of attempts against every *other* account from that
+// address — a reset lever on the control that exists to bound exactly that walk. The account
+// bucket is cleared; the address bucket is not.
+//
+// # Why deleting the key is the same as filling it
+//
+// bucketScript already deletes a key whose bucket is back at capacity, on the grounds that a full
+// bucket is indistinguishable from one that never existed. So this needs no separate "set to
+// capacity" path: absent *is* full, everywhere in this package.
+func (l *Limiter) Clear(ctx context.Context, key string) error {
+	if key == "" {
+		return errNoKey
+	}
+	if l.client == nil {
+		return ErrUnavailable
+	}
+
+	if err := l.client.Del(ctx, l.prefix+key).Err(); err != nil {
+		return fmt.Errorf("%w: %s: %w", ErrUnavailable, key, err)
+	}
+	return nil
+}
+
+// errNoKey is what every entry point reports when asked to count against nothing.
+//
+// A limit with no key counts every caller into one bucket, which is not a loose limit but a
+// different mechanism entirely — the first caller throttles everybody. It is a programming
+// mistake, so it is an error rather than a default.
+var errNoKey = errors.New("ratelimit: a limit needs a key to count against")
+
+// errNoLimit reports a bucket that describes nothing.
+//
+// A bucket with no capacity or no interval refuses everything or allows everything, depending on
+// which zero it is. Both are a programming mistake dressed as a limit.
+func errNoLimit(b Bucket) error {
+	return fmt.Errorf("ratelimit: bucket %+v describes no limit", b)
+}
+
 // bucketScript refills a bucket and, if it is not empty, charges the cost.
 //
 // One script rather than a read followed by a write, for the reason the idempotency store's claim
@@ -212,12 +260,10 @@ var bucketScript = redis.NewScript(`
 
 func (l *Limiter) take(ctx context.Context, key string, b Bucket, cost int) (Decision, error) {
 	if !b.Valid() {
-		// A bucket with no capacity or no interval refuses everything or allows everything,
-		// depending on which zero it is. Both are a programming mistake dressed as a limit.
-		return Decision{}, fmt.Errorf("ratelimit: bucket %+v describes no limit", b)
+		return Decision{}, errNoLimit(b)
 	}
 	if key == "" {
-		return Decision{}, errors.New("ratelimit: a limit needs a key to count against")
+		return Decision{}, errNoKey
 	}
 	if l.client == nil {
 		return Decision{}, ErrUnavailable

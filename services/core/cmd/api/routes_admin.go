@@ -62,6 +62,7 @@ func init() {
 			// and the administrative stages of Docs/04 §7 are a separate ticket behind a
 			// separate credential.
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).RaiseDispute() },
 		},
 
@@ -75,6 +76,7 @@ func init() {
 			// is that it is rate limited per account and per address, which is the property
 			// every entry on that list shares.
 			Auth:    Public,
+			Limit:   LimitCredential,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).SignIn() },
 		},
 
@@ -83,6 +85,7 @@ func init() {
 			Pattern: "/admin/sessions/current",
 			Group:   GroupV1,
 			Auth:    RequireAdmin,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).SignOut() },
 		},
 
@@ -91,6 +94,7 @@ func init() {
 			Pattern: "/admin/me",
 			Group:   GroupV1,
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).Me() },
 		},
 
@@ -103,6 +107,7 @@ func init() {
 			// Every role holds that permission: reading a queue is what the least-privileged
 			// role exists to be able to do.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).ExceptionQueue() },
 		},
 
@@ -117,6 +122,7 @@ func init() {
 			//
 			// RequireAdmin, and `moderation.read` inside the handler, like every other queue.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).CancellationQueue() },
 		},
 
@@ -134,6 +140,7 @@ func init() {
 			// endpoint by which a user reads another user, and this is not one arrived at
 			// through a different credential.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).SearchUsers() },
 		},
 
@@ -153,6 +160,7 @@ func init() {
 			// and putting it under /jobs would make the scope a property of the credential
 			// rather than of the path.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).SearchJobs() },
 		},
 
@@ -165,6 +173,7 @@ func init() {
 			// One shape carrying all three, because a console making three calls to draw one
 			// screen is three chances to show a job beside somebody else's bids.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).OpenJob() },
 		},
 
@@ -183,6 +192,7 @@ func init() {
 			// and `000003`s triggers refuse both from any connection. Entries are written by
 			// the actions that cause them, in the same transaction, never by a route.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).AuditTrail() },
 		},
 
@@ -205,6 +215,7 @@ func init() {
 			// `Cancelled` through the guarded transition and the row stays where it is
 			// (Docs/05 §3.1). A DELETE verb would describe the opposite of what happens.
 			Auth:    RequireAdmin,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).UnpublishJob() },
 		},
 
@@ -221,6 +232,7 @@ func init() {
 			// (SHIP-45) and the contact details are the account holder's. A PATCH would invite
 			// a body that grows keys.
 			Auth:    RequireAdmin,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).SetStanding() },
 		},
 
@@ -237,6 +249,7 @@ func init() {
 			// shapes and different statuses, and one endpoint that sometimes changed an
 			// account and sometimes filed a request is one a console has to branch inside.
 			Auth:    RequireAdmin,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).RequestSuspension() },
 		},
 
@@ -252,6 +265,7 @@ func init() {
 			// **Without this route the control does not work** — a review nobody can see is a
 			// review nobody approves.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).PendingSuspensions() },
 		},
 
@@ -267,6 +281,7 @@ func init() {
 			// is why the endpoint accepts no body at all: a two-person control whose second
 			// signature a client could name has one participant.
 			Auth:    RequireAdmin,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).ApproveSuspension() },
 		},
 
@@ -285,6 +300,7 @@ func init() {
 			// place the "never user-visible" rule has to hold. Two sub-resources under
 			// /admin/users/{id}/notes and /admin/jobs/{id}/notes would be two.
 			Auth:    RequireAdmin,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).AddNote() },
 		},
 
@@ -313,6 +329,7 @@ func init() {
 			// and contact details, not images and not credentials — so it is under the rule
 			// admin.AuditActions states rather than the exception SHIP-155 argues for.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).ExpiringDocumentsQueue() },
 		},
 
@@ -326,6 +343,7 @@ func init() {
 			// `notes.read`: notes never leave the console, so what needs distinguishing is
 			// who may add one.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).ReadNotes() },
 		},
 
@@ -349,6 +367,7 @@ func init() {
 			// a different resource wearing the same noun. routes_profiles.go's header settled
 			// that before either endpoint existed.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).VerificationQueue() },
 		},
 
@@ -380,6 +399,7 @@ func init() {
 			// decision describes — so a verb that reads as "edit these columns" would describe
 			// the opposite of what happens.
 			Auth:    RequireAdmin,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).DecideVerification() },
 		},
 
@@ -416,6 +436,7 @@ func init() {
 			// verification record per provider, `provider_verifications.provider_id` its
 			// primary key, and a provider's file addressed by the provider.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).VerificationEvidence() },
 		},
 
@@ -441,6 +462,7 @@ func init() {
 			// scoped to nothing — a different resource wearing the same noun, which is the
 			// line `GET /v1/admin/jobs` drew against `GET /v1/jobs`.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).DisputeQueue() },
 		},
 
@@ -458,6 +480,7 @@ func init() {
 			// over its life while never having two open at once, so a route keyed by the job
 			// could not name a settled one. `disputes.read` is the permission.
 			Auth:    RequireAdmin,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).OpenDispute() },
 		},
 
@@ -480,6 +503,7 @@ func init() {
 			// through the one guarded transition, so a verb that reads as "edit these
 			// columns" would describe something narrower than what happens.
 			Auth:    RequireAdmin,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).ResolveDispute() },
 		},
 
@@ -494,6 +518,7 @@ func init() {
 			// fifth class per permission — twelve permissions would be twelve classes, and
 			// guardsFor is finished.
 			Auth:    RequireAdmin,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return adminHandler(d).CreateAdministrator() },
 		},
 	)

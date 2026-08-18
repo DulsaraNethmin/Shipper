@@ -54,7 +54,7 @@ func withApp(deps Deps, app config.App) Deps {
 
 func routerWithApp(t *testing.T, app config.App) http.Handler {
 	t.Helper()
-	return newRouter(withApp(testDeps(), app), idempotency.NewMemoryStore(),
+	return newRouter(withApp(testDeps(), app), idempotency.NewMemoryStore(), testLimiter(),
 		testAuthenticator(), testDriverGuard(), testAdminGuard())
 }
 

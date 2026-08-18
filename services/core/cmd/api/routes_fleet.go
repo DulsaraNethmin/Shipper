@@ -83,6 +83,7 @@ func init() {
 			Pattern: "/fleet/profile",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).Profile() },
 		},
 		Route{
@@ -90,6 +91,7 @@ func init() {
 			Pattern: "/fleet/profile",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).Declare() },
 		},
 		Route{
@@ -97,6 +99,7 @@ func init() {
 			Pattern: "/fleet/vehicles",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).List() },
 		},
 		Route{
@@ -104,6 +107,7 @@ func init() {
 			Pattern: "/fleet/vehicles",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).Add() },
 		},
 		Route{
@@ -111,6 +115,7 @@ func init() {
 			Pattern: "/fleet/vehicles/{id}",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).Detail() },
 		},
 		Route{
@@ -118,6 +123,7 @@ func init() {
 			Pattern: "/fleet/vehicles/{id}",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).Update() },
 		},
 		Route{
@@ -125,6 +131,7 @@ func init() {
 			Pattern: "/fleet/vehicles/{id}/deactivate",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).Deactivate() },
 		},
 		Route{
@@ -132,6 +139,7 @@ func init() {
 			Pattern: "/fleet/vehicles/{id}/reactivate",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).Reactivate() },
 		},
 		Route{
@@ -139,6 +147,7 @@ func init() {
 			Pattern: "/fleet/jobs",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).OpenJobs() },
 		},
 		Route{
@@ -146,6 +155,7 @@ func init() {
 			Pattern: "/fleet/jobs/{id}",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return fleetHandler(d).ProviderJob() },
 		},
 	)

@@ -23,6 +23,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/logging"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/pagination"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 )
 
 // newRedisClient builds the Redis client from the configured URL.
@@ -167,6 +168,24 @@ func run() error {
 	// configuration error that will still be there after every restart, and a service that
 	// came up unable to verify any token would answer 401 to every authenticated request
 	// while reporting itself healthy.
+	// The token bucket behind the 74 subject-keyed routes (SHIP-183a), and the router's
+	// collaborator rather than a field on Deps for the same reason the store above is.
+	//
+	// It shares the `rl:v1:` prefix with the sign-in limiters that internal/identity and
+	// internal/admin build for themselves; the keys do not collide because these are namespaced
+	// by class and caller under `route:` and those under `signin:`. One prefix keeps every
+	// limiter's state findable with one SCAN, which is what an operator wants at three in the
+	// morning.
+	//
+	// It takes redisClient directly, including when that client points at a Redis nobody can
+	// reach: ratelimit.New normalises a nil client and every call then reports ErrUnavailable,
+	// which httpx.Limit turns into a 503. That is the fail-closed direction Docs/12 §4 chose,
+	// and it is why this does not silently degrade to an unlimited API during an outage.
+	routeLimiter, err := ratelimit.New(redisClient, "rl:v1:", deps.Clock)
+	if err != nil {
+		return err
+	}
+
 	authenticate, err := newAccessTokenAuthenticator(cfg.Identity, deps.Clock)
 	if err != nil {
 		return err
@@ -198,7 +217,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:    cfg.HTTP.Addr(),
-		Handler: newRouter(deps, idempotencyStore, authenticate, driverToken, adminSession),
+		Handler: newRouter(deps, idempotencyStore, routeLimiter, authenticate, driverToken, adminSession),
 
 		ReadTimeout:  cfg.HTTP.ReadTimeout,
 		WriteTimeout: cfg.HTTP.WriteTimeout,

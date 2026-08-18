@@ -51,6 +51,7 @@ func jobLiteralProbe() Route {
 		Pattern: "/jobs/{id}/segment-probe",
 		Group:   GroupV1,
 		Auth:    Public,
+		Limit:   LimitRead,
 		Handler: func(Deps) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_, _ = w.Write([]byte("probe:" + r.PathValue("id")))
@@ -79,7 +80,7 @@ func TestFourSegmentJobLiteralsCanBeRegistered(t *testing.T) {
 		}()
 
 		attachRoutes(mux, append(routes(), jobLiteralProbe()), GroupV1, testDeps(),
-			guardsFor(testDriverGuard(), testAdminGuard()))
+			guardsFor(testDriverGuard(), testAdminGuard()), testLimiter())
 	}()
 
 	// Registration succeeding is the criterion; routing to the right handler is what makes the

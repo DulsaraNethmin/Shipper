@@ -13,6 +13,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
 
 // The route manifest.
@@ -160,6 +161,14 @@ type Route struct {
 	// Auth is what the caller must present.
 	Auth Auth
 
+	// Limit is which rate-limit class serves the route (SHIP-183a).
+	//
+	// It has no default. [LimitUnset] is the zero value and register refuses it, so a route
+	// added without a class does not reach a mux — which is what makes `LimitUnlimited`
+	// something somebody decided rather than something nobody typed. Docs/12 §5 assigns
+	// every one of them and TestEveryRouteMatchesItsDocumentedClass holds the two together.
+	Limit LimitClass
+
 	// Handler builds the handler from the service's dependencies. It is a function rather
 	// than an http.Handler because routes are declared at init time, before anything has
 	// been constructed.
@@ -168,7 +177,7 @@ type Route struct {
 
 // String renders the route as the golden file records it.
 func (r Route) String() string {
-	return fmt.Sprintf("%-6s %-40s %-12s %s", r.Method, r.fullPath(), r.Auth, r.Group)
+	return fmt.Sprintf("%-6s %-40s %-12s %-12s %s", r.Method, r.fullPath(), r.Auth, r.Limit, r.Group)
 }
 
 func (r Route) fullPath() string {
@@ -209,6 +218,16 @@ func register(routes ...Route) {
 			panic(fmt.Sprintf("route %s %q must start with /", r.Method, r.Pattern))
 		case r.Handler == nil:
 			panic(fmt.Sprintf("route %s %q has no handler", r.Method, r.Pattern))
+		case r.Limit == LimitUnset:
+			// SHIP-183a's *Done when*: a route registered without a limit fails a gate
+			// rather than defaulting to unlimited. This is that gate. It is a panic at
+			// init rather than a test failure because the failure it prevents — a new
+			// endpoint quietly served with no bucket — is invisible in a diff, and a
+			// process that will not start is the loudest available version of it.
+			panic(fmt.Sprintf(
+				"route %s %q has no rate-limit class. Every route belongs to one; Docs/12 §5 "+
+					"assigns them and LimitUnlimited is a class you type rather than a default "+
+					"you fall into", r.Method, r.Pattern))
 		}
 		registry = append(registry, r)
 	}
@@ -270,8 +289,8 @@ type guards map[Auth]Guard
 // TestNoMutatingRouteIsPublic — a test that a route was *declared* correctly, not that the
 // declaration did anything. Reading it here is what turns the manifest from documentation into
 // the thing that decides.
-func attach(mux *http.ServeMux, group Group, deps Deps, g guards) {
-	attachRoutes(mux, routes(), group, deps, g)
+func attach(mux *http.ServeMux, group Group, deps Deps, g guards, limiter httpx.RateLimiter) {
+	attachRoutes(mux, routes(), group, deps, g, limiter)
 }
 
 // attachRoutes is attach over an explicit route list.
@@ -280,13 +299,48 @@ func attach(mux *http.ServeMux, group Group, deps Deps, g guards) {
 // alternative — registering a route from a _test.go init — would put it in the real registry for
 // every other test in this package, which breaks TestRouteTableMatchesGolden and
 // TestEveryRouteIsInTheContract, both of which compare the served surface with a committed file.
-func attachRoutes(mux *http.ServeMux, rs []Route, group Group, deps Deps, g guards) {
+func attachRoutes(mux *http.ServeMux, rs []Route, group Group, deps Deps, g guards, limiter httpx.RateLimiter) {
+	scale := limitScaleFrom(deps.Config)
+
 	for _, r := range rs {
 		if r.Group != group {
 			continue
 		}
 
 		handler := r.Handler(deps)
+
+		// The limiter is wrapped *before* the guard, which puts it *inside* the guard at
+		// request time, and that ordering is load-bearing (SHIP-183a).
+		//
+		// These classes key on the authenticated caller, and there is no caller until the
+		// guard has run. Outside it, every unauthenticated request would key on the same
+		// value and the first attacker to empty that bucket would refuse every anonymous
+		// request to every route in the class — a limiter converted into a denial of
+		// service. TestTheLimiterRunsInsideTheGuard holds this.
+		if r.Limit == LimitUnset {
+			// register already refuses this, so reaching it here means a Route literal
+			// went to a mux without passing through the registry — which is exactly what
+			// a test that builds its own routes does. Refusing in both places is what
+			// makes "nothing is served unlimited by accident" a property of the mux
+			// rather than of one code path into it.
+			panic(fmt.Sprintf(
+				"route %s %s has no rate-limit class, so attaching it would serve it "+
+					"unlimited. Every route belongs to a class — see Docs/12 §5",
+				r.Method, r.fullPath()))
+		}
+
+		if bucket, enforced := limitBucket(r.Limit, scale); enforced {
+			if limiter == nil {
+				// Same class of mistake, and the same answer, as an auth class with no
+				// middleware: a route declared limited and served unlimited is worse
+				// than a process that refuses to start.
+				panic(fmt.Sprintf(
+					"route %s %s is in the %s class and no limiter was supplied. Serving it "+
+						"would make it unlimited. Pass one to newRouter",
+					r.Method, r.fullPath(), r.Limit))
+			}
+			handler = httpx.Limit(limiter, bucket, limitKey(r.Limit))(handler)
+		}
 
 		if r.Auth != Public {
 			guard, enforced := g[r.Auth]

@@ -54,6 +54,7 @@ func init() {
 			// exactly the right pair: the provider is handed the link to forward, and the
 			// route that spends it is the third one below (SHIP-108).
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).AssignDriver() },
 		},
 		Route{
@@ -76,6 +77,7 @@ func init() {
 			// replaces the *link* and leaves the driver, the row and every milestone recorded
 			// against it exactly where they are.
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).ReissueDriverLink() },
 		},
 		Route{
@@ -90,6 +92,7 @@ func init() {
 			// accepted bid. When the driver's own milestone route arrives it will declare
 			// RequireDriverToken and sit under /driver, beside the read below.
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordMilestone() },
 		},
 		Route{
@@ -120,6 +123,7 @@ func init() {
 			// credential and no route in the manifest accepts one. The bytes go straight to
 			// the object store (Docs/06 §5.2), so there is no upload endpoint to declare.
 			Auth:    RequireUser,
+			Limit:   LimitUpload,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).PresignProofUpload() },
 		},
 		Route{
@@ -161,6 +165,7 @@ func init() {
 			// Service.ProofFor argues it, and SHIP-122 is where it gets revisited with a
 			// driver who can actually capture proof in front of it.
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).ProofOnJob() },
 		},
 		Route{
@@ -187,6 +192,7 @@ func init() {
 			// asks the database which of the two parties the caller is, and being neither
 			// answers exactly what a missing job answers.
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).DeliveryDetail() },
 		},
 		Route{
@@ -200,6 +206,7 @@ func init() {
 			// and no `job_status_history` row, so a timeline derived from the job's status —
 			// which is what SHIP-77 has to do today (Docs/11 §9) — cannot show either.
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).MilestonesOnJob() },
 		},
 		Route{
@@ -231,6 +238,7 @@ func init() {
 			// so a route declaring the class cannot skip it — see internal/delivery's
 			// driverauth.go for why that is the design rather than a convenience.
 			Auth:    RequireDriverToken,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).DriverJob() },
 		},
 		Route{
@@ -275,6 +283,7 @@ func init() {
 			// that writes into the evidence bucket. SHIP-122 then served that one too, and
 			// SHIP-147b removed what the asymmetry was about.
 			Auth:    RequireDriverToken,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).RecordDriverMilestone() },
 		},
 		Route{
@@ -308,6 +317,7 @@ func init() {
 			//
 			// No idempotency scope question arises, because a GET carries no key.
 			Auth:    RequireDriverToken,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).DriverMilestones() },
 		},
 		Route{
@@ -348,6 +358,7 @@ func init() {
 			// issued** — the middleware still replays before the guard runs, which is the
 			// mechanism the analysis is really about.
 			Auth:    RequireDriverToken,
+			Limit:   LimitUpload,
 			Handler: func(d Deps) http.Handler { return deliveryHandler(d).PresignDriverProofUpload() },
 		},
 	)

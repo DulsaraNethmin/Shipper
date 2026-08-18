@@ -97,14 +97,21 @@ const (
 
 // The two limits on administrator sign-in (SHIP-47's mechanism, this domain's figures).
 //
-// # Why the per-account figure is the same as identity's and the per-address one is not
+// # Both figures are identity's, and the second one changed at SHIP-183a
 //
 // Five failures per address in a burst is far past mistyping a password and far short of useful
-// guessing, and that reasoning is independent of who is signing in. The per-*network*-address
-// figure is not: `identity` sits above what a household, an office or a carrier's NAT looks like
-// when a group of people get their passwords wrong, and an administration console has a handful of
-// accounts. Twenty is generous for that and much tighter than thirty against somebody working
-// through a list.
+// guessing, and that reasoning is independent of who is signing in.
+//
+// **The per-network-address figure was twenty and is now thirty**, which is identity's. The
+// argument for the tighter number ran: an administration console has a handful of accounts, so
+// twenty is generous against somebody working through a list of them. Docs/12 §3 reviewed both
+// buckets across the whole surface and found that reasoning pointed the wrong way. The
+// per-*account* bucket is the anti-guessing control and is identical at five in both systems; the
+// address bucket exists to bound the list-walk, and **there are very few administrators to walk
+// through** — so the tighter figure buys almost nothing against the case it was chosen for. What
+// the administration console does have is an office sharing one address, which argues for the
+// looser figure rather than the tighter one, and a locked-out administrator is who the platform
+// needs during an incident.
 //
 // **`make verify` runs every request from 127.0.0.1**, so this bucket is shared across sections and
 // across concurrent worktrees. `scripts/verify/90-admin.sh` clears `rl:v1:admin-signin:*` at both
@@ -113,7 +120,7 @@ const (
 	signInAccountCapacity = 5
 	signInAccountInterval = 2 * time.Minute
 
-	signInAddressCapacity = 20
+	signInAddressCapacity = 30
 	signInAddressInterval = 20 * time.Second
 )
 
@@ -287,7 +294,30 @@ func (c *Credentials) SignIn(ctx context.Context, cmd SignInCommand) (Issued, Ad
 		}
 		return Issued{}, Administrator{}, err
 	}
+
+	c.clearAccount(ctx, buckets)
 	return issued, administrator, nil
+}
+
+// clearAccount returns the administrator's allowance after a sign-in that worked (SHIP-183a).
+//
+// Docs/12 §6's decision, applied here for the same reason it is applied in internal/identity and
+// with the same two constraints: the admission check stays in **front** of the password check, or
+// the 429/200 split becomes an oracle an attacker can guess against indefinitely; and only the
+// **account** bucket is cleared, never the address one, which exists to bound somebody working
+// through a list of administrators and would be reset by anybody holding one valid credential.
+//
+// identity.Service.clearSignInAccount carries the full argument and the arithmetic.
+//
+// A failure is logged rather than returned: the sign-in has already succeeded, and refusing an
+// administrator who presented the right password because Redis blinked is a worse answer than an
+// allowance that refills on its own.
+func (c *Credentials) clearAccount(ctx context.Context, limits signInLimits) {
+	if err := c.limiter.Clear(ctx, limits.accountKey); err != nil {
+		httpx.LoggerFrom(ctx).LogAttrs(ctx, slog.LevelWarn,
+			"a successful administrator sign-in could not clear its account rate limit",
+			slog.String("error", err.Error()))
+	}
 }
 
 // signIn is the body of a sign-in, inside the caller's transaction.

@@ -151,6 +151,7 @@ func init() {
 			Pattern: "/jobs/{id}/award",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Award() },
 		},
 		Route{
@@ -158,6 +159,7 @@ func init() {
 			Pattern: "/jobs/{id}/bids",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Place() },
 		},
 		Route{
@@ -165,6 +167,7 @@ func init() {
 			Pattern: "/jobs/{id}/bids/{bid_id}",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Revise() },
 		},
 		Route{
@@ -172,6 +175,7 @@ func init() {
 			Pattern: "/jobs/{id}/bids/{bid_id}/withdraw",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Withdraw() },
 		},
 		Route{
@@ -179,6 +183,7 @@ func init() {
 			Pattern: "/jobs/{id}/bids/{bid_id}/counter",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Counter() },
 		},
 		Route{
@@ -186,6 +191,7 @@ func init() {
 			Pattern: "/jobs/{id}/bids/{bid_id}/history",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).History() },
 		},
 		Route{
@@ -193,6 +199,7 @@ func init() {
 			Pattern: "/jobs/{id}/bids/{bid_id}/messages",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).SendMessage() },
 		},
 		Route{
@@ -200,6 +207,7 @@ func init() {
 			Pattern: "/jobs/{id}/bids/{bid_id}/messages",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Messages() },
 		},
 		Route{
@@ -207,6 +215,7 @@ func init() {
 			Pattern: "/fleet/bids",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Mine() },
 		},
 		Route{
@@ -273,6 +282,7 @@ func init() {
 			// the one endpoint in this domain where a competing provider could otherwise read
 			// every rival's price on a job in one request.
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return biddingHandler(d).Received() },
 		},
 	)

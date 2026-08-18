@@ -42,6 +42,7 @@ func init() {
 			Pattern: "/provider/verification",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return profilesHandler(d).Verification() },
 		},
 
@@ -62,6 +63,7 @@ func init() {
 			Pattern: "/provider/verification/documents/uploads",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitUpload,
 			Handler: func(d Deps) http.Handler { return profilesHandler(d).PresignDocumentUpload() },
 		},
 		Route{
@@ -69,6 +71,7 @@ func init() {
 			Pattern: "/provider/verification/documents",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return profilesHandler(d).SubmitDocument() },
 		},
 		Route{
@@ -76,6 +79,7 @@ func init() {
 			Pattern: "/provider/verification/documents",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return profilesHandler(d).ProviderDocuments() },
 		},
 	)

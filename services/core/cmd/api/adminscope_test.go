@@ -74,7 +74,7 @@ func signedInAdministrators(t *testing.T) twoAdministrators {
 	if err != nil {
 		t.Fatalf("building the administrator guard: %v", err)
 	}
-	router := newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(),
+	router := newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(),
 		testDriverGuard(), adminAuthn)
 
 	// The credentials service is built here rather than reached through the router because the
