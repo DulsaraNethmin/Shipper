@@ -171,12 +171,17 @@ ok "the push row is retired too, and its device token is untouched"
 
 # Two controls, because an assertion whose content is an absence passes when the consumer is broken.
 #
-# 0418x is the notifications range — 04180 is SHIP-134's, 81-notifier.sh takes 04181 and 04182, and
-# this file takes 04183. The second control is inserted with psql rather than registered, because
-# the address it needs is one the API refuses: `plausibleEmail` will not accept a pseudonym, which
-# is SHIP-171's own doing and is the point of the control.
+# 0418x is the notifications range and **this file takes 04185 and 04186, chosen by grep rather
+# than by reading the list**. 81-notifier.sh's header says it takes "04181 and 04182"; it takes
+# 04181 and **04183**, and 04182 is unused. Taking 04183 on that comment's word cost this section a
+# `409 identity_phone_taken` on a full harness run — so the prefixes below were measured with
+# `grep -rho '0418[0-9]\$\$' scripts/verify/*.sh`, which reports 04180, 04181 and 04183.
+#
+# The second control is inserted with psql rather than registered, because the address it needs is
+# one the API refuses: `plausibleEmail` will not accept a pseudonym, which is SHIP-171's own doing
+# and is the point of the control.
 status="$(post_json "verify-171b-live-$$" /v1/auth/register \
-  "{\"name\":\"Verify Live Provider\",\"email\":\"live-provider-$$@example.com\",\"phone\":\"04183$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
+  "{\"name\":\"Verify Live Provider\",\"email\":\"live-provider-$$@example.com\",\"phone\":\"04185$$\",\"password\":\"correct-horse-battery-staple\",\"role\":\"provider\"}" \
   "$WORKDIR/live-provider.json")"
 [[ "$status" == "201" ]] \
   || { cat "$WORKDIR/live-provider.json"; fail "could not register the live control provider: $status"; }
@@ -188,7 +193,7 @@ live_provider="$(json "$WORKDIR/live-provider.json" '["id"]')"
 # erased, so it must not.
 lookalike_provider="$("$PSQL" "$DATABASE_URL" -qtAc \
   "insert into users (id, email, phone, password_hash, role)
-   values (gen_random_uuid(), 'deleted:' || gen_random_uuid(), '04184$$', 'x', 'provider')
+   values (gen_random_uuid(), 'deleted:' || gen_random_uuid(), '04186$$', 'x', 'provider')
    returning id;" | tr -d ' ')"
 [[ -n "$lookalike_provider" ]] || fail "could not insert the pseudonym-shaped control account"
 ok "two controls exist: a live provider, and one whose address reads like a pseudonym but is not deleted"
