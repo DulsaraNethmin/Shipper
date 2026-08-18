@@ -356,6 +356,70 @@ func init() {
 		},
 
 		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/disputes",
+			Group:   GroupV1,
+
+			// Docs/04 §5's **sixth** queue (SHIP-164), and the endpoint `idx_disputes_open`
+			// was built for in `000800` and read by nothing for four waves. Without it an
+			// administrator cannot find a dispute at all: `GET /v1/admin/jobs` searches jobs
+			// and would need them to already know which job to look at, which is the question
+			// this queue answers.
+			//
+			// RequireAdmin is the credential; `disputes.read` is the permission, checked in
+			// the handler (SHIP-148). Every role holds it including `support` — looking is
+			// what the least-privileged role exists to be able to do, and deciding what is in
+			// the queue is a different permission on a different endpoint.
+			//
+			// Under /admin rather than /jobs, and not merely because the handler is admin's.
+			// `POST /v1/jobs/{id}/disputes` is a party raising one about their own delivery,
+			// scoped to the caller by construction; this is every dispute on the platform,
+			// scoped to nothing — a different resource wearing the same noun, which is the
+			// line `GET /v1/admin/jobs` drew against `GET /v1/jobs`.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).DisputeQueue() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/disputes/{id}",
+			Group:   GroupV1,
+
+			// Docs/04 §7's investigation read (SHIP-164): the complaint, the desired outcome
+			// and the evidence, which were reachable from nowhere. The rest of what §7 asks a
+			// reviewer to look at is already served — `GET /v1/admin/jobs/{id}` carries the
+			// listing, every bid and every transition (SHIP-152).
+			//
+			// **`{id}` is the dispute, not the job.** One job may accumulate several disputes
+			// over its life while never having two open at once, so a route keyed by the job
+			// could not name a settled one. `disputes.read` is the permission.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).OpenDispute() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
+			Pattern: "/admin/disputes/{id}/resolution",
+			Group:   GroupV1,
+
+			// Docs/04 §7's outcome stage (SHIP-164), and the act the ticket's *Done when* is
+			// about: a documented outcome that unfreezes the job. `disputes.resolve` is the
+			// permission, which `moderator` and `owner` hold and `support` does not — the
+			// same split `jobs.read` against `jobs.unpublish` makes.
+			//
+			// Five segments, which is safe: the four-segment collision SHIP-83a cleared was
+			// `GET /v1/jobs/{id}/<literal>`, this is a POST under /admin, and it has no
+			// literal sibling at its depth.
+			//
+			// A named sub-resource rather than PATCH on the dispute: recording an outcome
+			// writes three columns `ck_disputes_resolution` binds together *and* moves a job
+			// through the one guarded transition, so a verb that reads as "edit these
+			// columns" would describe something narrower than what happens.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).ResolveDispute() },
+		},
+
+		Route{
 			Method:  http.MethodPost,
 			Pattern: "/admin/administrators",
 			Group:   GroupV1,
@@ -523,6 +587,16 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin verification console: " + err.Error())
 	}
 
+	// SHIP-164. It takes the same lifecycle adapter intake and enforcement do — one
+	// `admin.Jobs` implementation with a method per move this domain needs — and the auditor
+	// built above, so the dispute row, the job's transition and the audit entry all share the
+	// clock and all commit together.
+	disputeWorkflow, err := admin.NewDisputeWorkflow(
+		disputeLifecycle{jobs: newJobService(d)}, auditor, d.Clock, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin dispute workflow: " + err.Error())
+	}
+
 	handler, err := admin.NewHandler(admin.HandlerServices{
 		Disputes:      svc,
 		Credentials:   creds,
@@ -535,6 +609,8 @@ func adminHandler(d Deps) *admin.Handler {
 		Notes:         notes,
 		Suspensions:   suspensions,
 		Verifications: verifications,
+
+		DisputeWorkflow: disputeWorkflow,
 	}, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())
@@ -660,6 +736,98 @@ func (l disputeLifecycle) Unpublish(
 		return admin.JobAlreadyRemoved, nil
 	case errors.Is(err, jobs.ErrTransitionNotPermitted):
 		return admin.JobNotRemovable, nil
+	default:
+		return admin.JobMoveUnrecognised, err
+	}
+}
+
+// ResolveAsCompleted runs Docs/02 §2's `Disputed → Completed` — "admin resolves dispute with
+// delivery accepted" — through the one guarded function, inside the caller's transaction (SHIP-164).
+//
+// # This and its sibling are what unfreeze a job, and there is nothing else that does
+//
+// `Docs/02` §3: "a dispute freezes automatic completion until an administrator resolves it". The
+// freeze is not a flag and there is no pause to lift — the job simply sits in `Disputed`, where the
+// 72-hour auto-complete (Docs/02 §6.1) has no row to run on. These two methods are the only
+// transitions out of it in the platform, and `admin.DisputeWorkflow` runs one of them in the same
+// transaction that records the outcome.
+//
+// # The actor is an administrator, like Unpublish and unlike MoveToDisputed
+//
+// `jobs.ActorAdmin`, so `job_status_history` records that the platform's staff resolved the dispute
+// rather than that a party did. The reason is **required** of that actor by
+// `ck_job_status_history_admin_reason` and by `Move.validate`, and `admin` refuses an empty one a
+// layer earlier so the failure names the field.
+//
+// # No new domain event, deliberately
+//
+// The transition emits `job.status_changed` inside this transaction, and
+// `notifications.StatusRules` already routes `Completed` and `Cancelled` to the job's customer and
+// its awarded provider — `rules.go` says so of this ticket by name. A `dispute.resolved` event would
+// be a second announcement of one state change, which is the failure those rules are written to
+// prevent, and it would need a routing rule in a package this change does not own. SHIP-160 recorded
+// the same finding for the same reason.
+//
+// RecordedAt is left zero, so jobs.Transition uses the platform's clock for both. Correct here: an
+// administrator is a person at a screen, online, and there is one clock for the act of resolving.
+func (l disputeLifecycle) ResolveAsCompleted(
+	ctx context.Context,
+	r db.Runner,
+	jobID, actorID uuid.UUID,
+	reason string,
+) (admin.JobMove, error) {
+	return l.resolve(ctx, r, jobID, actorID, jobs.StatusCompleted, reason)
+}
+
+// ResolveAsCancelled runs Docs/02 §2's `Disputed → Cancelled` — "admin resolves as cancelled/failed
+// delivery" — through the one guarded function, inside the caller's transaction (SHIP-164).
+//
+// See [disputeLifecycle.ResolveAsCompleted] for the reasoning both share.
+//
+// **It ends in the same status as [disputeLifecycle.Unpublish] and is not the same act.** Unpublish
+// removes a job nobody has committed to, from Draft, Open or Negotiating; this ends a delivery
+// somebody has committed to, from `Disputed`, after an administrator has read a complaint and made a
+// finding. Two audit actions, two reasons in `job_status_history`, and a trail that can tell a
+// policy removal from a resolved dispute — which one method serving both would have made impossible.
+func (l disputeLifecycle) ResolveAsCancelled(
+	ctx context.Context,
+	r db.Runner,
+	jobID, actorID uuid.UUID,
+	reason string,
+) (admin.JobMove, error) {
+	return l.resolve(ctx, r, jobID, actorID, jobs.StatusCancelled, reason)
+}
+
+// resolve is the transition and the translation both resolutions share.
+//
+// Unexported and taking a `jobs.Status`, which is exactly the shape `admin.Jobs` must not have — and
+// that is the point of the boundary rather than a hole in it. **The status is chosen here, in the
+// composition root, by a method whose name is the move**; the port above it has two methods and no
+// status parameter, so `internal/admin` cannot name a destination Docs/02 §2 does not offer. A
+// private helper on this side of the seam is a shared switch statement, not a widened contract.
+func (l disputeLifecycle) resolve(
+	ctx context.Context,
+	r db.Runner,
+	jobID, actorID uuid.UUID,
+	to jobs.Status,
+	reason string,
+) (admin.JobMove, error) {
+	_, err := l.jobs.Transition(ctx, r, jobs.Move{
+		JobID:  jobID,
+		To:     to,
+		Actor:  jobs.User(jobs.ActorAdmin, actorID),
+		Reason: reason,
+	})
+
+	switch {
+	case err == nil:
+		return admin.JobMoved, nil
+	case errors.Is(err, jobs.ErrJobNotFound):
+		return admin.JobNotFound, nil
+	case errors.Is(err, jobs.ErrAlreadyInStatus):
+		return admin.JobAlreadyResolved, nil
+	case errors.Is(err, jobs.ErrTransitionNotPermitted):
+		return admin.JobNotResolvable, nil
 	default:
 		return admin.JobMoveUnrecognised, err
 	}

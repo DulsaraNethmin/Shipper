@@ -3146,3 +3146,340 @@ status="$(verif_decide "$verif_first_token" "verify-adm154-usertoken-$$" "$verif
 ok "a provider cannot decide their own standing and a user token cannot reach the administrator's endpoint — one act, one credential, one route"
 
 admin_clear_limits
+
+# ==========================================================================================
+# SHIP-164 — the dispute workflow: investigation, and the outcome that unfreezes the job.
+#
+# # What this section demonstrates that no Go test can
+#
+# Three things, and each of them is a seam `internal/admin` cannot see from inside.
+#
+#   1. **The transition runs through cmd/api's real adapter.** `disputeLifecycle.resolve` is in
+#      package main, where no test has a database to reach; the Go suite exercises a *copy* of it.
+#      The adapter under test here is the one that ships.
+#   2. **The two credential systems stay apart.** A user token must not reach the console's dispute
+#      endpoints, and the complainant's own intake response must not acquire an administrator's
+#      outcome. Both are claims about two packages at once.
+#   3. **The freeze and the unfreeze are the same job row.** The SHIP-163 section above proved a
+#      dispute freezes it; this proves an outcome lets it move again, on the same fixtures.
+#
+# # The fixtures are the section's own, and the prefixes above are already taken
+#
+# 0419 is admin's, and 04190…04198 are spoken for (see the block at the head of this file). This
+# section reuses `dispute_customer_id` and `dispute_provider_id` rather than registering more, which
+# is what `dispute_delivered_job` was written to make cheap — every job below is a fresh delivery
+# between the same two accounts, and the assertions fence on job and dispute identifiers.
+
+ticket "SHIP-164  a dispute moves through investigation to a documented outcome that unfreezes the job"
+
+admin_clear_limits
+
+# A moderator and a support administrator of this section's own, for the reason the SHIP-153 section
+# gives: `disputes.read` and `disputes.resolve` split across those two roles is exactly what this
+# section is about, and a token borrowed from another section is one another section can revoke.
+res_mod_email="verify-admin-res-mod-$$@example.com"
+res_mod_id="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$res_mod_email', 'Verify Resolver', '$admin_fixture_hash', 'moderator')
+   returning id;")"
+[[ -n "$res_mod_id" ]] || fail "the resolving moderator could not be created"
+
+status="$(admin_signin "verify-adm164-modin-$$" "$res_mod_email" "$admin_password" res-mod)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-res-mod.json"; fail "the resolving moderator could not sign in ($status)"; }
+res_mod_token="$(json "$WORKDIR/admin-res-mod.json" '["token"]')"
+
+res_sup_email="verify-admin-res-sup-$$@example.com"
+"$PSQL" "$DATABASE_URL" -q -c \
+  "insert into admin_users (id, email, name, password_hash, role)
+   values (gen_random_uuid(), '$res_sup_email', 'Verify Reader', '$admin_fixture_hash', 'support');" >/dev/null \
+  || fail "the support administrator could not be created"
+status="$(admin_signin "verify-adm164-supin-$$" "$res_sup_email" "$admin_password" res-sup)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-res-sup.json"; fail "the support administrator could not sign in ($status)"; }
+res_sup_token="$(json "$WORKDIR/admin-res-sup.json" '["token"]')"
+
+# res_disputed <label> — a delivered job frozen by an open dispute.
+#
+# Raised through the endpoint rather than inserted, so the job is frozen the way a complainant
+# freezes it.
+#
+# **It prints `<dispute-id> <job-id>` and callers `read` both**, rather than leaving the job in a
+# global. Every call site is a command substitution, which is a subshell, so a variable this function
+# assigned would be lost the moment it returned — and under the runner's `set -u` the caller reading
+# it aborts the whole section rather than failing a check. That cost this section a run.
+res_disputed() {
+  local job occurred code
+  job="$(dispute_delivered_job "res-$1")"
+  occurred="$("$PSQL" "$DATABASE_URL" -tAc \
+    "select to_char((now() at time zone 'utc') - interval '3 hours', 'YYYY-MM-DD\"T\"HH24:MI:SS') || 'Z';")"
+  code="$(dispute_request "$dispute_customer_token" "verify-adm164-raise-$1-$$" "$job" \
+    "{\"category\":\"goods_damaged_or_missing\",\"description\":\"Two of the four crates arrived with the sides staved in.\",\"desired_outcome\":\"A record of the damage.\",\"occurred_at\":\"$occurred\",\"evidence\":[\"Photographed the crates at the depot\"]}" \
+    "res-$1")"
+  [[ "$code" == "201" ]] || { cat "$WORKDIR/dsp-res-$1.json"; fail "could not raise the dispute for $1: $code"; }
+  [[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$job';")" == "Disputed" ]] \
+    || fail "the fixture job for $1 is not frozen, so nothing below is testing what it claims"
+  printf '%s %s' "$(json "$WORKDIR/dsp-res-$1.json" '["id"]')" "$job"
+}
+
+# res_resolve <token> <key> <dispute-id> <body> <name> — one resolution, answering with its status.
+res_resolve() {
+  admin_post "/v1/admin/disputes/$3/resolution" "$1" "$2" "$4" "$5"
+}
+
+res_reason="Reviewed the proof of delivery and the messages between the parties before deciding."
+
+# --- the queue: an administrator cannot investigate a dispute they cannot find --------------------
+
+read -r res_first res_first_job <<< "$(res_disputed first)"
+
+status="$(curl -s -o "$WORKDIR/res-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/admin/disputes")"
+[[ "$status" == "401" ]] || { cat "$WORKDIR/res-anon.json"; fail "the dispute queue answered $status without a credential, want 401"; }
+
+status="$(admin_get "/v1/admin/disputes" "$dispute_customer_token" res-userq)"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/admin-res-userq.json"; fail "a user token reached the dispute queue and got $status, want 401"; }
+ok "the dispute queue is on the administrator credential alone — a mobile token cannot reach it, which is the two systems staying apart"
+
+status="$(admin_get "/v1/admin/disputes?limit=100" "$res_sup_token" res-queue)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-res-queue.json"; fail "a support administrator could not read the dispute queue: $status"; }
+
+# res_carries <name> <dispute-id> — how many times the page names that dispute.
+res_carries() {
+  python3 - "$WORKDIR/admin-$1.json" "$2" <<'PY'
+import json, sys
+page = json.load(open(sys.argv[1]))
+print(sum(1 for e in (page.get("data") or []) if e["id"] == sys.argv[2]))
+PY
+}
+
+[[ "$(res_carries res-queue "$res_first")" == "1" ]] \
+  || { cat "$WORKDIR/admin-res-queue.json"; fail "the open dispute is not on Docs 04 §5's sixth queue"; }
+ok "an open dispute appears on the queue with no state parameter — Docs 04 §5 names it 'open disputes', so that is what the default means"
+
+# The entry's key set, closed. A budget arrives on an administrative shape as a field somebody added,
+# and SHIP-83 established that a spelling-based guard misses one named anything at all.
+python3 - "$WORKDIR/admin-res-queue.json" "$res_first" <<'PY' || fail "the dispute queue entry shape is wrong"
+import json, sys
+page = json.load(open(sys.argv[1]))
+entry = next(e for e in page["data"] if e["id"] == sys.argv[2])
+allowed = {"id", "job_id", "complainant_id", "complainant_party", "category",
+           "occurred_at", "raised_at", "resolved_at", "outcome", "resolved_by"}
+extra, missing = set(entry) - allowed, allowed - set(entry)
+if extra:
+    print("the entry carries", sorted(extra)); sys.exit(1)
+if missing:
+    print("the entry is missing", sorted(missing)); sys.exit(1)
+if entry["complainant_party"] != "customer":
+    print("complainant_party is", entry["complainant_party"]); sys.exit(1)
+if entry["resolved_at"] or entry["outcome"] or entry["resolved_by"]:
+    print("an open dispute carries resolution fields:", entry); sys.exit(1)
+if "description" in entry or "evidence" in entry:
+    print("the queue carries the account; that is the detail endpoint's"); sys.exit(1)
+PY
+ok "a queue entry is ten keys, carries nothing commercial and no shape to put a budget in, and its resolution fields are empty while it is open"
+
+status="$(admin_get "/v1/admin/disputes?state=pending" "$res_mod_token" res-badstate)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/admin-res-badstate.json"; fail "a queue half that does not exist returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-res-badstate.json")" == *'"state"'* ]] \
+  || { cat "$WORKDIR/admin-res-badstate.json"; fail "the refusal does not name the field"; }
+ok "a state that is neither open nor resolved is refused rather than ignored — an ignored filter answers something that looks like an answer"
+
+# --- investigation: the complaint itself, which was reachable from nowhere ------------------------
+
+status="$(admin_get "/v1/admin/disputes/$res_first" "$res_sup_token" res-detail)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-res-detail.json"; fail "a support administrator could not open a dispute: $status"; }
+python3 - "$WORKDIR/admin-res-detail.json" <<'PY' || fail "the dispute detail shape is wrong"
+import json, sys
+d = json.load(open(sys.argv[1]))
+for want in ("description", "desired_outcome", "evidence"):
+    if want not in d:
+        print("the dispute does not carry", want); sys.exit(1)
+if d["description"] != "Two of the four crates arrived with the sides staved in.":
+    print("description is", d["description"]); sys.exit(1)
+if d["evidence"] != ["Photographed the crates at the depot"]:
+    print("evidence is", d["evidence"]); sys.exit(1)
+for forbidden in ("idempotency_key", "key"):
+    if forbidden in d:
+        print("the dispute carries", forbidden); sys.exit(1)
+PY
+ok "Docs 04 §7's investigation read: the account, the desired outcome and the evidence, and never the complainant's idempotency key"
+
+status="$(admin_get "/v1/admin/disputes/00000000-0000-7000-8000-000000000000" "$res_mod_token" res-nodispute)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/admin-res-nodispute.json"; fail "a dispute that does not exist returned $status, want 404"; }
+ok "a dispute that does not exist is a plain 404 — the caller is an administrator, and unlike intake nothing is being kept from them"
+
+# --- the permission split, and that a refused resolution changes nothing --------------------------
+
+status="$(res_resolve "$res_sup_token" "verify-adm164-sup-$$" "$res_first" \
+  "{\"outcome\":\"delivery_completed_as_agreed\",\"job_outcome\":\"completed\",\"reason\":\"$res_reason\"}" res-supres)"
+[[ "$status" == "403" ]] || { cat "$WORKDIR/admin-res-supres.json"; fail "a support administrator resolved a dispute and got $status, want 403"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$res_first_job';")" == "Disputed" ]] \
+  || fail "a refused resolution unfroze the job anyway"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc "select count(*) from disputes where id = '$res_first' and resolved_at is not null;")" == "0" ]] \
+  || fail "a refused resolution settled the dispute anyway"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc "select count(*) from audit_log where target_id = '$res_first_job' and action = 'dispute.resolved';")" == "0" ]] \
+  || fail "a refused resolution wrote an audit entry, in a table nothing can correct"
+ok "a support administrator may investigate a dispute and may not settle one — Docs 04 §9's least privilege as two permissions on two endpoints, and the refusal left three tables untouched"
+
+# --- the outcome, and the unfreeze this ticket's *Done when* is about ------------------------------
+
+status="$(res_resolve "$res_mod_token" "verify-adm164-badout-$$" "$res_first" \
+  "{\"outcome\":\"compensation_awarded\",\"job_outcome\":\"completed\",\"reason\":\"$res_reason\"}" res-badout)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/admin-res-badout.json"; fail "an outcome Docs 04 §7 does not list returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-res-badout.json")" == *'"outcome"'* ]] || fail "the refusal does not name the outcome field"
+
+status="$(res_resolve "$res_mod_token" "verify-adm164-badjob-$$" "$res_first" \
+  "{\"outcome\":\"failed_delivery_recorded\",\"job_outcome\":\"Disputed\",\"reason\":\"$res_reason\"}" res-badjob)"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/admin-res-badjob.json"; fail "a destination Docs 02 §2 does not offer returned $status, want 422"; }
+[[ "$(cat "$WORKDIR/admin-res-badjob.json")" == *'"job_outcome"'* ]] || fail "the refusal does not name the job_outcome field"
+ok "the two vocabularies are refused separately and each refusal names its own field — a console sending a good outcome with a bad destination is told which half is wrong"
+
+status="$(res_resolve "$res_mod_token" "verify-adm164-first-$$" "$res_first" \
+  "{\"outcome\":\"delivery_completed_as_agreed\",\"job_outcome\":\"completed\",\"reason\":\"$res_reason\"}" res-done)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-res-done.json"; fail "resolving a dispute returned $status, want 200"; }
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$res_first_job';")" == "Completed" ]] \
+  || fail "the job is still frozen after its dispute was resolved — the *Done when* is an outcome that unfreezes it"
+ok "the outcome unfroze the job: Disputed to Completed, through the one guarded transition (Docs 02 §2)"
+
+# The row, read rather than the answer the endpoint gave about itself. All three columns, because
+# ck_disputes_resolution binds them and a dispute with resolved_at alone is off idx_disputes_open
+# with nothing documented about it.
+res_row="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (resolved_at is not null) || '|' || outcome || '|' || (resolved_by = '$res_mod_id')
+     from disputes where id = '$res_first';")"
+[[ "$res_row" == "true|Delivery completed as agreed|true" ]] \
+  || fail "the stored resolution is '$res_row', want 'true|Delivery completed as agreed|true'"
+ok "the outcome is documented on the row in Docs 04 §7's own vocabulary, with the administrator who recorded it"
+
+# The reason is in both tables, and neither is redundant: job_status_history is what a customer's
+# support conversation reads and audit_log is what Docs 04 §9's controls read.
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from job_status_history
+    where job_id = '$res_first_job' and to_status = 'Completed'
+      and actor_type = 'admin' and reason = '$res_reason';")" == "1" ]] \
+  || fail "the administrator's reason is not on the job's status history"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from audit_log
+    where target_id = '$res_first_job' and target_type = 'job'
+      and action = 'dispute.resolved' and actor_id = '$res_mod_id'
+      and reason = '$res_reason'
+      and metadata->>'dispute_id' = '$res_first'
+      and metadata->>'outcome' = 'Delivery completed as agreed'
+      and metadata->>'job_outcome' = 'completed';")" == "1" ]] \
+  || fail "the audit entry does not carry the administrator, the dispute and both vocabularies"
+ok "the reason reached the job's history and the audit trail, and the entry names the job with the dispute and both vocabularies in its metadata"
+
+# The queue moved it. idx_disputes_open is partial on `resolved_at IS NULL`, so a queue reading the
+# whole table would have looked correct until the first resolution.
+status="$(admin_get "/v1/admin/disputes?state=open&limit=100" "$res_mod_token" res-openq)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-res-openq.json"; fail "the open queue returned $status"; }
+[[ "$(res_carries res-openq "$res_first")" == "0" ]] || fail "a resolved dispute is still on the open queue"
+status="$(admin_get "/v1/admin/disputes?state=resolved&limit=100" "$res_mod_token" res-resq)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-res-resq.json"; fail "the resolved queue returned $status"; }
+[[ "$(res_carries res-resq "$res_first")" == "1" ]] || fail "a resolved dispute is not on the resolved queue"
+ok "resolving moves the dispute between the two halves of the queue — the open one is a partial index, not a filter somebody remembered"
+
+# --- the events, fenced by id, because one broker serves every worktree ---------------------------
+#
+# No new aggregate and no new topic: the guarded transition emits `job.status_changed`, which
+# notifications.StatusRules already routes to the customer and the awarded provider on Completed and
+# Cancelled. This asserts the outbox row exists for *this* job — a count over the topic would see
+# every other worktree's run as readily as its own.
+
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from outbox
+    where aggregate_id = '$res_first_job' and event_type = 'job.status_changed'
+      and payload->>'to' = 'Completed';")" == "1" ]] \
+  || fail "resolving the dispute emitted no job.status_changed, so nothing notifies the parties"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from outbox where aggregate_id = '$res_first' or event_type like 'dispute.%';")" == "0" ]] \
+  || fail "a dispute-shaped event was emitted; SHIP-164 adds no fourth aggregate and no new topic"
+ok "the unfreeze rides the existing job.status_changed and emits nothing of its own — one state change, one announcement"
+
+# --- a second resolution, and a job that has moved on ---------------------------------------------
+
+status="$(res_resolve "$res_mod_token" "verify-adm164-twice-$$" "$res_first" \
+  "{\"outcome\":\"failed_delivery_recorded\",\"job_outcome\":\"cancelled\",\"reason\":\"$res_reason\"}" res-twice)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/admin-res-twice.json"; fail "a second resolution returned $status, want 409"; }
+[[ "$(json "$WORKDIR/admin-res-twice.json" '["error"]["code"]')" == "admin_dispute_already_resolved" ]] \
+  || { cat "$WORKDIR/admin-res-twice.json"; fail "the refusal does not carry admin_dispute_already_resolved"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select outcome from disputes where id = '$res_first';")" == "Delivery completed as agreed" ]] \
+  || fail "a refused second resolution overwrote the first administrator's finding"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$res_first_job';")" == "Completed" ]] \
+  || fail "a refused second resolution moved the job again"
+ok "a second resolution is refused and the first administrator's finding stands — on a queue two moderators are reading, that is the answer the second one gets"
+
+# --- the other destination, and that the two vocabularies are independent -------------------------
+#
+# `delivery_issue_acknowledged` on a job that nevertheless **completes** is the pairing a derivation
+# would refuse, and 000804's whole argument is that three of Docs 04 §7's five outcomes are equally
+# true of a delivery that completed and one that failed. A resolution deriving the destination from
+# the finding cannot record this at all.
+
+read -r res_second res_second_job <<< "$(res_disputed second)"
+
+status="$(res_resolve "$res_mod_token" "verify-adm164-orth-$$" "$res_second" \
+  "{\"outcome\":\"delivery_issue_acknowledged\",\"job_outcome\":\"completed\",\"reason\":\"Damage acknowledged; the parties are settling it between themselves.\"}" res-orth)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-res-orth.json"; fail "an acknowledged issue on a completed job returned $status, want 200"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select outcome || '|' || (select status from jobs where id = '$res_second_job') from disputes where id = '$res_second';")" \
+  == "Delivery issue acknowledged|Completed" ]] \
+  || fail "the outcome and the job's destination did not stay independent"
+ok "Docs 04 §7's finding and Docs 02 §2's destination are orthogonal — an acknowledged issue on a job the customer nonetheless accepts is a pairing a derived destination could not record"
+
+read -r res_third res_third_job <<< "$(res_disputed third)"
+
+status="$(res_resolve "$res_mod_token" "verify-adm164-cancel-$$" "$res_third" \
+  "{\"outcome\":\"failed_delivery_recorded\",\"job_outcome\":\"cancelled\",\"reason\":\"Two crates damaged beyond use; the provider accepts the delivery failed.\"}" res-cancel)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-res-cancel.json"; fail "resolving as cancelled returned $status, want 200"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$res_third_job';")" == "Cancelled" ]] \
+  || fail "the job did not move to Cancelled"
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc \
+  "select count(*) from outbox
+    where aggregate_id = '$res_third_job' and event_type = 'job.status_changed'
+      and payload->>'to' = 'Cancelled';")" == "1" ]] \
+  || fail "the cancellation emitted no job.status_changed"
+ok "both of Docs 02 §2's rows out of Disputed are reachable, each through its own method on the lifecycle port — and neither is the unpublish route, which cannot touch an awarded job at all"
+
+# --- a job that moved out from under its dispute ---------------------------------------------------
+#
+# The other half of the drift: SHIP-163's service.go warns of a job carrying an open dispute while
+# not being Disputed, and an administrator meeting it needs telling plainly rather than a 500.
+
+read -r res_fourth res_fourth_job <<< "$(res_disputed fourth)"
+
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -v job="$res_fourth_job" -v actor="$res_mod_id" \
+  >/dev/null <<'SQL'
+BEGIN;
+WITH written AS (
+    INSERT INTO job_status_history
+        (id, job_id, from_status, to_status, actor_type, actor_id, reason, actor_recorded_at)
+    VALUES (gen_random_uuid(), :'job', 'Disputed', 'Cancelled', 'admin', :'actor',
+            'Cancelled under a different dispute on the same delivery.', now())
+    RETURNING id
+)
+SELECT set_config('shipper.job_status_transition', (SELECT id::text FROM written), true);
+UPDATE jobs SET status = 'Cancelled' WHERE id = :'job';
+COMMIT;
+SQL
+
+status="$(res_resolve "$res_mod_token" "verify-adm164-moved-$$" "$res_fourth" \
+  "{\"outcome\":\"failed_delivery_recorded\",\"job_outcome\":\"cancelled\",\"reason\":\"$res_reason\"}" res-moved)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/admin-res-moved.json"; fail "resolving a job that had moved on returned $status, want 409"; }
+[[ "$(json "$WORKDIR/admin-res-moved.json" '["error"]["code"]')" == "admin_job_not_resolvable" ]] \
+  || { cat "$WORKDIR/admin-res-moved.json"; fail "the refusal does not carry admin_job_not_resolvable"; }
+[[ "$("$PSQL" "$DATABASE_URL" -qtAc "select count(*) from disputes where id = '$res_fourth' and resolved_at is not null;")" == "0" ]] \
+  || fail "the dispute was settled against a job that had already moved — the exact corrupt state service.go warns about"
+ok "a job that has moved out from under its dispute is a 409 a console can act on, and the refusal inside the transaction left the dispute open"
+
+# --- the complainant's own view is unchanged, which is the two shapes staying apart ---------------
+
+status="$(dispute_request "$dispute_customer_token" "verify-adm164-replay-$$" "$res_first_job" \
+  "{\"category\":\"goods_damaged_or_missing\",\"description\":\"x\",\"desired_outcome\":\"y\",\"occurred_at\":\"2026-01-01T00:00:00Z\"}" res-reraise)"
+[[ "$status" == "409" ]] || { cat "$WORKDIR/dsp-res-reraise.json"; fail "raising a dispute on a completed job returned $status, want 409"; }
+[[ "$(json "$WORKDIR/dsp-res-reraise.json" '["error"]["code"]')" == "admin_job_not_disputable" ]] \
+  || { cat "$WORKDIR/dsp-res-reraise.json"; fail "expected admin_job_not_disputable once the job has completed"; }
+ok "once the outcome has completed the job it can no longer be disputed — the guard refuses it, which is the freeze being genuinely lifted rather than a flag being cleared"
+
+admin_clear_limits

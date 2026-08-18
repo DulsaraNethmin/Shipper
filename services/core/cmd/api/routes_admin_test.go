@@ -83,6 +83,24 @@ var auditedAdminMutations = map[string]admin.AuditAction{
 	// Docs/01 §5.1 asks for audit logs of **privileged actions**. An entry per queue load would
 	// bury the decisions in the reads.
 	"POST /v1/admin/verifications/{id}/decision": admin.AuditActionVerificationDecided,
+
+	// SHIP-164. One action for all five of Docs/04 §7's outcomes, which is what this table's
+	// one-action-per-route rule requires and independently the right shape.
+	//
+	// **The entry names the job rather than the dispute**, so that a search for everything that
+	// happened to a job returns the resolution beside the unpublish and the notes; the dispute's
+	// identifier is in the metadata, along with **both** vocabularies — Docs/04 §7's outcome and
+	// Docs/02 §2's destination, which `000804` keeps orthogonal and which are two independent
+	// facts about one decision.
+	//
+	// `GET /v1/admin/disputes` and `GET /v1/admin/disputes/{id}` are not here and do not need to
+	// be: both are reads, and Docs/01 §5.1 asks for audit logs of **privileged actions**. An
+	// entry per queue load would bury the resolutions in the reads.
+	//
+	// `POST /v1/jobs/{id}/disputes` is still deliberately outside this table — see
+	// [administrativeMutation]. Intake is a party reporting a problem with their own delivery;
+	// this is an administrator deciding what happens to it.
+	"POST /v1/admin/disputes/{id}/resolution": admin.AuditActionDisputeResolved,
 }
 
 // administrativeMutation reports whether this route is a state change an administrator makes.

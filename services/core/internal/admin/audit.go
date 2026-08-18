@@ -273,6 +273,32 @@ const (
 	// joined by nothing but the provider identifier, and a reader of either should not have to
 	// find the other.
 	AuditActionVerificationDecided AuditAction = "verification.decided"
+
+	// AuditActionDisputeResolved is a dispute settled with a documented outcome, which is also
+	// what unfreezes the job (SHIP-164).
+	//
+	// **The target is the job rather than the dispute**, on [AuditActionNoteAdded]'s reading: a
+	// support query asking "everything that happened to this job" should return the resolution
+	// beside the unpublish, the notes and the standing changes, and an entry naming the dispute
+	// would answer "a dispute was resolved" to a query nobody runs. The dispute's identifier is
+	// in the metadata, so an entry can still be traced to the row it settled.
+	//
+	// **Both vocabularies are in the metadata, because either alone is an incomplete account of
+	// what was decided.** `outcome` is Docs/04 §7's finding and `job_outcome` is where Docs/02 §2
+	// sent the job; the two are orthogonal, which is `000804`s whole argument, and three of §7's
+	// five outcomes are compatible with either destination. The job's status records where it
+	// went and nothing else records what was *found*, so this entry is the only place the
+	// administrator's own pairing of the two is kept as a pairing.
+	//
+	// **One action for all five outcomes**, on [AuditActionVerificationDecided]'s reasoning and
+	// cmd/api's TestTheAuditedMutationsAreDistinctActions: "what has happened to the disputes on
+	// this job" is one question, and a reader filtering by action should get the whole history
+	// rather than having to know which of five verbs to ask for.
+	//
+	// **Raising one is still not audited**, which SHIP-163 decided and this ticket does not
+	// revisit — see the note above this block. Intake is a party to a delivery reporting a
+	// problem with their own job; this is an administrator deciding what happens to it.
+	AuditActionDisputeResolved AuditAction = "dispute.resolved"
 )
 
 // AuditActions is the whole catalogue, in the order the constants declare it.
@@ -292,6 +318,7 @@ var AuditActions = []AuditAction{
 	AuditActionUserSuspensionRequested,
 	AuditActionUserSuspensionApproved,
 	AuditActionVerificationDecided,
+	AuditActionDisputeResolved,
 }
 
 // Valid reports whether a is in the catalogue.

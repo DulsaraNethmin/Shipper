@@ -51,9 +51,11 @@ them where the call is made, beside the thing the user was trying to do.
 | `admin_account_disabled` | This administrator account has been disabled. Ask whoever administers the platform to restore it; signing in again will not help. |
 | `admin_credentials_invalid` | That email address and password do not match an administrator account. Deliberately one code for both halves, so this endpoint cannot be used to find out which addresses are administrators. |
 | `admin_dispute_already_open` | This job already has a dispute waiting on an outcome. Open it rather than raising another — one job is disputed once at a time. |
+| `admin_dispute_already_resolved` | This dispute has already been resolved. Reload it — another administrator may have recorded an outcome already, and the audit trail will say who. |
 | `admin_email_taken` | An administrator account already exists with that email address. |
 | `admin_job_already_unpublished` | This job has already been unpublished. Reload it to see who removed it and why. |
 | `admin_job_not_disputable` | A dispute can only be raised on a job that has been awarded and has not yet been completed or cancelled. Reload the job to see its current status. |
+| `admin_job_not_resolvable` | This job is no longer waiting on a dispute. Reload it — its status has moved since this dispute was opened. |
 | `admin_job_not_unpublishable` | A job can only be unpublished before it is awarded. Once a provider has committed, ending it is a dispute an administrator resolves — reload the job to see its current status. |
 | `admin_permission_denied` | This administrator account does not have permission to do that. Ask whoever administers the platform if you need it. |
 | `admin_same_administrator` | A suspension must be approved by a different administrator from the one who requested it. Docs/04 §9 requires two people. |

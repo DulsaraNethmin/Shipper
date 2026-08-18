@@ -16,6 +16,7 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
@@ -187,10 +188,11 @@ type adminMutation struct {
 
 // adminMutations is every state-changing administrative action the service serves today.
 //
-// Six, matching the six mutating routes in `cmd/api/routes_golden.txt` under `/v1/admin/`. The
-// pairing between this list and the served surface is checked from the other side by
-// TestEveryMutatingAdminRouteIsAudited in cmd/api, which is the only place the route table is
-// visible.
+// One row per mutating route in `cmd/api/routes_golden.txt` under `/v1/admin/`, plus sign-in, which
+// is `Public` and has to be. The pairing between this list and the served surface is checked from
+// the other side by TestEveryMutatingAdminRouteIsAudited in cmd/api, which is the only place the
+// route table is visible — so the count is checked rather than stated, and this comment deliberately
+// no longer carries a number. It said "six" while the list held nine.
 func adminMutations() []adminMutation {
 	return []adminMutation{
 		{
@@ -480,6 +482,61 @@ func adminMutations() []adminMutation {
 				return moderator.ID, providerID
 			},
 		},
+		{
+			name:       "resolving a dispute",
+			action:     AuditActionDisputeResolved,
+			targetType: AuditTargetJob,
+			run: func(t *testing.T, f auditFixture, ready func()) (uuid.UUID, uuid.UUID) {
+				t.Helper()
+
+				// A moderator: `support` holds `disputes.read` and not `disputes.resolve`,
+				// which is Docs/04 §9's least privilege as two permissions on two endpoints.
+				moderator, token := f.signedIn(t, "dispute-resolver@example.com", RoleModerator, "10.0.59.1")
+
+				customerID := newAccount(t, f.pool, "resolve-audit-cust@example.com", "+61400590", "customer")
+				providerID := newAccount(t, f.pool, "resolve-audit-prov@example.com", "+61400591", "provider")
+				jobID := deliveredJob(t, f.pool, customerID, providerID)
+
+				// Raised through the real intake service, so the job is frozen the way a
+				// complainant freezes it rather than by an insert that skips the guard.
+				svc := NewService(
+					testJobs{svc: jobs.NewService(events.NewOutbox(), f.clk, nil)},
+					testParties{}, f.clk)
+				dispute, _, err := raiseWith(t, f.pool, svc, customerID, jobID, Intake{
+					Category:       CategoryGoodsDamaged,
+					Description:    "Two of the four crates arrived with the sides staved in.",
+					DesiredOutcome: "A record of the damage.",
+					OccurredAt:     f.clk.Now().Add(-24 * time.Hour),
+					Key:            "audit-resolve-key",
+				})
+				if err != nil {
+					t.Fatalf("raising the dispute: %v", err)
+				}
+				ready()
+
+				req := httptest.NewRequest(http.MethodPost,
+					"/v1/admin/disputes/"+dispute.ID.String()+"/resolution",
+					strings.NewReader(`{"outcome":"failed_delivery_recorded",`+
+						`"job_outcome":"cancelled",`+
+						`"reason":"Two crates damaged beyond use; delivery recorded as failed."}`))
+				req.SetPathValue("id", dispute.ID.String())
+				req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
+				req.Header.Set("Content-Type", "application/json")
+
+				rec := httptest.NewRecorder()
+				RequireAdmin(f.auth)(f.handler.ResolveDispute()).ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("resolving a dispute: status = %d, want 200 (%s)", rec.Code, rec.Body)
+				}
+
+				// The entry names the **job**, not the dispute — see
+				// AuditActionDisputeResolved. A support query asking "everything that
+				// happened to this job" returns the resolution beside the unpublish, the
+				// notes and the standing changes; the dispute's identifier is in the
+				// metadata.
+				return moderator.ID, jobID
+			},
+		},
 	}
 }
 
@@ -602,6 +659,7 @@ func TestEveryAuditActionConstantIsInTheCatalogue(t *testing.T) {
 		AuditActionUserSuspensionRequested,
 		AuditActionUserSuspensionApproved,
 		AuditActionVerificationDecided,
+		AuditActionDisputeResolved,
 	}
 
 	if len(declared) != len(AuditActions) {

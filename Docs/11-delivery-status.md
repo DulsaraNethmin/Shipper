@@ -828,6 +828,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-103** | M3 | The negotiation screen — **one screen for two people**, over the four endpoints that each serve both sides and work out which from the credential. It reads the whole chain and the conversation, and writes a counter-offer and a message; `BidCounter` is a **difference rather than an offer**, so a counter on price alone leaves the timing on the table, and an empty `message` is sent rather than omitted because that is how conditions are cleared. A counter **re-reads the chain instead of patching it** — the response is the new head alone and the platform also superseded the row it answered — and the read count is what the test asserts, because a client that wrote both facts renders identically. **The budget guard is closed-world over three rendered surfaces** in the provider's view with the counter form open — `Text`, `EditableText` and the **semantics tree a screen reader is read from** — and every string on them must be recorded copy, a written-down value shape, or a party's own words, so a sentence nobody recorded fails whatever it says and wherever it is carried. A ban-list was tried first and **lost to a paraphrase**; a `Text`-only collector then **lost to a `semanticsLabel:`**, which leaves the visible screen byte-identical and changes only what is spoken. **No other client screen has a test that reads a semantics label at all** — measured, and carried to §9 What it does not build: revising and withdrawing your own offer, both still served and both still wanting a confirmation flow — *see below* |
 | **SHIP-131a** | M4 | The driver's own words on a milestone. **No platform change at all** — `MilestoneRecording.reason` has been published, bounded and stored since SHIP-111, and the customer's tracking view has rendered it since SHIP-133, against a field **no client had ever sent**. Three controls, one per screen the row names: the Flutter milestone screen, the Flutter proof-exception panel and the driver portal. On the exception path it sits **beside** the selected reason rather than instead of one — a note alone still records nothing, because a closed list is what `Docs/04` §5's queue can group and the sentence is which of the three it was. **Optional in the strong sense**: an empty or whitespace-only note puts no `reason` key in the body, because a customer's view branches on the field being *present*. The mutation aimed at exactly the defect the ticket closes — drop the note from the portal's request body, leave the field on screen — was killed by `lib/completion.test.ts`, which asserts on the body the platform received — *see below* |
 | **SHIP-169** | M7 | `POST /v1/account/deletion` — a signed-in person asks to be deleted and is told the date, and **the date is recorded when it is promised rather than derived when it is read**. That is the whole ticket: `now() + 30 days` computed while rendering answers plausibly every time, writes nothing, and lets the promise slide forward for as long as nobody executes it. The state lives in a **new table in identity's block** (`000105`) and not in a column on `users` — the shared block is not a domain branch's to take, and `Docs/10` §3.3 forbids the soft delete a `deleted_at` invites. One open request per account is a **partial unique index**, so two honest taps carrying two keys are one promise. **The deferral clause is declared out of scope with its reason**: `Docs/09` gives it to SHIP-170, which depends on SHIP-57 as well as on this — *see below* |
+| **SHIP-164** | M6 | `GET /v1/admin/disputes`, `GET /v1/admin/disputes/{id}` and `POST /v1/admin/disputes/{id}/resolution` — the four-times-held row, and the ticket that **unfreezes a job**. `Docs/04` §7's five outcomes and `Docs/02` §2's two destinations are **orthogonal**, so a resolution records both and derives neither; three of the five are equally true of a delivery that completed and one that failed. **No thirteenth job status and no fourth Kafka aggregate** — the transition emits `job.status_changed`, which `StatusRules` already routes on both destinations. The outcome, the transition and the audit entry are **one transaction**, which is the ticket's hardest invariant and the only thing a happy path cannot demonstrate. `idx_disputes_open` finally has a reader. **§7's right-of-reply clause is declared unmet with its reason**, and a constraint written and then removed found a **two-clock inconsistency on `disputes.created_at`** — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -14662,6 +14663,298 @@ What was done instead is leave the room without building the thing. `state` is a
 #### What it touched, and what it deliberately did not
 
 One new migration (`000105`, identity's block, highest there now `000105`), one new domain file, one handler, one route, one contract fragment block and one `$ref` line, one new migration test file, one new domain test file (seven tests, one of them written because the mutation exposed an uncovered layer), three route tests appended, and one `make verify` section appended. **No new error code**, so `Docs/10-api-error-codes.md` is untouched: every failure this endpoint can produce is already registered — `unauthenticated`, `idempotency_key_required`, `unavailable`. **No `internal/config` entry**: thirty days is a published commitment in a privacy policy and a store listing rather than a lever to pull under pressure, so moving it is a deploy *and* a document change, which is the correct amount of friction.
+
+### SHIP-164 — the two vocabularies, and the transaction that is the whole ticket
+
+`GET /v1/admin/disputes`, `GET /v1/admin/disputes/{id}` and
+`POST /v1/admin/disputes/{id}/resolution`. An administrator finds an open dispute on `Docs/04` §5's
+**sixth** moderation queue, opens it with everything the complainant sent, and records an outcome —
+which sets `resolved_at`, and setting `resolved_at` is what lets the job move again. `000804` is the
+migration; `internal/admin/resolution.go` is the service.
+
+**This row had been held four times** — dispatched and not delivered in wave 10, then passed over in
+waves 11, 12 and 13 because `internal/admin` was committed elsewhere each time. Nothing about the
+delay was technical and §6 recorded that honestly.
+
+#### The decision the ticket turns on: `Docs/04` §7 and `Docs/02` §2 are two vocabularies
+
+`Docs/04` §7 lists **five** possible outcomes of a dispute. `Docs/02` §2 offers a disputed job
+exactly **two** ways out — `Disputed → Completed` and `Disputed → Cancelled`. **Three of the five map
+to neither.** Directing the parties to settle externally, warning or restricting somebody, and
+referring a matter to an insurer are all things that can be true of a delivery that nevertheless
+completed *or* failed.
+
+Two wrong answers were available and both were rejected in `000804`s header rather than in a commit
+message. **Inventing a thirteenth job status**: `Docs/02` §1 has twelve, the transition table is
+authoritative for the guard, and a status carrying a moderation vocabulary would be one every feed,
+every eligibility query and every expiry sweep had to learn — for a fact that is not about where the
+job is. **Dropping the three that do not map**: that is §7 quietly reduced to the two rows §2 happens
+to have, in the one field recording what an administrator decided.
+
+So a resolution carries **both**, and neither is derived from the other. `outcome` is §7's and is a
+column on `disputes`; `job_outcome` is §2's and is applied through the one guarded transition. The
+`make verify` section pins the pairing a derivation would refuse: `delivery_issue_acknowledged` on a
+job that nevertheless **completes**, which is the customer accepting the delivery and taking the
+damage up with the provider directly.
+
+The five stored forms are **shortened** from §7's sentences, on exactly the grounds
+`ck_disputes_category` records for the intake list: the wire form is derived by lower-snake-casing
+(`Docs/10` §4.7), and a semicolon, a comma or a slash has no legal form as an identifier in any of
+the three client languages. `TestOutcomeWireFormsAreLegalAndRoundTrip` checks that property directly
+rather than checking the five strings, so a sixth outcome carrying a comma fails in Go rather than in
+a generated Dart enum. `§7`s "Job cancelled / failed delivery recorded" is the clearest case: the
+slash **is** the two vocabularies overlapping, and the shortening is what separates them.
+
+#### No fourth aggregate, and the reason the block was never a partition count
+
+`Docs/11` had recorded this row for four waves as entangled with an irreversible Kafka decision. It
+was not. `events.TopicPartitions` is **3** — a single constant applied to every topic, so there was
+never a per-topic number to choose here. The real question was whether a dispute is a fourth
+aggregate, and `Docs/11` had it pointing in a circle: SHIP-163's entry said it belonged to SHIP-136,
+SHIP-136's said whoever wrote SHIP-164 should decide, and SHIP-136 shipped without taking it.
+
+**The answer is no.** Resolving moves the job through `jobs.Transition`, which already emits
+`job.status_changed` inside the same transaction, and `internal/notifications/rules.go:281-288`
+already carries live rules for both destinations with a comment naming this ticket: *"Opening lands
+here; resolving lands on Completed or Cancelled above."* A `dispute.resolved` event would be a second
+announcement of one state change — the failure `StatusRules` is written to prevent — and would need a
+routing rule in a package this change does not own. **No aggregate, no topic, no `events_golden.txt`
+line, and `internal/events/catalogue.go` was not opened.** It is also the reversible direction: a
+topic can be added later and never removed.
+
+The `make verify` section asserts both halves by identifier rather than by count, because one broker
+serves every worktree: the `job.status_changed` row exists for *this* job, and no row anywhere is
+`dispute.%` or keyed on a dispute.
+
+#### The transaction is the ticket, and it is the one thing a happy path cannot demonstrate
+
+`internal/admin/service.go` named the corrupt state two waves before there was code to produce it:
+*"The job says 'Disputed' and no dispute was open, which is the state a resolved dispute would leave
+behind if SHIP-164's outcome failed to move the job back."* A job frozen with nothing to resolve is a
+job nothing can unfreeze — `uq_disputes_open_per_job` admits a new dispute, but `Docs/02` §6.1's
+auto-complete stays stopped and no party can do anything about it. The mirror image is no better.
+
+So the row lock, the `UPDATE`, the guarded transition and the audit entry are **one transaction**,
+and **every other assertion in the ticket passes against an implementation that is not atomic**: on a
+healthy database a two-transaction resolve still settles the dispute, still unfreezes the job and
+still answers correctly. `TestAResolutionIsRefusedWhenItsAuditEntryCannotBeWritten` is the only test
+that separates them, using the instrument `enforcement_test.go` established in wave 9 — an auditor
+that fails **before any SQL**, so the transaction stays healthy and only a genuine rollback keeps the
+job frozen. A trigger would prove the rollback and nothing about the `if err != nil`.
+
+#### Two methods on the port, not a status parameter — and the temptation was real here
+
+`ports.go` had already reserved them: *"SHIP-164 needs the moves out of 'Disputed' … one method
+each."* The temptation is sharpest at this ticket, because its caller genuinely has two destinations
+and a `Resolve(jobID, status, reason)` would have collapsed them into one line. It would also be the
+first time `internal/admin` named a job status. `admin.Jobs` now has **four methods and no parameter
+anywhere on it names a status**; `cmd/api`'s `disputeLifecycle` holds an unexported `resolve` helper
+that does take one, which is the seam working as intended rather than a hole in it — the status is
+chosen in the composition root, by a method named for the move.
+
+`ResolveAsCancelled` ends in the same status as `Unpublish` and is **not the same act**: one removes
+a job nobody has committed to, the other ends a delivery somebody has, after a finding. Two audit
+actions, two reasons in `job_status_history`, and a trail that can tell them apart.
+
+#### Serving Docs/04 §5's sixth queue was in scope, because an unfindable dispute cannot be
+#### investigated
+
+`idx_disputes_open` was built by `000800` for that queue and **read by nothing** for four waves; no
+other ticket owns it. `GET /v1/admin/jobs` searches jobs, which needs a moderator to already know
+which job to look at — the question the queue answers. So the queue is served, with `state` defaulting
+to `open`.
+
+**That default is the opposite of the verification queue's rule and the difference is deliberate.**
+SHIP-153 refuses an absent `state` because `Docs/04` §5's *first* queue is "new **or changed**"
+submissions — no document-given default, and an ignored filter would answer an empty page that reads
+exactly like a quiet week. §5's *sixth* queue is **named** "Open disputes", so the default is the
+document's and a console that forgets the parameter gets the queue rather than silence. The failure
+the other rule exists to prevent cannot occur here. A value that is neither half is still refused.
+
+The two halves are ordered oppositely and both orderings are the document's: open **oldest first**,
+because `Docs/04` §8 sets acknowledgement and resolution targets and the oldest entry is closest to
+breaching one; resolved **newest first**, because a settled dispute is looked up to see what was
+decided. They are **two SQL statements rather than one with a `CASE`**, because an ordering expression
+the planner cannot match against an index key turns both halves into a sort over every row the
+predicate returns — which is the whole point of the two partial indexes.
+
+#### `Docs/04` §7's right-of-reply clause is unmet, and is declared rather than approximated
+
+§7's investigation sentence is two clauses. The **review** clause needed no new surface —
+`GET /v1/admin/jobs/{id}` already answers with the listing, every bid and every recorded transition
+in one snapshot (SHIP-152), and `GET /v1/admin/verifications` is the verification half (SHIP-153);
+what was reachable from nowhere is the complaint itself, and `GET /v1/admin/disputes/{id}` is that.
+
+**"Give the other party a reasonable opportunity to respond" is not built.** `dispute.go` says why
+the column is absent and it is still true: there is no place to record a response, no notification
+telling the other party one is wanted, and no window after which an administrator may proceed
+without it. Building it is a second complainant-facing endpoint, a notification rule in a package
+this change does not own, and a policy decision about how long "reasonable" is — which is `Docs/04`
+§8's territory and an operations question. **It has no ticket.** A clause declared unmet with a
+reason is worth more than one quietly met in reduced form.
+
+#### The budget question SHIP-152 named this ticket as the revisit for, answered: no
+
+`Docs/11` recorded SHIP-152 leaving `jobs.budget` off the administrative job shape as *"a decision
+with SHIP-164 named as its revisit — an administrator resolving a dispute about price may genuinely
+need the number"*. **This ticket does not add one, anywhere.** Nothing in the *Done when* needs it: a
+resolution is a finding and a destination, neither of which is a number. An administrator who needs
+the offers a disputed award was chosen over opens `GET /v1/admin/jobs/{id}`, where every bid amount
+already is. Both new read shapes are held to **closed key sets** in Go and again in `make verify` —
+SHIP-83's axis, because a field named `max_price` passes a search for the word "budget" — and
+`DisputeSummary` has nowhere to put one, so the guard is structural rather than remembered. **No
+provider-facing surface was touched**: the diff contains no change to `internal/bidding`,
+`internal/fleet` or `internal/jobs`.
+
+#### A constraint was written, applied and removed, and what it found is worth more than the constraint
+
+`ck_disputes_resolved_after_raised` — `resolved_at >= created_at` — refuses the one ordering no clock
+can produce, and it costs nothing in production where every clock is `clock.System`. **It failed
+against the test suite, and the cause is a two-clock inconsistency this ticket does not own.**
+`disputes.created_at` is `DEFAULT now()` — the *database's* clock — while `resolved_at` is written
+from the domain's injected one. `Docs/11` §9's rule is *one row, one clock*, and `admin.Service` has
+injected one since SHIP-163. So a test holding `clock.Fixed` in the past resolves a dispute at an
+instant earlier than the `now()` its own row was inserted with: the constraint correctly refuses a
+row that is correctly written by code inconsistent about which clock it is on. `audit.go`s header
+records the identical defect one table along in `admin_sessions`, where "the suite agreed with the
+database for exactly one idle window and then failed for ever".
+
+Repairing it changes what `raised_at` means on SHIP-163's intake response, which is that ticket's
+column. **The constraint was dropped rather than the inconsistency hidden**, and the measurement is
+recorded in `000804`s header, here, and in the handover. Adding the constraint afterwards is one
+line. It also had a second cost worth naming: kept, it would lay a trap for every future
+`internal/admin` test that resolves a dispute on a backdated fixed clock.
+
+#### A new CHECK collided with two other tickets' fixtures, exactly as wave 13 predicted
+
+`ck_disputes_resolution` — all three resolution columns set or all three NULL — broke **four
+pre-existing tests in files this branch had no other reason to open**: three in
+`migrations/disputes_test.go` and one in `internal/admin/service_test.go`, each of which freed
+`uq_disputes_open_per_job` by writing `resolved_at` alone. All four now write a complete resolution
+through one helper. **The sweep found nothing in `scripts/verify/*.sh`**:
+`grep -rn 'resolved_at' scripts/ deploy/ apps/` returns nothing at all, and no domain outside
+`internal/admin` writes the column.
+
+#### The mutation
+
+**Move the job's transition out of the resolution's transaction**, so the dispute row and the audit
+entry commit in one transaction and the job's status change commits in another. The mechanism stays
+perfect: both writes happen, the dispute resolves, the job unfreezes, and on a healthy database every
+assertion about the end state still passes. What breaks is only **atomicity** — the exact corrupt
+state `service.go:204-209` names.
+
+**It had to be run twice, and the first run is a finding in its own right.** The obvious form — pass
+`w.pool` rather than the caller's `tx` to `admin.Jobs.ResolveAsCompleted` — **cannot produce the
+defect at all**: `jobs.Transition` asserts `pgx.Tx` on the runner it is handed and answers *"jobs: a
+transition must run inside a transaction"*. So every resolution became a 500, seven tests failed for
+one reason, and **the corrupt state was never reached**. That is a real second layer under the whole
+class of mutation and it is worth recording: no caller anywhere can transition a job outside a
+transaction, whatever it passes. It is also the wave-12 trap in a new place — a mutation killed by
+the wrong layer says nothing about the guard you were aiming at.
+
+The second form is the one that tests the claim: wrap the transition in its own `db.InTx` on the
+pool, which satisfies `jobs`' assertion while genuinely committing separately.
+
+**Killed, by exactly one test in the repository:**
+`TestAResolutionIsRefusedWhenItsAuditEntryCannotBeWritten`. Its assertion is *"the job is
+`Disputed`"* after a resolution that failed at the audit write; with the transition on its own
+connection the job is `Cancelled` and the dispute is open — a delivery unfrozen by a resolution that
+was rolled back, plus a `job_status_history` row telling the customer an administrator cancelled it.
+**Everything else was green under the mutation, measured rather than assumed**: `cmd/api` ok,
+`migrations` ok, and `internal/admin` ok with that one test excluded.
+
+**This entry first said "nine other tests drive the same code path", and that figure was wrong.** It
+was a count of test functions in `resolution_test.go`, which is not the same question — most of them
+never reach the statement at all. The measured figure is **five**:
+`TestResolvingADisputeUnfreezesTheJob`, `TestTheOutcomeAndTheJobDestinationAreIndependent`,
+`TestASecondResolutionIsRefused`, `TestTheQueueServesBothHalvesAndAResolvedDisputeLeavesTheOpenOne`
+and `TestEveryAdminMutationWritesAnAuditEntry` all execute the identical statement and not one can
+see the difference. The substance is unchanged and slightly sharper; the arithmetic was not measured
+until it was asked for.
+
+**The method is the durable part of this, because the next claim of this shape needs settling the
+same way.** *Per-test statement coverage*, in three steps:
+
+ 1. **Find the call sites, not the files.**
+    `grep -rn "handler.ResolveDispute()\|workflow.Resolve(\|unwritable.Resolve("` over
+    `internal/admin/*_test.go` gives `resolution_test.go` and `audit_test.go` and nothing else.
+    **A naive `\.Resolve(` grep also matches `adminauth_test.go` and that is a false positive** —
+    it is `auth.Resolve`, session resolution, an unrelated method on an unrelated type. Candidate
+    set: the 13 test functions in `resolution_test.go` plus `TestEveryAdminMutationWritesAnAuditEntry`.
+ 2. **Pick a statement only the path under test can reach.** `resolution.go:633`, the
+    `w.auditor.Record` call: every non-`JobMoved` arm of the switch above it returns, so reaching 633
+    means the transition succeeded.
+ 3. **Run each candidate alone with coverage** — `go test ./internal/admin -run '^Name$'
+    -coverprofile=…` — and read the block spanning 633 for a count above zero.
+
+**The instrument validates itself**, which is what makes the answer trustworthy: the 404 test, the
+vocabulary test, the two queue-only tests, the support-403 test and
+`TestAJobThatHasMovedOnCannotBeResolved` all come back *not reached*, exactly as they must. Six of
+the fourteen reach it — the five above, plus the killing test itself, which reaches it because
+`Auditor.Record` checks its nil receiver **inside** the method, so the call executes.
+
+**Which layer holds it, stated for whoever comes next.** Not the database — no constraint can express
+"these two writes are one act", because `disputes` and `jobs` are different tables and PostgreSQL has
+nothing to check at the moment of the second commit. Not the handler, which sees one error either
+way. **The guard is that single Go test and there is no second layer**, which is the opposite of
+wave 11's finding where a removed Go check turned out to be held by a SQL predicate underneath. Wave
+13's Lane A closed the symmetric hole on the *audit* write with a `MaxConns = 1` pool; that guard
+does **not** cover this one, and it was run to confirm rather than assumed — no deadlock occurred,
+because `pgtest.DB` builds an unbounded pool and the second connection touches `jobs` while the first
+holds `disputes`.
+
+#### `make verify` reported **exit 0** on a run that aborted, and the cause is isolated
+
+Worth reading before trusting the harness's exit status in either direction. This section's first
+run died on `res_job: unbound variable` — a variable a helper set inside a command substitution,
+which is a subshell, so the caller never saw it. That is an ordinary shell mistake and it cost one
+run. **What matters is what the harness then reported: `'make verify' exited 0`, with no summary
+line and no check count**, on a run that never reached its last four sections.
+
+The cause is not the section. `scripts/verify-foundation.sh:158-162` installs `trap cleanup EXIT`
+whose last command is `rm -rf "$WORKDIR"`, and **on bash 3.2 — which is what `/usr/bin/env bash`
+resolves to on macOS — an abort under `set -u` leaves no pending status, so the trap's own successful
+exit becomes the script's.** Reduced to four lines and confirmed by construction: `exit 1` and a
+`set -e` abort both survive the trap and report 1; an unbound-variable abort reports **0**, and
+reports 1 again if the trap's last command is made to fail. It is not about `source` — it reproduces
+with the mutation inline.
+
+So the harness has a **false pass** as well as the known false failure. `Docs/11` §3's guard exits 1
+on a stale count line even when every check passed, and this exits 0 when the run never finished.
+**Read the "N checks passed across M sections" line; its absence is the signal.** Not fixed here —
+`scripts/verify-foundation.sh` is a shared file no lane edits — and recorded for whoever owns it.
+
+**This entry first proposed a one-line fix — `local status=$?; …; return $status` in `cleanup` — and
+that fix was then measured and does not work.** It is recorded as tried rather than quietly replaced,
+because the reason it fails is the whole finding restated: **`$?` is already `0` at trap entry**, so
+the status is lost *before* `cleanup` runs and nothing that reads it can recover it. An `ERR` trap
+does not fire on a `set -u` abort either. Both probed directly rather than reasoned about.
+
+The status cannot be recovered, so the fix has to be a **completion sentinel**. Three added lines,
+verified across every path the harness can exit by:
+
+```
+VERIFY_FINISHED=0                                  # beside SERVER_PID=""
+  [[ "$VERIFY_FINISHED" == 1 ]] || exit 1          # as cleanup()'s last line
+VERIFY_FINISHED=1                                  # as the script's last line
+```
+
+`set -u` abort → **1**; `fail()`'s `exit 1` → 1; `set -e` abort → 1; the stale-count `exit 1` → 1;
+a clean run → **0**. So it closes the false pass without disturbing either intended non-zero path.
+**Proposed, not applied** — the file belongs to the owner.
+
+#### What it touched, and what it deliberately did not
+
+One migration (`000804`, admin's block, highest there now `000804`), two new domain files
+(`resolution.go`, `postgres_resolution.go`) with one new test file beside them, a delimited region at
+the end of `internal/admin/http.go`, three routes, two methods and one unexported helper on
+`cmd/api`'s `disputeLifecycle`, three contract fragments and three `$ref` lines, one new migration
+test file, and one `make verify` section. **Two new error codes**, so `Docs/10-api-error-codes.md`
+was regenerated — never hand-edited. **`internal/events/catalogue.go` was not opened**, no domain
+other than `admin` was touched, and `internal/admin/permissions.go` needed no change at all:
+SHIP-148 declared `disputes.read` and `disputes.resolve` and granted them to the right roles four
+waves before there was an endpoint behind either.
+
 
 ## 4. Partly done — do not treat these as finished
 

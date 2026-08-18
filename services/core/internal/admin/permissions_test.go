@@ -128,6 +128,15 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		t.Fatalf("building the verification console: %v", err)
 	}
 
+	// SHIP-164. The real lifecycle adapter over the real guard, like enforcement above: the
+	// resolution moves a job out of `Disputed` through `jobs.Transition`, so a stub here would
+	// prove that `admin` writes an outcome and nothing about whether the job unfroze.
+	disputeWorkflow, err := NewDisputeWorkflow(
+		testJobs{svc: jobs.NewService(events.NewOutbox(), clk, nil)}, auditor, clk, pool)
+	if err != nil {
+		t.Fatalf("building the dispute workflow: %v", err)
+	}
+
 	return HandlerServices{
 		Disputes:      testDisputeService(t),
 		Credentials:   creds,
@@ -140,6 +149,8 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		Notes:         notes,
 		Suspensions:   suspensions,
 		Verifications: verifications,
+
+		DisputeWorkflow: disputeWorkflow,
 	}
 }
 
