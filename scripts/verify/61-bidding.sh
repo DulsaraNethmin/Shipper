@@ -39,8 +39,9 @@
 # claim. So the provider below bids with a token that says customer, and the customer is refused with
 # an identical one — a stronger demonstration than two honest tokens would be.
 #
-# No check here signs in, so SHIP-47's per-address bucket (rl:v1:signin:*, shared across sections and
-# across runs from 127.0.0.1) is untouched by this file.
+# No check here signs in, so the Credential class's buckets (rl:v1:signin:account:* and
+# rl:v1:credential:address:*, both shared across sections and across runs from 127.0.0.1) are
+# untouched by this file.
 #
 # Nothing here reads Kafka. **Two of the last three sections do more than send requests**, and both
 # say so where they sit: SHIP-89's starts the real `cmd/worker` binary, and SHIP-136's reads the

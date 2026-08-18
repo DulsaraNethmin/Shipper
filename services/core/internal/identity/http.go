@@ -23,10 +23,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -214,9 +212,12 @@ func (h *Handler) VerifyEmail() http.Handler {
 			return err
 		}
 
-		user, err := h.svc.VerifyEmail(r.Context(), req.Token)
-		if err != nil {
-			return apiError(err)
+		var user User
+		if err := h.credentialAttempt(w, r, func() (err error) {
+			user, err = h.svc.VerifyEmail(r.Context(), req.Token)
+			return err
+		}); err != nil {
+			return err
 		}
 
 		httpx.WriteJSON(w, http.StatusOK, accountFrom(user))
@@ -267,9 +268,12 @@ func (h *Handler) VerifyPhone() http.Handler {
 			return err
 		}
 
-		user, err := h.svc.VerifyPhone(r.Context(), req.Phone, req.Code)
-		if err != nil {
-			return apiError(err)
+		var user User
+		if err := h.credentialAttempt(w, r, func() (err error) {
+			user, err = h.svc.VerifyPhone(r.Context(), req.Phone, req.Code)
+			return err
+		}); err != nil {
+			return err
 		}
 
 		httpx.WriteJSON(w, http.StatusOK, accountFrom(user))
@@ -318,15 +322,7 @@ func (h *Handler) Login() http.Handler {
 			ClientIP:    clientIP(r),
 		})
 		if err != nil {
-			// Retry-After is set here rather than inside the error, because httpx.Error
-			// carries a status, a code and a message and no headers — and a throttled
-			// caller told to come back later without being told when either gives up or
-			// polls. The same shape RequestOTP already uses for its cooldown.
-			var throttled *ThrottledError
-			if errors.As(err, &throttled) {
-				w.Header().Set("Retry-After", retryAfterSeconds(throttled.RetryAfter))
-			}
-			return apiError(err)
+			return withRetryAfter(w, err)
 		}
 
 		httpx.WriteJSON(w, http.StatusOK, h.tokenPairFrom(pair))
@@ -410,9 +406,12 @@ func (h *Handler) Refresh() http.Handler {
 			return err
 		}
 
-		pair, err := h.svc.Refresh(r.Context(), req.RefreshToken)
-		if err != nil {
-			return apiError(err)
+		var pair TokenPair
+		if err := h.credentialAttempt(w, r, func() (err error) {
+			pair, err = h.svc.Refresh(r.Context(), req.RefreshToken)
+			return err
+		}); err != nil {
+			return err
 		}
 
 		httpx.WriteJSON(w, http.StatusOK, h.tokenPairFrom(pair))
@@ -689,25 +688,82 @@ func timestamp(t time.Time) string {
 	return t.UTC().Format("2006-01-02T15:04:05.000Z07:00")
 }
 
-// clientIP is where the request came from, as SHIP-47's per-address limit counts it.
+// clientIP is where the request came from, as the Credential class's per-address bucket counts it.
 //
-// **RemoteAddr only. `X-Forwarded-For` is deliberately not read**, and that is a decision with a
-// deployment consequence recorded in Docs/11 §9 rather than an oversight. A forwarded header is
-// whatever the client wrote unless a trusted proxy overwrote it, so honouring one here would let
-// any caller pick their own bucket and evade the limit entirely — which is worse than no limit,
-// because it would look like one. The other direction has a cost too: behind a load balancer that
-// does not yet exist, every request would arrive from one address and share one bucket. Neither is
-// acceptable in production and the answer is a trusted-proxy configuration, which belongs with the
-// deployment work rather than inside a three-point ticket.
+// **It no longer reads RemoteAddr itself, and that is SHIP-183b.** [httpx.ClientAddr] answers this
+// for the whole service: a forwarded header is honoured only as far as the deployment's
+// trusted-proxy hop count or CIDR allow-list says it may be, and RemoteAddr is used otherwise. Both
+// halves matter and each closes a different failure —
 //
-// The port is stripped, so that a caller does not get a fresh bucket per connection.
+//   - Reading X-Forwarded-For unconditionally would let any caller pick their own bucket, which is
+//     worse than no limit because it looks like one.
+//   - Reading RemoteAddr alone behind a load balancer puts every caller in one bucket, so the
+//     first attacker throttles the world.
+//
+// Which of those is true is a fact about the deployment rather than about this domain, and it is
+// configured rather than guessed. The port is stripped and IPv6 is grouped by /64 there too, so a
+// caller gets neither a fresh bucket per connection nor a fresh one per address in their prefix.
+//
+// This stays a named function rather than becoming an inlined call, because what the domain wants
+// is "the client's address" and where that comes from is infrastructure's business — the same
+// reason the six lines it replaces were a function.
 func clientIP(r *http.Request) string {
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
+	return httpx.ClientAddr(r)
+}
+
+// withRetryAfter sets the header a throttled caller needs and maps the error (SHIP-183b).
+//
+// Retry-After is set here rather than inside the error, because [httpx.Error] carries a status, a
+// code and a message and no headers — and a throttled caller told to come back later without being
+// told when either gives up or polls. The same shape RequestOTP already uses for its cooldown.
+//
+// One function rather than the block repeated in every handler that tests a secret: four copies is
+// four chances for one endpoint to answer 429 with no wait in it, which is invisible in review and
+// only shows up as a client that hammers.
+func withRetryAfter(w http.ResponseWriter, err error) error {
+	var throttled *ThrottledError
+	if errors.As(err, &throttled) {
+		w.Header().Set("Retry-After", retryAfterSeconds(throttled.RetryAfter))
 	}
-	// httptest and any transport that reports a bare address land here. Returned as-is
-	// rather than as an empty string, because the domain refuses an empty address.
-	return strings.TrimSpace(r.RemoteAddr)
+	return apiError(err)
+}
+
+// credentialAttempt runs one test of a secret under the Credential class's address bucket
+// (SHIP-183b).
+//
+// # Why here rather than in the middleware
+//
+// The class charges **failures only** (Docs/12 §3), and that is what makes it a control on
+// guessing rather than a cap on how often somebody may legitimately sign in. The rate-limit
+// middleware in cmd/api runs before the handler and cannot see an outcome, so the three
+// middleware-enforced classes charge every request and this one is enforced where the answer is
+// known. cmd/api's limitBucket records the same split from the other side.
+//
+// # Why the admission check comes first
+//
+// Docs/12 §6 is explicit that the tempting alternative destroys the limit outright: if a correct
+// credential is honoured even while throttled, every wrong guess answers 429 and the right one
+// answers 200 — so an attacker guesses indefinitely and the split tells them the moment they have
+// won.
+//
+// A failure that was the platform's rather than the caller's is deliberately not charged. An
+// unreachable Redis is not a wrong password, and counting it would spend a real caller's allowance
+// on an outage they had no part in.
+func (h *Handler) credentialAttempt(w http.ResponseWriter, r *http.Request, attempt func() error) error {
+	addr := clientIP(r)
+
+	if err := h.svc.admitCredentialAddress(r.Context(), addr); err != nil {
+		return withRetryAfter(w, err)
+	}
+
+	err := attempt()
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, errUnavailable) {
+		h.svc.chargeCredentialAddress(r.Context(), addr)
+	}
+	return withRetryAfter(w, err)
 }
 
 // retryAfterSeconds renders a wait for the header, rounded up.
@@ -772,12 +828,18 @@ func apiError(err error) error {
 		return httpx.NewError(http.StatusForbidden, CodeAccountSuspended,
 			"This account has been suspended. Contact support.").WithCause(err)
 
-	// 429, with the honest wait in Retry-After. The message says which limit was reached in
-	// the vaguest terms that are still useful, because "this account" and "this network" are
-	// different remedies and neither discloses anything the caller does not already know.
+	// 429, with the honest wait in Retry-After.
+	//
+	// The message stopped naming sign-in at SHIP-183b, because the Credential class's address
+	// bucket is now spent by refresh and by both verification endpoints as well — and telling
+	// somebody who submitted a verification code that they have made too many *sign-in*
+	// attempts sends them to look at the wrong thing. It says no more than that, deliberately:
+	// which of the two buckets was empty is the difference between "this account" and "this
+	// network", and a caller who could tell them apart could use the endpoint to establish
+	// whether an account exists.
 	case errors.As(err, new(*ThrottledError)):
 		return httpx.NewError(http.StatusTooManyRequests, httpx.CodeRateLimited,
-			"Too many sign-in attempts. Wait a moment and try again.").WithCause(err)
+			"Too many attempts. Wait a moment and try again.").WithCause(err)
 
 	// 404 for a session that belongs to somebody else as well as for one that does not exist,
 	// which is what stops the revoke endpoint being used to probe identifiers (SHIP-46).

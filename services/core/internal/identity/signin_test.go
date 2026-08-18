@@ -621,8 +621,8 @@ func TestASuccessfulSignInLeavesTheAddressBucketAlone(t *testing.T) {
 		return spent
 	}
 
-	if spent := walk(0, signInAddressCapacity-1); spent != signInAddressCapacity-1 {
-		t.Fatalf("%d strangers were admitted, want %d", spent, signInAddressCapacity-1)
+	if spent := walk(0, credentialAddressCapacity-1); spent != credentialAddressCapacity-1 {
+		t.Fatalf("%d strangers were admitted, want %d", spent, credentialAddressCapacity-1)
 	}
 
 	// A success from the same address, admitted on the one token left.
@@ -631,7 +631,7 @@ func TestASuccessfulSignInLeavesTheAddressBucketAlone(t *testing.T) {
 	}
 
 	// The walk must resume where it stopped rather than starting again.
-	if resumed := walk(signInAddressCapacity, signInAddressCapacity); resumed > 1 {
+	if resumed := walk(credentialAddressCapacity, credentialAddressCapacity); resumed > 1 {
 		t.Errorf("%d further attempts were admitted from the same address after a successful "+
 			"sign-in, want at most the one token that was left. A success has reset the address "+
 			"bucket, which gives anybody holding one valid credential an unlimited walk through "+
@@ -725,7 +725,7 @@ func TestRepeatedFailuresAreThrottledPerAddress(t *testing.T) {
 	const from = "198.51.100.4"
 
 	admitted := 0
-	for i := range signInAddressCapacity + 5 {
+	for i := range credentialAddressCapacity + 5 {
 		cmd := validSignIn()
 		cmd.Email = fmt.Sprintf("nobody-%d@example.com", i)
 		cmd.ClientIP = from
@@ -736,9 +736,9 @@ func TestRepeatedFailuresAreThrottledPerAddress(t *testing.T) {
 		admitted++
 	}
 
-	if admitted != signInAddressCapacity {
+	if admitted != credentialAddressCapacity {
 		t.Fatalf("%d attempts were admitted from one address, want the capacity of %d",
-			admitted, signInAddressCapacity)
+			admitted, credentialAddressCapacity)
 	}
 
 	t.Run("the account it was working through is refused from that address", func(t *testing.T) {

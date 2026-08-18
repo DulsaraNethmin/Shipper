@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"math"
 	"net/http"
 	"time"
@@ -11,7 +10,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 )
 
-// The rate-limit classes (SHIP-183, SHIP-183a).
+// The rate-limit classes (SHIP-183, SHIP-183a, SHIP-183b).
 //
 // Docs/12 is the authority for every figure in this file and for which class each route belongs
 // to. This is the transcription; changing a number here without changing the reason there is how
@@ -103,9 +102,10 @@ func (c LimitClass) String() string {
 
 // keyedOnSubject reports whether the class counts against the authenticated caller.
 //
-// These are the classes SHIP-183a enforces. They survive a proxy untouched, because a user id, an
-// administrator's session and a driver's job token are all things the caller presented rather than
-// things the network reported (Docs/12 §8).
+// These are the classes SHIP-183a enforced, and they were first because they survive a proxy
+// untouched: a user id, an administrator's session and a driver's job token are all things the
+// caller presented rather than things the network reported (Docs/12 §8). The rest waited for
+// SHIP-183b — see keyedOnAddress.
 func (c LimitClass) keyedOnSubject() bool {
 	switch c {
 	case LimitUpload, LimitWrite, LimitRead:
@@ -117,13 +117,19 @@ func (c LimitClass) keyedOnSubject() bool {
 
 // keyedOnAddress reports whether the class counts against the client's network address.
 //
-// **These are the eleven routes SHIP-183a deliberately does not enforce.** internal/httpx does not
-// read X-Forwarded-For, so behind a load balancer every request presents the balancer's address —
-// which would put all eleven into one bucket per class and throttle the entire world at the first
-// caller. SHIP-183b enforces them once a trusted-proxy hop count or CIDR allow-list exists.
+// **These are the eleven routes of Docs/12 §8, and SHIP-183b is what made them enforceable.**
+// SHIP-183a declared the class on each of them and enforced none, because internal/httpx read
+// RemoteAddr alone: behind a load balancer that is the balancer, so all eleven would have
+// collapsed into one bucket per class and throttled the world at the first caller.
 //
-// The class is still declared on the route today, which is what makes SHIP-183b a transcription
-// rather than a second review.
+// [httpx.ResolveClientAddr] closed it. The address now comes from a forwarded header only as far
+// as config.TrustedProxy says it may, and from RemoteAddr otherwise, so neither being behind a
+// proxy nor being in front of one lets a caller choose their own bucket.
+//
+// Six of the eleven are enforced by the middleware in this package — the three LimitMessage and
+// the three LimitPublicRead. The five LimitCredential routes are enforced inside internal/identity
+// and internal/admin, because that class charges failures only and this middleware runs before the
+// handler. See limitBucket.
 func (c LimitClass) keyedOnAddress() bool {
 	switch c {
 	case LimitCredential, LimitMessage, LimitPublicRead:
@@ -236,31 +242,37 @@ func limitScaleFrom(cfg *config.Config) limitScale {
 	return limitScale{burst: cfg.RateLimits.BurstScale, rate: cfg.RateLimits.RateScale}
 }
 
-// limitBucket returns the bucket a class is enforced with, and whether this middleware enforces it
-// at all.
+// limitBucket returns the bucket a class is enforced with by this middleware, and whether it is
+// enforced here at all.
 //
-// Three classes are not enforced here and each is a different reason rather than an oversight:
+// A class is enforced here exactly when limitBuckets holds figures for it. Two do not, and each is
+// a different reason rather than an oversight:
 //
-//   - LimitUnlimited has no bucket by definition.
-//   - LimitCredential is enforced inside internal/identity and internal/admin, where the
-//     outcome of the credential check is known — the class charges failures only, and this
-//     middleware runs before the handler and cannot see an outcome.
-//   - LimitMessage and LimitPublicRead key on the network address, which is not trustworthy
-//     until SHIP-183b reads a forwarded header from a configured trusted proxy.
+//   - LimitUnlimited has no bucket by definition. GET /health is the one route with it.
+//   - LimitCredential is enforced inside internal/identity and internal/admin, where the outcome
+//     of the credential check is known. The class charges failures only (Docs/12 §3), and this
+//     middleware runs before the handler and cannot see an outcome. Holding its figures here as
+//     well would be a second source of truth for numbers only those two packages can apply.
+//
+// TestEveryClassIsEitherEnforcedOrAccountedFor is what keeps that list at two, so a class added
+// with no figures is a test failure rather than a route quietly served unlimited.
 func limitBucket(c LimitClass, scale limitScale) (ratelimit.Bucket, bool) {
-	if !c.keyedOnSubject() {
-		return ratelimit.Bucket{}, false
-	}
 	b, ok := limitBuckets[c]
 	if !ok {
-		// A subject-keyed class with no figures is this file contradicting itself, which is a
-		// programming mistake rather than a configuration one.
-		panic(fmt.Sprintf("cmd/api: limit class %s is keyed on the subject and has no bucket", c))
+		return ratelimit.Bucket{}, false
 	}
 	return scale.apply(b), true
 }
 
 // limitKey names the bucket one request counts against.
+//
+// # Two kinds of caller, because two kinds of class
+//
+// A subject-keyed class counts against who the caller proved they are; an address-keyed class
+// counts against where the request came from, because on those routes nobody has proved anything
+// yet. [httpx.ClientAddr] is what answers the second, under the deployment's trusted-proxy rules
+// and never from the raw header — so a caller can no more choose their bucket by writing an
+// X-Forwarded-For than an account holder can by claiming a different user id (SHIP-183b).
 //
 // # The caller, from what they presented rather than from a lookup
 //
@@ -297,6 +309,11 @@ func limitBucket(c LimitClass, scale limitScale) (ratelimit.Bucket, bool) {
 // class shares one — which is the shape Docs/12 §3's figures were argued for. See the note in
 // internal/httpx/ratelimit.go.
 func limitKey(c LimitClass) func(*http.Request) string {
+	if c.keyedOnAddress() {
+		return func(r *http.Request) string {
+			return "route:" + c.String() + ":" + httpx.ClientAddr(r)
+		}
+	}
 	return func(r *http.Request) string {
 		return "route:" + c.String() + ":" + httpx.SubjectScope(r)
 	}

@@ -143,6 +143,11 @@ func newRouter(
 	// innermost so it sees the 404 and 405 that ServeMux produces itself and can put
 	// them in the error contract (SHIP-12).
 	//
+	// The client-address resolver sits inside Logger and Recover for both of those reasons —
+	// it logs a misconfigured proxy chain through the request-scoped logger, and a malformed
+	// header must not be able to panic past the recovery handler. It sits outside everything
+	// that reads an address, which is every address-keyed limit in the service (SHIP-183b).
+	//
 	// Do not tidy this. Changing the order, or removing the second StandardErrors above,
 	// breaks idempotent replay in a way no test outside internal/httpx will notice
 	// (Docs/10 §4.2).
@@ -150,8 +155,28 @@ func newRouter(
 		httpx.RequestID,
 		httpx.Logger(deps.Logger),
 		httpx.Recover(deps.Logger),
+		resolveClientAddr(deps),
 		httpx.StandardErrors,
 	)
+}
+
+// resolveClientAddr builds the client-address middleware from the deployment's configuration
+// (SHIP-183b).
+//
+// # Why it is read here rather than passed to newRouter
+//
+// It is not a collaborator the composition root has to build — it is two values already on Deps,
+// and threading them through a signature that five tests construct by hand would be five more
+// places to forget them. Every one of those would then run with the resolver absent, which
+// [httpx.ClientAddr] handles by falling back to RemoteAddr and is exactly the shape a test wants.
+//
+// A nil Config is a test's rather than a deployment's, and it means trusting no proxy — the same
+// answer config.Load gives a deployment that sets neither variable.
+func resolveClientAddr(deps Deps) func(http.Handler) http.Handler {
+	if deps.Config == nil {
+		return httpx.ResolveClientAddr(0, nil)
+	}
+	return httpx.ResolveClientAddr(deps.Config.TrustedProxy.Hops, deps.Config.TrustedProxy.Networks)
 }
 
 // The two routes that belong to the service itself rather than to any domain.

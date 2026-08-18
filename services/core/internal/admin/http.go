@@ -32,7 +32,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -1020,26 +1019,20 @@ func (h *Handler) SignOut() http.Handler {
 
 // clientIP is where the request came from, as the per-address sign-in limit counts it.
 //
-// **`RemoteAddr` only. `X-Forwarded-For` is deliberately not read**, which is the position
-// `identity` took at SHIP-47 and the reasoning is unchanged: a forwarded header is whatever the
-// client wrote unless a trusted proxy overwrote it, so honouring one would let any caller pick their
-// own bucket and evade the limit — worse than no limit, because it would look like one. Behind a
-// load balancer that does not yet exist, every request arrives from one address and shares one
-// bucket, which is the other unacceptable end. The answer is a trusted-proxy configuration, and it
-// belongs with the deployment work.
+// **It no longer reads RemoteAddr itself, and that is SHIP-183b.** [httpx.ClientAddr] answers this
+// for the whole service: a forwarded header is honoured only as far as the deployment's
+// trusted-proxy hop count or CIDR allow-list says it may be, and RemoteAddr is used otherwise —
+// which closes both ends of the position this comment used to describe as undecided. A caller can
+// no longer pick their own bucket by writing a header, and a deployment behind a balancer no
+// longer puts every administrator in one.
 //
-// A second copy of identity's function rather than a shared one, because the two domains cannot
-// import each other and the alternative is promoting six lines into infrastructure that would then
-// own a deployment decision neither domain has made yet.
-//
-// The port is stripped, so a caller does not get a fresh bucket per connection.
+// It stays a named function in this domain rather than an inlined call, for the reason the six
+// lines it replaces were one: what this domain wants is "the client's address", and where that
+// comes from is infrastructure's business. internal/identity has the same one-line function for
+// the same reason, and the two are no longer two implementations of anything — both defer to
+// httpx, so the duplication that comment worried about is now a name rather than a mechanism.
 func clientIP(r *http.Request) string {
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	// httptest and any transport reporting a bare address land here. Returned as-is rather than
-	// as an empty string, because the domain refuses an empty address.
-	return strings.TrimSpace(r.RemoteAddr)
+	return httpx.ClientAddr(r)
 }
 
 // retryAfterSeconds renders a wait for the header, rounded up.

@@ -9,6 +9,11 @@ reason lives. Changing a number without changing the reason beside it is how the
 
 ## 1. What already exists, measured rather than assumed
 
+> **This section is the state at SHIP-183's review and is deliberately not kept current.** It is
+> what the assignment in §5 was argued *from*, and rewriting it would delete the starting point that
+> makes the argument checkable. Every route on the manifest carries an enforced class as of
+> SHIP-183b; §5 is the current assignment and §8 and §11 record how it got there.
+
 **Five of the 86 routes carry a limit today, through three different mechanisms.** This is worth
 stating precisely because `Docs/11` §6 recorded the figure as *"84 of the 86 routes need a number
 nobody has decided"*, which counted only the routes using `internal/ratelimit` and missed two other
@@ -300,7 +305,14 @@ default must be the numbers in §3.
 At that point the answer is a per-**class** override map, not a per-route one — seven values a
 person can hold in their head, against eighty-six they cannot.
 
-## 8. The gate SHIP-183a inherits
+## 8. The gate SHIP-183a inherited, and SHIP-183b closed
+
+> **Closed by SHIP-183b.** `internal/httpx` reads `X-Forwarded-For` as far as a configured
+> trusted-proxy hop count or CIDR allow-list allows, and `RemoteAddr` otherwise, so all eleven
+> routes now enforce. The section is kept as written because the argument is what the
+> configuration has to keep being true of — a deployment that sets neither variable still gets
+> `RemoteAddr` alone, which is the shared-bucket end of exactly this trade-off, deliberately
+> chosen as the safe default. §11 records what SHIP-183b decided along the way.
 
 **Eleven of the 86 routes key on a network address, and none of their limits can be trusted behind
 a load balancer until the trusted-proxy configuration exists.** `Docs/11` §9 records that
@@ -372,5 +384,95 @@ class keeps a floor of one token and one millisecond, so these are a dial and no
 |---|---|
 | An account reported locked out by a third party, or buckets emptied from >3 distinct addresses | Build the distinct-address per-account limit (§6) |
 | An incident wanting one route different from the rest | A per-**class** override map, never per-route (§7) |
-| The trusted-proxy configuration landing | The eleven address-keyed routes become enforceable (§8) |
+| ~~The trusted-proxy configuration landing~~ **Done at SHIP-183b** | The eleven address-keyed routes became enforceable (§8) |
+| An IPv6 caller reported sharing a limit with an unrelated one, or evading one from inside a prefix | Revisit the /64 the address is keyed on (§11) |
+| An incident wanting the global lever to reach the `Credential` class | Thread the scale into `internal/identity` and `internal/admin`, which it does not reach today (§11) |
 | The first route whose cost is neither a caller, a destination nor an artefact | A fourth mechanism, and this document gains a section rather than a class |
+
+## 11. What SHIP-183b decided, which this document left open
+
+§9 is SHIP-183a's version of this section and exists for the same reason: the next change to any of
+these is a change to this document's reasoning, so the reasoning lives here rather than only in a
+comment somebody may edit.
+
+### The chain is read from the right, and that is the whole security argument
+
+`X-Forwarded-For` is a list a caller can prepend to and cannot append to. The rightmost element of
+`X-Forwarded-For…, RemoteAddr` is the peer the process actually accepted a connection from — the one
+entry no client can write — and everything to its left was put there by something further out. So
+counting hops **from the right** is unspoofable: a caller who prepends ten addresses moves the true
+client ten places left and the count lands on it regardless. Reading from the left would find the
+first invented entry, which is the bypass the whole mechanism exists to refuse.
+
+Two consequences worth stating rather than discovering:
+
+- **A malformed entry keeps its place in the chain.** Dropping one would shift everything to its
+  left by a position, which is a shift a caller engineers by writing a malformed entry of their own.
+- **A chain shorter than the configured hop count falls back to the peer, and logs.** That is a
+  proxy not appending what it was configured to append, and the consequence is every caller behind
+  it sharing one bucket. It is not reachable by a caller — a client can only make the chain longer
+  — so the log fires when the deployment is wrong and never because somebody attacked it.
+
+### The hop count and the allow-list are alternatives, and setting both refuses to start
+
+`Docs/09`'s *Done when* offers them as "a hop count **or** CIDR allow-list", and they answer the same
+question by different means. Composing them needs a rule nobody has argued for, and the plausible
+readings disagree — does the allow-list gate whether the header is read at all, or does it filter
+which hops the count skips? A deployment that set both would get whichever the code happened to
+prefer, which is a security posture nobody chose. `config.Load` refuses it.
+
+**The hop count is the better of the two wherever the count is stable.** It ignores what the values
+look like, so it has no equivalent of the allow-list's one weakness: a range wide enough to contain
+addresses a client could also write into the header — `10.0.0.0/8` where the balancer is one host —
+lets a caller inside it choose their bucket, because a spoofed entry that looks trusted is skipped
+rather than believed.
+
+### IPv6 is keyed on its /64, and IPv4 on the address
+
+**A limit keyed on a full IPv6 address is not a limit.** A residential IPv6 subscriber is routinely
+handed a /64 and often a /56, so one caller holds billions of addresses and empties a fresh bucket
+from each — the class would be unenforceable against exactly the callers it is meant to bound while
+remaining fully enforced against IPv4 callers, who cannot do the same. That is worse than an uneven
+limit: it is one whose strictness depends on which protocol the attacker chose.
+
+A /64 is the smallest block an operator assigns to one subscriber, which makes it the largest
+grouping that cannot merge two unrelated callers and the smallest one caller cannot escape. The
+revisit trigger is in §10 rather than left to judgement.
+
+IPv4 is keyed on the address, because there it already is one — and an IPv4-mapped IPv6 address is
+unmapped first, so `::ffff:198.51.100.9` and `198.51.100.9` are one caller rather than two who never
+meet.
+
+### The `Credential` class has two buckets, not one, and the reason is a boundary
+
+§9 settled **one bucket per class per caller** for the middleware classes, and this document applies
+the same rule to `Credential`: sign-in, refresh, email verification and phone verification all spend
+from one `credential:address:` bucket in `internal/identity`. Four buckets of thirty would be a
+hundred and twenty guesses from an address §3 meant to allow thirty, and an attacker who found one
+endpoint tight would simply spread the campaign across the other three.
+
+**`internal/admin` keeps its own, and that is a deliberate second bucket rather than an oversight.**
+The two domains cannot import each other, so a shared key would be two string constants agreeing by
+comment — which `Docs/10` §3.4 refuses — and the administrator console is a separate credential
+system from the mobile one by an invariant `CLAUDE.md` names, so one bucket spanning both would let
+traffic against either throttle sign-in to the other. The cost, stated rather than buried: **an
+attacker probing both surfaces from one address gets thirty on each rather than thirty in total.**
+That is a factor of two against a figure already an order of magnitude above legitimate use.
+
+### The global lever does not reach the `Credential` class
+
+§7 says the two scalars are "applied to every class", and that is true of the five this middleware
+enforces and **false of `Credential`**, which is enforced inside `internal/identity` and
+`internal/admin` against constants neither package reads configuration for. SHIP-183a shipped it
+that way and SHIP-183b did not change it.
+
+**It is recorded here rather than quietly fixed**, because the gap has an operational shape worth
+knowing before an incident rather than during one: *"everything tighter, now"* would move the read,
+write, upload, message and public-read surfaces and leave the credential surface — the one being
+attacked in a credential-stuffing incident — exactly where it was. §10 carries the trigger.
+
+It also has a benign consequence that the harness depends on: `scripts/verify-foundation.sh` opens
+the lever all the way, because every request in a `make verify` run arrives from `127.0.0.1` and the
+whole harness is therefore one caller against the address-keyed classes. `40-identity.sh`'s
+`SHIP-47` checks still measure the figures §3 argues for, precisely because the lever does not reach
+them.

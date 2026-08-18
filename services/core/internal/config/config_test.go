@@ -30,6 +30,12 @@ var allKeys = []string{
 	"STORAGE_ACCESS_KEY_ID", "STORAGE_SECRET_ACCESS_KEY", "STORAGE_USE_PATH_STYLE",
 	"STORAGE_PRESIGN_TTL", "STORAGE_MAX_UPLOAD_BYTES", "STORAGE_ACCEPTED_CONTENT_TYPES",
 	"UNSYNCED_NUDGE_AFTER", "PROOF_COMPRESSION_BUDGET_BYTES",
+	// SHIP-183a's global lever and SHIP-183b's trusted proxy. The first four lines of this
+	// list predate them and did not include the lever, which meant a deploy/.env setting one
+	// leaked into every test here — make exports the file's contents, so the tests would have
+	// been reading a developer's incident tuning.
+	"RATE_LIMIT_BURST_SCALE", "RATE_LIMIT_RATE_SCALE",
+	"TRUSTED_PROXY_HOPS", "TRUSTED_PROXY_NETWORKS",
 }
 
 // deploymentStorageCredentials is a credential a staging or production configuration can
