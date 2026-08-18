@@ -357,6 +357,42 @@ func init() {
 
 		Route{
 			Method:  http.MethodGet,
+			Pattern: "/admin/verifications/{id}/documents",
+			Group:   GroupV1,
+
+			// SHIP-155, and the screen that sits between the queue above and the decision
+			// above that. Docs/04 §3 defines the review as an administrator looking at the
+			// images "by eye for obvious validity"; SHIP-81b built the table and the
+			// provider's own endpoint over it, and until this route there was no way for the
+			// person doing the reviewing to see anything.
+			//
+			// RequireAdmin is the credential; `verifications.read` is the permission, checked
+			// in the handler (SHIP-148). The same permission the queue takes, which is a
+			// decision rather than an inheritance — the handler's own comment argues it
+			// against a narrower `verifications.evidence`, and the reason it is defensible is
+			// that **every read here writes an audit entry naming who made it**.
+			//
+			// **A GET that writes, which is the one thing about this route worth pausing on.**
+			// The write is an access record rather than a state change: the resource is
+			// unchanged, a repeat is safe, and what accumulates is the trail. It is therefore
+			// deliberately *not* in `auditedAdminMutations` — that table is the served
+			// surface's mutating half and a read listed there fails its own reverse check.
+			// `auditedAdminReads` in routes_admin_test.go is the tripwire for this one.
+			//
+			// Five segments with the wildcard fourth, the same shape as the decision route
+			// above and safe for the same reason: no literal sibling at that depth. The
+			// four-segment sibling `GET /v1/admin/verifications/expiring` (SHIP-159) is a
+			// different length and does not overlap.
+			//
+			// `{id}` is the **provider's account identifier**, as it is on the decision: one
+			// verification record per provider, `provider_verifications.provider_id` its
+			// primary key, and a provider's file addressed by the provider.
+			Auth:    RequireAdmin,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).VerificationEvidence() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
 			Pattern: "/admin/disputes",
 			Group:   GroupV1,
 
@@ -587,6 +623,17 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin verification console: " + err.Error())
 	}
 
+	// SHIP-155. It takes its own `profiles.Documents`, built from the same signer
+	// routes_profiles.go hands the provider's own endpoints — the seam that file opened in
+	// advance, so that the console reaches the evidence without `profiles.NewService` widening to
+	// carry a signer for the queue and the decision as well. The auditor is the one built above,
+	// so the access entry shares the clock and the transaction of the read it records.
+	evidence, err := admin.NewEvidence(
+		providerEvidence{documents: verificationDocuments(d)}, auditor, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin verification document viewer: " + err.Error())
+	}
+
 	// SHIP-164. It takes the same lifecycle adapter intake and enforcement do — one
 	// `admin.Jobs` implementation with a method per move this domain needs — and the auditor
 	// built above, so the dispute row, the job's transition and the audit entry all share the
@@ -609,6 +656,7 @@ func adminHandler(d Deps) *admin.Handler {
 		Notes:         notes,
 		Suspensions:   suspensions,
 		Verifications: verifications,
+		Evidence:      evidence,
 
 		DisputeWorkflow: disputeWorkflow,
 	}, d.Pool, d.Logger)
@@ -922,6 +970,7 @@ var (
 	_ admin.CancellationQueue     = cancellationQueueLookup{}
 	_ admin.JobDirectory          = jobDirectory{}
 	_ admin.ProviderVerifications = providerVerifications{}
+	_ admin.ProviderEvidence      = providerEvidence{}
 )
 
 // exceptionQueueLookup implements admin.ExceptionQueue over `delivery`s and `jobs`' rows
@@ -1669,4 +1718,85 @@ func (p providerVerifications) DecideVerification(
 	default:
 		return admin.VerificationMoveUnrecognised, admin.VerificationChange{}, err
 	}
+}
+
+// --- SHIP-155: the document viewer for private evidence ------------------------------------------
+
+// providerEvidence implements admin.ProviderEvidence over `internal/profiles`.
+//
+// # The capability, not the service, is what crosses
+//
+// `internal/profiles`' documents.go said in advance what this adapter would be: *"SHIP-155 composes
+// with this rather than against it. The administrator's document viewer constructs its own
+// [Documents] from `cmd/api/routes_admin.go`, hands it the same two ports, and reaches the reader
+// below — it does not need a wider [Service]."* That is what happens here, and the property it buys
+// is worth stating rather than assuming: `profiles.NewService` is untouched, so the administrator's
+// queue and decision endpoints still hold no signer, and this adapter holds a signer and cannot move
+// a verification state.
+//
+// The `*profiles.Documents` is built from `profileDocuments(d)` — the same `*storage.S3` value
+// routes_profiles.go builds for the provider's own endpoints, satisfying the same two ports. One
+// deployment, one bucket, one credential; the two kinds of object are kept apart by their key
+// prefix, and the two *readers* are kept apart by which credential reached them.
+//
+// # The translation, and there are two of them
+//
+//   - **the shapes.** `profiles.DocumentLink` and `admin.EvidenceDocument` are two packages' own
+//     types and neither may name the other's. Go satisfies the interface structurally, so this file
+//     is the only thing in the build that knows the two correspond.
+//   - **the refusal.** `admin` cannot call errors.Is against `profiles`' sentinels, so a caller who
+//     is not a provider account becomes found=false with a nil error. Everything else stays an
+//     error, because a failing database is not an answer. That is [providerVerifications]' division
+//     and [admin.ProviderEvidence] records the same reasoning from the other side.
+//
+// # Why the documents service is built per request rather than once
+//
+// It is built inside `adminHandler`, which `attach` calls once per route at startup — the same place
+// `profilesHandler` builds its own. The value holds configuration and a signer and no connection, so
+// a second is a struct rather than a resource, and threading one between two route files would be a
+// field on `Deps` that two domains would then both have to agree about.
+type providerEvidence struct {
+	documents *profiles.Documents
+}
+
+// EvidenceFor is every document a provider has submitted, each with a URL minted on this call.
+//
+// The Runner is the caller's, and here it is a *transaction*: admin.Evidence.For opens one so that
+// the read and the audit entry recording it commit together. That is safe to hold across this call —
+// `profiles.Documents.For` presigns, and presigning is an HMAC over a string rather than a request
+// to the store. The one method in that package that does reach the network is `Submit`'s `Stored`,
+// and nothing here calls it.
+//
+// A caller who is not a provider account — no such account, or a customer — is found=false. Both
+// come back from `profiles` as ErrNotProvider, which is that domain's single answer to the same two
+// conditions for the same reason `000200` makes them indistinguishable.
+func (p providerEvidence) EvidenceFor(
+	ctx context.Context,
+	r db.Runner,
+	providerID uuid.UUID,
+) ([]admin.EvidenceDocument, bool, error) {
+
+	links, err := p.documents.For(ctx, r, providerID)
+	switch {
+	case errors.Is(err, profiles.ErrNotProvider), errors.Is(err, profiles.ErrNoSuchProvider):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, fmt.Errorf("cmd/api: reading the verification evidence of %s: %w",
+			providerID, err)
+	}
+
+	out := make([]admin.EvidenceDocument, 0, len(links))
+	for _, link := range links {
+		out = append(out, admin.EvidenceDocument{
+			ID:            link.ID,
+			Kind:          string(link.Kind),
+			ContentType:   link.ContentType,
+			ContentLength: link.ContentLength,
+			ETag:          link.ETag,
+			SubmittedAt:   link.SubmittedAt,
+			URL:           link.URL,
+			ExpiresAt:     link.ExpiresAt,
+		})
+	}
+	return out, true, nil
 }

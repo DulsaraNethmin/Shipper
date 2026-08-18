@@ -141,6 +141,15 @@ type AuditAction string
 // half — an administrator recording an outcome and unfreezing the job — is a privileged action and
 // gets an entry, from that ticket.
 //
+// **One read is audited, and exactly one.** [AuditActionVerificationEvidenceViewed] is the
+// exception SHIP-155's *Done when* asks for by name — "verification images render through
+// short-lived signed URLs **and are access-logged**" — and its own doc comment argues why the
+// evidence is different from every other thing this console shows. It is worth stating here as
+// well, because a reader arriving at this block will otherwise take "mutations only" as the whole
+// rule and either widen it casually or delete the one entry that breaks it. The rule is: **an entry
+// per read is refused wherever the read is of the console's own working surface, and required where
+// the read hands somebody a credential to another person's identity documents.**
+//
 // **A failed sign-in is not audited either, and that is the more interesting of the two.** It cannot
 // be: `ck_audit_log_actor_id` requires a non-NULL actor for a non-system entry, and a sign-in that
 // failed because the address is unknown has no account to name. Recording it as `system` would put
@@ -274,6 +283,43 @@ const (
 	// find the other.
 	AuditActionVerificationDecided AuditAction = "verification.decided"
 
+	// AuditActionVerificationEvidenceViewed is an administrator opening a provider's document
+	// images (SHIP-155).
+	//
+	// **The only audited *read* in this catalogue, and the exception is the ticket's own
+	// requirement rather than a change of position.** The note above this block states the rule
+	// it departs from — Docs/01 §5.1 asks for audit logs of *privileged actions*, reading a queue
+	// or a history is not one, and an entry per read would bury the actions in the reads. That
+	// still holds for every other read the console serves: [AuditActionNoteAdded] declines a
+	// `note.read`, and `GET /v1/admin/verifications`, `GET /v1/admin/disputes` and the audit
+	// viewer itself write nothing.
+	//
+	// What is different here is *what is read*. SHIP-155's *Done when* is "verification images
+	// render through short-lived signed URLs **and are access-logged**", and Docs/04 §9 requires
+	// "private storage of verification evidence" as an internal control — of an object that is a
+	// photograph of somebody's driver licence, the most identifying thing this platform holds.
+	// The signed URL makes the image reachable and nothing can revoke one, so **the only durable
+	// record that a particular administrator was handed a credential to a particular person's
+	// identity documents is this entry.** A queue load discloses that somebody is waiting; this
+	// discloses the person.
+	//
+	// It is written in the transaction that performs the read, so a viewer whose entry cannot be
+	// written renders nothing — the same rule every mutation here is under, and the one clause of
+	// this ticket most likely to be met in name only. [Evidence.For] records the argument and
+	// TestTheDocumentViewerRendersNothingWhenItsAccessEntryCannotBeWritten takes the branch.
+	//
+	// The target is the **provider** whose evidence it was, as a `users` row, on
+	// [AuditActionNoteAdded]'s reading: a support query asking "everything that happened to this
+	// account" should return who looked at their documents beside the decisions taken about them.
+	// Which images were rendered is in the metadata, as the count and the identifiers — Docs/04
+	// §6.6 asks a moderation record to carry its "evidence reference", and this is the entry that
+	// can carry one.
+	//
+	// There is no reason on it. A reviewer opening a case has not made a decision yet, and a
+	// mandatory field with nothing to put in it becomes a placeholder string that makes the
+	// column useless for the actions that do need it ([AuditEntry.Reason] records that argument).
+	AuditActionVerificationEvidenceViewed AuditAction = "verification.evidence_viewed"
+
 	// AuditActionDisputeResolved is a dispute settled with a documented outcome, which is also
 	// what unfreezes the job (SHIP-164).
 	//
@@ -318,6 +364,7 @@ var AuditActions = []AuditAction{
 	AuditActionUserSuspensionRequested,
 	AuditActionUserSuspensionApproved,
 	AuditActionVerificationDecided,
+	AuditActionVerificationEvidenceViewed,
 	AuditActionDisputeResolved,
 }
 

@@ -3148,6 +3148,294 @@ ok "a provider cannot decide their own standing and a user token cannot reach th
 admin_clear_limits
 
 # ==========================================================================================
+# SHIP-155 — the document viewer for private evidence.
+#
+# # What this section demonstrates that no Go test can
+#
+# `internal/admin`'s own suite drives the real `internal/profiles` reader over a **fake** object
+# store, deliberately: what the domain has to get right is the record, and the schema enforces that.
+# What is left over is exactly what this section is for.
+#
+#   1. **The signature is real.** A URL minted here is signed by `internal/platform/storage` against
+#      MinIO with the deployment's own credential, and it is *spent* — the bytes come back. A
+#      stubbed signer means no Go test in that package can fail when signing breaks.
+#   2. **The adapter under test is the one that ships.** `providerEvidence` lives in package main,
+#      where no test has a database to reach; the Go suite exercises a copy of it.
+#   3. **The access entry is read out of `audit_log` by SQL**, on the same request that rendered the
+#      images. Two clauses of one *Done when*, demonstrated together on one round trip, which is the
+#      only place they meet.
+#
+# The provider is `verif_first`, already registered and decided by the two sections above, and every
+# fixture below is this file's own — no variable from another section file is read.
+
+ticket "SHIP-155  verification images render through short-lived signed URLs and are access-logged"
+
+admin_clear_limits
+
+# --- a document that actually exists in the bucket -------------------------------------------------
+#
+# Minted, uploaded and submitted through the platform's own three endpoints, because a row written
+# with SQL would carry an object key naming nothing, a media type nobody measured and an entity tag
+# nobody was given. Every one of those is the store's answer rather than anybody's choice, and the
+# viewer below hands all three to a reviewer.
+
+printf 'not a licence, but exactly fifty-two bytes of proof.' > "$WORKDIR/adm-evidence.bin"
+
+# evid_submit <kind> <n> — one document into verif_first's file. Leaves the record in
+# $WORKDIR/adm-evid-<kind>.json and the object key in $evid_last_key.
+#
+# It sets a global rather than printing, and is called directly rather than in a command
+# substitution: `fail` exits, and inside `$( … )` that exits only the subshell — the harness would
+# print the failure and carry on green.
+evid_last_key=""
+evid_submit() {
+  local kind="$1" n="$2" url code
+  code="$(curl -s -X POST -o "$WORKDIR/adm-evid-url-$kind.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $verif_first_token" -H "Idempotency-Key: verify-adm155-url-$kind-$n-$$" \
+    -H 'Content-Type: application/json' -d '{"content_type":"image/jpeg","content_length":52}' \
+    "http://localhost:$VERIFY_PORT/v1/provider/verification/documents/uploads")"
+  [[ "$code" == "200" ]] \
+    || { cat "$WORKDIR/adm-evid-url-$kind.json"; fail "minting an upload URL for $kind answered $code"; }
+
+  evid_last_key="$(json "$WORKDIR/adm-evid-url-$kind.json" '["object_key"]')"
+  url="$(json "$WORKDIR/adm-evid-url-$kind.json" '["upload_url"]')"
+
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Content-Type: image/jpeg" \
+    --data-binary "@$WORKDIR/adm-evidence.bin" "$url")"
+  [[ "$code" == "200" ]] || fail "uploading the $kind answered $code"
+
+  code="$(curl -s -X POST -o "$WORKDIR/adm-evid-$kind.json" -w '%{http_code}' \
+    -H "$auth_header: Bearer $verif_first_token" -H "Idempotency-Key: verify-adm155-rec-$kind-$n-$$" \
+    -H 'Content-Type: application/json' \
+    -d "{\"kind\":\"$kind\",\"object_key\":\"$evid_last_key\"}" \
+    "http://localhost:$VERIFY_PORT/v1/provider/verification/documents")"
+  [[ "$code" == "201" ]] \
+    || { cat "$WORKDIR/adm-evid-$kind.json"; fail "submitting the $kind answered $code"; }
+}
+
+evid_submit licence 1
+evid_licence_key="$evid_last_key"
+evid_licence_id="$(json "$WORKDIR/adm-evid-licence.json" '["id"]')"
+evid_submit insurance 1
+evid_insurance_id="$(json "$WORKDIR/adm-evid-insurance.json" '["id"]')"
+
+# evid_views — how many access entries name this provider.
+evid_views() {
+  "$PSQL" "$DATABASE_URL" -tAc \
+    "select count(*) from audit_log
+      where action = 'verification.evidence_viewed' and target_id = '$verif_first';"
+}
+
+evid_before="$(evid_views)"
+
+# --- who may reach it, before anything succeeds -----------------------------------------------------
+
+status="$(curl -s -o "$WORKDIR/adm-evid-anon.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/admin/verifications/$verif_first/documents")"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/adm-evid-anon.json"; fail "the viewer answered $status without a credential, want 401"; }
+
+status="$(admin_get "/v1/admin/verifications/$verif_first/documents" "$verif_first_token" evid-usertoken)"
+[[ "$status" == "401" ]] \
+  || { cat "$WORKDIR/admin-evid-usertoken.json"; fail "a user token reached the viewer and got $status, want 401"; }
+
+# And the provider's own endpoint is still the provider's: the same evidence, on the other
+# credential, scoped to the caller by construction and with no identifier anywhere in it.
+status="$(curl -s -o "$WORKDIR/adm-evid-own.json" -w '%{http_code}' \
+  -H "$auth_header: Bearer $verif_first_token" \
+  "http://localhost:$VERIFY_PORT/v1/provider/verification/documents")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/adm-evid-own.json"; fail "the provider could not read their own documents: $status"; }
+
+[[ "$(evid_views)" == "$evid_before" ]] \
+  || fail "a refused read, or the provider reading their own file, wrote an administrator access entry"
+ok "the evidence is on the administrator credential alone — an anonymous caller and a mobile token are both refused, and neither leaves an access entry"
+
+# --- the images themselves, through a support administrator -----------------------------------------
+#
+# `support` deliberately: every role holds `verifications.read`, because Docs 01 §4.6 gives "review
+# provider verification status" to the least-privileged role and Docs 04 §3 defines that review as
+# looking at the images. What makes that defensible is the entry, not the permission.
+
+status="$(admin_get "/v1/admin/verifications/$verif_first/documents" "$verif_sup_token" evid-first)"
+[[ "$status" == "200" ]] \
+  || { cat "$WORKDIR/admin-evid-first.json"; fail "a support administrator could not open the file: $status"; }
+
+python3 - "$WORKDIR/admin-evid-first.json" "$evid_licence_id" "$evid_insurance_id" <<'EVIDSHAPE' || fail "the evidence page shape is wrong"
+import json, sys
+page = json.load(open(sys.argv[1]))
+rows = page.get("data")
+if rows is None:
+    print("data is null"); sys.exit(1)
+allowed = {"id", "kind", "content_type", "content_length", "etag",
+           "submitted_at", "download_url", "download_expires_at"}
+by_id = {}
+for entry in rows:
+    extra, missing = set(entry) - allowed, allowed - set(entry)
+    if extra:
+        print("an entry carries", sorted(extra)); sys.exit(1)
+    if missing:
+        print("an entry is missing", sorted(missing)); sys.exit(1)
+    if not entry["download_url"] or not entry["download_expires_at"]:
+        print("a document came back with no credential:", entry["kind"]); sys.exit(1)
+    if not entry["etag"]:
+        print("a document came back with no entity tag:", entry["kind"]); sys.exit(1)
+    by_id[entry["id"]] = entry
+for want, kind in ((sys.argv[2], "licence"), (sys.argv[3], "insurance")):
+    if want not in by_id:
+        print("the file does not carry the submitted", kind); sys.exit(1)
+    if by_id[want]["kind"] != kind:
+        print("the", kind, "came back as", by_id[want]["kind"]); sys.exit(1)
+    if by_id[want]["content_length"] != 52:
+        print("the stored size is the client's claim rather than the store's answer"); sys.exit(1)
+EVIDSHAPE
+ok "a reviewer opens a provider's file and gets Docs 04 §3's documents, each with a credential and the store's own size and entity tag"
+
+# The object key never crosses the wire as a field. It is inside the signed URL, because a signature
+# over a request names the object it authorises and cannot not — so the claim that is worth making,
+# and is made here, is that it appears nowhere the expiry does not reach.
+grep -q '"object_key"' "$WORKDIR/admin-evid-first.json" \
+  && { cat "$WORKDIR/admin-evid-first.json"; fail "the viewer carries an object_key field"; }
+python3 - "$WORKDIR/admin-evid-first.json" "$evid_licence_key" <<'EVIDKEY' || fail "the object key outlives the credential beside it"
+import json, sys
+raw = open(sys.argv[1]).read()
+key = sys.argv[2]
+if key not in raw:
+    print("the signed URL does not name the object, so this check would pass vacuously"); sys.exit(1)
+for entry in json.load(open(sys.argv[1]))["data"]:
+    raw = raw.replace(entry["download_url"], "")
+if key in raw:
+    print("the object key survives outside the signed URL"); sys.exit(1)
+EVIDKEY
+ok "and no durable handle comes with it — the key is inside the signature and nowhere else"
+
+# --- the URL is real, is short-lived, and is minted on the request that asked ------------------------
+
+evid_url_1="$(python3 -c "
+import json,sys
+for d in json.load(open(sys.argv[1]))['data']:
+    if d['id'] == sys.argv[2]: print(d['download_url']); break
+" "$WORKDIR/admin-evid-first.json" "$evid_licence_id")"
+[[ -n "$evid_url_1" ]] || fail "the licence came back with no download URL"
+
+fetched="$(curl -s -o "$WORKDIR/adm-evid-fetched.bin" -w '%{http_code}' "$evid_url_1")"
+[[ "$fetched" == "200" ]] || fail "the administrator's signed download answered $fetched"
+[[ "$(cat "$WORKDIR/adm-evid-fetched.bin")" == "not a licence, but exactly fifty-two bytes of proof." ]] \
+  || fail "the signed download returned something other than the uploaded bytes"
+
+# The signature is the whole of the authorisation: the same object without one is refused by the
+# store, which is what makes "private" a property of the bucket rather than of this endpoint.
+unsigned="$(curl -s -o /dev/null -w '%{http_code}' "${evid_url_1%%\?*}")"
+[[ "$unsigned" == "403" || "$unsigned" == "401" ]] \
+  || fail "the object is readable without a signature (HTTP $unsigned) — the bucket is not private"
+ok "the reviewer's URL fetches the image the provider uploaded, and the same object without a signature is refused by the store"
+
+sleep 1
+status="$(admin_get "/v1/admin/verifications/$verif_first/documents" "$verif_mod_token" evid-second)"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/admin-evid-second.json"; fail "the second read answered $status"; }
+
+evid_url_2="$(python3 -c "
+import json,sys
+for d in json.load(open(sys.argv[1]))['data']:
+    if d['id'] == sys.argv[2]: print(d['download_url']); break
+" "$WORKDIR/admin-evid-second.json" "$evid_licence_id")"
+
+[[ "$evid_url_1" != "$evid_url_2" ]] \
+  || fail "two reads a second apart produced the same URL, so the credential did not move with the request"
+python3 - "$evid_url_1" "$evid_url_2" <<'EVIDFRESH' || fail "both reads carry one signing instant — a stored URL would look exactly like this"
+import sys, urllib.parse
+def signed_at(u):
+    return urllib.parse.parse_qs(urllib.parse.urlsplit(u).query)["X-Amz-Date"][0]
+if signed_at(sys.argv[1]) == signed_at(sys.argv[2]):
+    sys.exit(1)
+EVIDFRESH
+
+# And there is no column a URL could have come out of, which is what makes the freshness above a
+# property of the schema rather than of one implementation.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+      "select count(*) from information_schema.columns
+        where table_name = 'provider_verification_documents'
+          and (column_name like '%url%' or column_name like '%link%');")" == "0" ]] \
+  || fail "provider_verification_documents holds a URL-shaped column, so a credential is stored at rest"
+ok "each read mints its own signature with its own expiry, and no column exists that a stored one could come from"
+
+# --- the access log, which is the clause most easily met in name only --------------------------------
+
+evid_after="$(evid_views)"
+(( evid_after == evid_before + 2 )) \
+  || fail "two reads left $((evid_after - evid_before)) access entries, want 2 — an access log that records one look in two is one nobody can rely on"
+
+evid_entries="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select json_agg(row_to_json(e))
+     from (select actor_type, actor_id::text as actor_id, target_type, target_id::text as target_id, metadata
+             from audit_log
+            where action = 'verification.evidence_viewed' and target_id = '$verif_first'
+            order by id) e;")"
+
+# The support administrator's identifier, taken from the sign-in body rather than from a variable
+# the SHIP-153 fixture never set. `admin_signin` stores the whole response, and it names the account
+# it issued the session for — which is the same value the access entry must carry.
+evid_sup_id="$(json "$WORKDIR/admin-verif-sup.json" '["administrator"]["id"]')"
+[[ -n "$evid_sup_id" ]] || fail "the support administrator's sign-in did not name the account"
+
+python3 - "$evid_entries" "$evid_sup_id" "$verif_mod_id" "$evid_licence_id" "$evid_insurance_id" \
+  <<'EVIDLOG' || fail "the access entries do not record who looked at whose evidence"
+import json, sys
+entries = json.loads(sys.argv[1])
+support, moderator = sys.argv[2], sys.argv[3]
+wanted = {sys.argv[4], sys.argv[5]}
+if len(entries) < 2:
+    print("only", len(entries), "entries"); sys.exit(1)
+first, second = entries[-2], entries[-1]
+for entry, who in ((first, support), (second, moderator)):
+    if entry["actor_type"] != "admin":
+        print("actor_type is", entry["actor_type"]); sys.exit(1)
+    if entry["actor_id"] != who:
+        print("the entry names", entry["actor_id"], "and the read was made by", who); sys.exit(1)
+    if entry["target_type"] != "user":
+        print("target_type is", entry["target_type"]); sys.exit(1)
+    metadata = entry["metadata"]
+    if metadata.get("document_count") != 2:
+        print("document_count is", metadata.get("document_count")); sys.exit(1)
+    if not wanted.issubset(set(metadata.get("document_ids") or [])):
+        print("the entry does not name the images handed over:", metadata.get("document_ids"))
+        sys.exit(1)
+EVIDLOG
+ok "every read names the administrator who made it, the provider whose file it was, and the images handed over — Docs 04 §6.6's evidence reference, in a table nobody can rewrite"
+
+# The trail is append-only, so the record of who was shown somebody's licence cannot be tidied away
+# afterwards. `000003`'s trigger, from a psql prompt rather than through the service.
+evid_entry_id="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select id from audit_log where action = 'verification.evidence_viewed'
+     and target_id = '$verif_first' order by id desc limit 1;")"
+if "$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+     "delete from audit_log where id = '$evid_entry_id';" >/dev/null 2>&1; then
+  fail "an access entry was deleted — the record of who saw somebody's identity documents is not append-only"
+fi
+[[ "$(evid_views)" == "$evid_after" ]] || fail "an access entry disappeared"
+ok "and an access entry cannot be deleted, from the service or from a database prompt"
+
+# --- an account with no verification record ---------------------------------------------------------
+#
+# A customer has none — `000200` gives one to providers — so there is no file to open. It is a plain
+# 404 because the caller is an administrator holding a permission over verifications and, unlike
+# dispute intake, nothing is being kept from them. **And nothing is written**: an entry for a read
+# that did not happen would record a review of a file nobody was shown, and would let somebody probe
+# which identifiers exist by reading the trail rather than the responses.
+
+status="$(admin_get "/v1/admin/verifications/$verif_customer_id/documents" "$verif_mod_token" evid-cust)"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/admin-evid-cust.json"; fail "a customer's evidence answered $status, want 404"; }
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+      "select count(*) from audit_log
+        where action = 'verification.evidence_viewed' and target_id = '$verif_customer_id';")" == "0" ]] \
+  || fail "a refused read wrote an access entry, which is a trail describing a review that did not happen"
+
+status="$(admin_get "/v1/admin/verifications/not-a-uuid/documents" "$verif_mod_token" evid-badid)"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/admin-evid-badid.json"; fail "a malformed identifier answered $status, want 400"; }
+ok "an account with no verification record is a plain 404 that writes nothing, and a malformed identifier is a 400"
+
+admin_clear_limits
+
+# ==========================================================================================
 # SHIP-164 — the dispute workflow: investigation, and the outcome that unfreezes the job.
 #
 # # What this section demonstrates that no Go test can

@@ -860,3 +860,101 @@ type VerificationChange struct {
 	// To is the outcome they now hold.
 	To string
 }
+
+// --- SHIP-155: the document viewer for private evidence ------------------------------------------
+
+// ProviderEvidence is Docs/04 §3's four document images, as far as this domain reaches into them.
+//
+// # Why this is a second port rather than two more methods on [ProviderVerifications]
+//
+// `internal/profiles` already divides the same way and records why: [DocumentUploads] answers "where
+// may this provider put a photograph of their insurance certificate" and [DocumentObjects] answers
+// "what is actually there, and may this reader see it", so that "a domain reading proof cannot mint
+// permission to write it". This port is the administrator's end of the second question only. A
+// console that could reach the evidence must not thereby be able to move a verification state, and
+// the reason it cannot is that the two capabilities are two interfaces with two services behind
+// them.
+//
+// **The implementation is an adapter over that domain's [profiles.Documents] rather than SQL in
+// cmd/api**, which is [ProviderVerifications]' arrangement rather than [JobDirectory]'s: the
+// statement touches one domain's table plus `users`, so it stays with the domain that owns the rows
+// and what lives in the composition root is a translation. `cmd/api/routes_admin.go` constructs its
+// own `profiles.Documents` from the same two ports the provider's own endpoint uses — it does not
+// need, and must not be given, a wider service.
+//
+// # Every URL on the way out is minted on the request that asked for it
+//
+// `provider_verification_documents` has no URL column, so there is nothing anybody could read a
+// credential out of, and each [EvidenceDocument] carries its own expiry. That is the *Done when*'s
+// first clause and it is a property of the schema rather than of one implementation —
+// `scripts/verify/62-profiles.sh` asserts the absent column directly.
+type ProviderEvidence interface {
+	// EvidenceFor is every document this provider has submitted, newest first within each kind,
+	// each with a freshly signed short-lived URL.
+	//
+	// found is false when there is no such provider — no account, or an account that is not a
+	// provider. One answer for two conditions, on [VerificationProviderNotFound]'s reasoning:
+	// `000200` gives every provider a record at registration, so the two are indistinguishable
+	// from the record's side, and the caller holds a permission over verifications so nothing is
+	// being kept from them.
+	//
+	// A provider who has submitted nothing is found with no documents, which is not the same
+	// answer and must not be collapsed into the first: it is the ordinary state of every provider
+	// on the day they register, and it is what a reviewer about to reject somebody for having
+	// supplied no evidence needs to be able to see.
+	//
+	// It takes a Runner rather than opening its own, so the read and the access entry that
+	// records it are one transaction — see [Evidence.For].
+	EvidenceFor(ctx context.Context, r db.Runner, providerID uuid.UUID) (
+		documents []EvidenceDocument, found bool, err error)
+}
+
+// EvidenceDocument is one submitted image and a short-lived URL to read it at (SHIP-155).
+//
+// **No object key**, and that is a narrowing this domain makes deliberately rather than a field
+// nobody needed. The key is a durable handle into the bucket holding identity documents; a console
+// has no operation that takes one, and every read is answered with a credential that expires
+// instead. `internal/profiles`' own response shape declines it for the same reason and says so.
+//
+// **No budget, no job and no bid**, which is structural in the way [VerificationEntry] is: there is
+// nowhere on this struct to put one.
+type EvidenceDocument struct {
+	ID uuid.UUID
+
+	// Kind is which of Docs/04 §3's four documents this is, as a plain string.
+	//
+	// Not a closed type here, on [VerificationEntry.State]'s reasoning: `profiles.Kinds` is that
+	// domain's list, held to `ck_provider_verification_documents_kind` by a test in both
+	// directions, and a second copy in this package would shadow a checked one.
+	Kind string
+
+	// ContentType and ContentLength are what the object store reported when the platform asked,
+	// after the upload — not what the client said it would send.
+	ContentType   string
+	ContentLength int64
+
+	// ETag is the store's entity tag for the bytes at the moment they became evidence.
+	//
+	// On the wire because `000201` put it in the schema for this endpoint: *"A pre-signed PUT
+	// stays usable until it expires and nothing can revoke it, so the holder of a URL can
+	// overwrite the object it names inside that window. The answer is detection rather than
+	// prevention… SHIP-155's viewer is where an administrator would be shown a mismatch."*
+	//
+	// **The platform does not re-ask the store and compare**, and that is a decision rather than
+	// an omission. Doing so would be one HEAD per document held across the database transaction
+	// this read runs in, which is the arrangement `profiles.Documents.Submit` explicitly refuses —
+	// "a database transaction held open across a call to another service is a pool connection
+	// hostage to that service's worst day". The comparison belongs to whoever renders the image,
+	// because a signed GET returns the store's current tag in its own response header: the party
+	// holding the bytes is the party that can tell whether they are the recorded ones.
+	ETag string
+
+	// SubmittedAt is when the platform recorded the document. The newest of a kind is the current
+	// one; `000201` is append-only, so the ones behind it are what was reviewed before.
+	SubmittedAt time.Time
+
+	// URL is a freshly signed, short-lived link to the image, and ExpiresAt is when it stops
+	// working. Nothing stores either.
+	URL       string
+	ExpiresAt time.Time
+}

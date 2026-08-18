@@ -15420,6 +15420,130 @@ so an allow-list cannot outlive the copy it records.
 |---|---|
 | Provider disclosure channels | The enumeration above; `test/support/disclosure.dart`, the first shared Flutter test helper root; closed-world guards on the open job screen and bid panel, the provider feed, the provider's own bids, and the negotiation screen; the money-by-shape hole closed and proved by mutation |
 
+### SHIP-155 — the administrator's document viewer, and the first audited read (wave 15)
+
+> **Done when:** Verification images render through short-lived signed URLs and are access-logged.
+
+**Both clauses demonstrated.** `GET /v1/admin/verifications/{id}/documents` renders a provider's
+submitted evidence with a URL minted on the request that asked for it, and writes one `audit_log`
+entry per read naming the administrator, the provider, and the images handed over — in the
+transaction that performs the read, so a viewer whose entry cannot be written renders nothing.
+
+This is the screen between SHIP-153's queue and SHIP-154's decision. Docs/04 §3 defines the review
+as an administrator looking at the images "by eye for obvious validity"; SHIP-81b built the table and
+the provider's own endpoint over it last wave, and until this ticket the person doing the reviewing
+had a row, a state and a reason and nothing to look at.
+
+#### The seam was designed a wave in advance and it held without widening anything
+
+`internal/profiles/documents.go` predicted this ticket in its own header — *"SHIP-155 composes with
+this rather than against it. The administrator's document viewer constructs its own Documents from
+`cmd/api/routes_admin.go`, hands it the same two ports, and reaches the reader below — it does not
+need a wider Service."* That is exactly what shipped. **`profiles.NewService` is untouched**, so the
+queue and the decision endpoints still hold no signer; the new adapter holds a signer and cannot move
+a verification state. The two capabilities stay two interfaces, which is the property `profiles`'
+ports.go spends a paragraph on.
+
+One refactor came out of it: `cmd/api/routes_profiles.go` now exposes `verificationDocuments(d)`, so
+the document policy is read out of `internal/config` once rather than in each of the two route files.
+Two copies of the accepted media types and the two lifetimes is the drift `Docs/06` §5.3 is written
+about — the one nobody updated refuses a photograph the other half had just accepted.
+
+#### `verifications.read`, not a narrower permission — and the reasoning, because it was close
+
+A `verifications.evidence` held by `moderator` and `owner` alone was the alternative and it is not
+obviously wrong: an identity document is the most sensitive object this platform holds. It was
+refused for two reasons and one compensation.
+
+- **`Docs/01` §4.6 gives "review provider verification status" to support**, and `Docs/04` §3 defines
+  that review as looking at the images. A support administrator who could see the queue and not the
+  evidence could not perform the review the document assigns them.
+- **`Docs/04` §9's control over evidence is *"private storage of verification evidence"***, which is
+  a statement about the bucket and the URL lifetime rather than about which console role may look.
+- **The access entry is the compensating control**, and it is what makes a broad read permission
+  defensible at all: a narrower permission moves the question from "who looked" to "who *could* have
+  looked", and only the first is answerable afterwards.
+
+#### The first audited read in the catalogue, and the rule it departs from is now written twice
+
+`admin.AuditActions`' header said reads are not audited — "an entry per read would bury the actions
+in the reads" — and `AuditActionNoteAdded` declines a `note.read` in as many words. That rule still
+holds for `GET /v1/admin/verifications`, `GET /v1/admin/disputes` and the audit viewer itself. What
+is different here is **what the response contains**: a queue load discloses that somebody is waiting;
+this hands the caller unrevocable short-lived links to photographs of that person's driver licence.
+The stated rule is now: *an entry per read is refused wherever the read is of the console's own
+working surface, and required where the read hands somebody a credential to another person's identity
+documents.*
+
+The route is deliberately **not** in `cmd/api`'s `auditedAdminMutations`. That table checks itself in
+both directions and its reverse direction only marks *mutating* routes as served, so a read listed
+there would fail as "listed and not served" on a tree where nothing is wrong. A second table,
+`auditedAdminReads`, is the tripwire on that side, and `TestEveryAuditedAdminReadIsServedAndDistinct`
+checks the two tables share no action. **What that test cannot check is stated in its own doc
+comment**: "no unlisted administrative read writes an entry" is not answerable from the route table,
+because a route declaration carries its method, path and auth class and nothing about whether the
+handler writes. `admin.AuditActions` paired with the domain's `adminMutations` table is what closes
+that side.
+
+#### One test was written wrong, went red, and is recorded rather than quietly narrowed
+
+`TestTheDocumentViewerCarriesNoObjectKey` asserted the object key was absent from the whole response
+body. It failed, correctly: **a pre-signed URL necessarily names the object it authorises**, so the
+key is inside `download_url` and cannot be removed from it — that is what a signature over a request
+*is*. An assertion that would fail on every correct implementation is an assertion about the wrong
+thing. It is now `TestTheDocumentViewerCarriesNoDurableObjectKey` and makes the narrower claim that
+is true and worth making: strip the signed URLs out of the body and the key goes with them, so a
+console that stores the response keeps nothing outliving the credential. The harness makes the same
+check the same way, and both fail loudly if the fixture stops signing at all.
+
+#### What was declined, and why
+
+**The platform does not re-ask the store for each object's entity tag and compare.** `000201` stores
+`etag` and says SHIP-155's viewer "is where an administrator would be shown a mismatch". Doing the
+comparison here would be one HEAD per document held across the database transaction the access entry
+is written in — the arrangement `profiles.Documents.Submit` explicitly refuses, because "a database
+transaction held open across a call to another service is a pool connection hostage to that service's
+worst day". The recorded tag is on the wire instead, and a signed GET returns the store's current tag
+in its own response header: **the party holding the bytes is the party that can tell whether they are
+the recorded ones.** That is a console's check to make and the contract says so.
+
+**No notification, no state change and no worker task.** The viewer reads. `cmd/api/routes_admin.go`
+noted that the system actor on a verification decision would come from "SHIP-159's expiry sweep"; no
+sweep was built, and §4 carries what that leaves.
+
+#### The mutation: the audit write removed, the viewer left working
+
+The whole `auditor.Record` block deleted from `admin.Evidence.For` — 30 lines, leaving the read, the
+signing and the response untouched. This attacks the *Done when*'s second clause, which is the one
+most easily met in name only.
+
+**Killed, in the domain, by four tests.** Named because which one fires is the finding:
+
+| Test | What it caught |
+|---|---|
+| `TestOpeningAProvidersEvidenceIsAccessLogged` (`evidence_test.go:485`) | `one read wrote 0 access entries, want exactly 1` — a row count over `audit_log`, not a return value |
+| `TestAnEmptyFileIsStillAnAccessAndStillWritesAnEntry` (`:564`) | the same, for a provider who has submitted nothing |
+| `TestTheDocumentViewerRendersNothingWhenItsAccessEntryCannotBeWritten` (`:598`) | the read succeeded where it must fail — the commit-together half rather than the write half |
+| `TestEveryAdminMutationWritesAnAuditEntry/opening a provider's verification evidence` (`audit_test.go:651`) | **SHIP-150's pre-existing machinery** |
+
+**The fourth row is the one worth carrying.** It is not a test this ticket wrote. Adding
+`verification.evidence_viewed` to `admin.AuditActions` obliges a row in `adminMutations`, and that
+row drives the handler through `RequireAdmin` and reads the entry back — so the mutation would have
+died even if this branch had written no evidence-specific test at all. The catalogue is load-bearing
+rather than documentary, which is a claim SHIP-150's own §3 entry made and this is the first time
+another ticket has demonstrated it.
+
+The harness's `SHIP-155` section fails on it as well (`two reads left 0 access entries, want 2`), so
+the guard exists at both layers. **Restored by the recipe** — copy taken before the mutation with
+`SHASUMS` written beside it in the same command at
+`~/.claude/shipper-mutations/wave15-lane-a/`, restored with `cp`, confirmed by `git diff` (silent),
+`shasum -a 256 -c` (`evidence.go: OK`) and the tree's own digest
+(`202b4d499b99c3df09ea8a41dbb0abac8d269e2ae89774067ccca6003f7f1e17`, equal to the snapshot's).
+
+| Surface | What |
+|---|---|
+| SHIP-155 | `GET /v1/admin/verifications/{id}/documents` — a provider's evidence with a fresh signed URL per image and per read; `admin.Evidence` + the `ProviderEvidence` port + `cmd/api`'s `providerEvidence` adapter over `profiles.Documents`; `verification.evidence_viewed`, the catalogue's first audited read, written in the read's own transaction; `auditedAdminReads` as the route-side tripwire; 8 Go tests and 9 harness checks |
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

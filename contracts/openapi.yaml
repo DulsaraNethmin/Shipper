@@ -220,6 +220,8 @@ paths:
     $ref: './paths/admin.yaml#/AdminVerifications'
   /v1/admin/verifications/{id}/decision:
     $ref: './paths/admin.yaml#/AdminVerificationDecision'
+  /v1/admin/verifications/{id}/documents:
+    $ref: './paths/admin.yaml#/AdminVerificationEvidence'
   /v1/app/minimum-version:
     $ref: './paths/app.yaml#/MinimumVersion'
   /v1/app/policy:

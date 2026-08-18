@@ -3856,6 +3856,112 @@ AdminVerifications:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+AdminVerificationEvidence:
+  get:
+    operationId: adminVerificationEvidence
+    summary: Open a provider's verification documents
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/04 §3's four document images, for the administrator who reviews them "by eye for obvious
+      validity — correct document type, legible, not visibly expired, name matching the account".
+      This is the screen between the verification queue and the decision taken from it (SHIP-155).
+
+      **Every image is reachable only through a freshly signed URL, and the URL is the whole of the
+      authorisation.** Nothing stored holds one — `provider_verification_documents` has no URL
+      column — so each read mints its own with its own expiry, and a link handed to a console stops
+      working when its window closes. Nothing can revoke one before then, which is why the window is
+      short and why the next paragraph exists.
+
+      **Every read is recorded in the audit log**, naming the administrator who made it, the
+      provider whose file it was, and the identifiers of the images handed over. It is the only
+      durable record that a particular person was given links to another person's identity
+      documents, and it is written in the same transaction as the read — a request whose entry
+      cannot be written renders nothing.
+
+      Newest first within each kind. `000201` is append-only, so a retake is a second row and **the
+      first row of a kind is the current document**; the ones behind it are what was reviewed
+      before. There is no paging: four kinds, each re-photographed a handful of times at most.
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: |
+          The **provider's account identifier**. There is one verification record per provider and
+          `provider_verifications.provider_id` is its primary key, so a provider's file is addressed
+          by the provider — the same identifier the queue returns and the decision endpoint takes.
+        schema:
+          type: string
+          format: uuid
+    responses:
+      '200':
+        description: |
+          The provider's submitted documents, each with a signed URL. An empty `data` is an ordinary
+          answer rather than a 404: it is the state of every provider on the day they register, and
+          it is what a reviewer about to reject somebody for supplying no evidence needs to see.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/VerificationEvidencePage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `verifications.read`
+          (`admin_permission_denied`). Every role holds it, including `support` — Docs/01 §4.6
+          gives "review provider verification status" to the least-privileged role, and the access
+          entry above is what makes that defensible.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          No provider verification record exists for that identifier — either no such account, or an
+          account that is not a provider (`not_found`). Disclosed plainly: the caller holds a
+          permission over verifications and, unlike dispute intake, nothing is being kept from them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
 AdminVerificationDecision:
   post:
     operationId: adminDecideVerification
@@ -4017,6 +4123,102 @@ AdminVerificationDecision:
           application/json:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
+
+VerificationEvidencePage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`, and
+    `next_cursor` is always absent — this collection is bounded by how many times a provider
+    re-photographs four documents rather than by anything that grows with the platform. The envelope
+    is here anyway, because a client tells a collection from a single resource by its shape.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/VerificationEvidenceDocument'
+    next_cursor:
+      type: string
+      description: Always absent on this endpoint. See above.
+    has_more:
+      type: boolean
+      description: Always `false` on this endpoint.
+      example: false
+
+VerificationEvidenceDocument:
+  type: object
+  additionalProperties: false
+  required: [id, kind, content_type, content_length, etag, submitted_at, download_url, download_expires_at]
+  description: |
+    One submitted image, and permission to look at it until `download_expires_at`.
+
+    **There is no object key here.** The key is a durable handle into the private bucket holding
+    identity documents; a console has no operation that takes one, and every read is answered with a
+    credential that expires instead — so sending a permanent handle beside a temporary one would be
+    handing out the thing the expiry exists to make temporary. The provider's own endpoint declines
+    it for the same reason.
+
+    **Nothing commercial, and there is nowhere in this shape to put any** (Docs/01 §4.3).
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: |
+        The document record's identifier. It is what the access entry in the audit log names, so a
+        later question — "which images was this reviewer actually shown?" — is answerable.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    kind:
+      type: string
+      enum: [licence, registration, insurance, abn_evidence]
+      description: |
+        Which of Docs/04 §3's four documents this is. `abn_evidence` rather than `abn`, because what
+        is photographed is evidence *of* an ABN rather than the number itself.
+      example: insurance
+    content_type:
+      type: string
+      description: |
+        What the object store reported when the platform asked, after the upload — not what the
+        client said it would send.
+      example: image/jpeg
+    content_length:
+      type: integer
+      format: int64
+      description: The stored size in bytes, likewise the store's answer.
+      example: 284913
+    etag:
+      type: string
+      description: |
+        The store's entity tag for the bytes at the moment they became evidence.
+
+        A pre-signed PUT stays usable until it expires and nothing can revoke it, so the holder of an
+        upload URL can overwrite the object it names inside that window. The answer is detection
+        rather than prevention: **a signed GET returns the store's current tag in its own response
+        header, and a viewer that finds a different one is looking at bytes that are not the ones
+        recorded.** The platform does not make that comparison itself — it would be one request to
+        the store per document, held across the database transaction the access entry is written in.
+      example: '"9b2cf5e1d0a34f6e8c7b1a2d3e4f5061"'
+    submitted_at:
+      type: string
+      format: date-time
+      description: |
+        When the platform recorded the document. Within a kind, the newest row is the current
+        document and the ones behind it are what was reviewed before.
+      example: '2026-06-10T08:00:00Z'
+    download_url:
+      type: string
+      format: uri
+      description: |
+        A freshly signed link to the image, minted on this request. **Always present**, unlike the
+        provider's own shape where it is omitted from the response that records a submission: this
+        endpoint only ever reads, so a document with no link is a fault rather than a state.
+      example: https://storage.example/verification/0198f2c1/0198f2c2?X-Amz-Signature=…
+    download_expires_at:
+      type: string
+      format: date-time
+      description: |
+        When the link stops working. Nothing can revoke it before then, which is why it is short.
+      example: '2026-06-10T08:05:00Z'
 
 VerificationQueuePage:
   type: object
