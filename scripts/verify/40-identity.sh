@@ -1643,26 +1643,31 @@ ok "another account's request is its own, and neither account can see the other'
 
 # The scope boundary, stated as a check rather than as a comment. **SHIP-170 widened it and this
 # line moved with it rather than being deleted**, which is what SHIP-169 wrote it for: "if a later
-# branch widens the constraint, this line is what makes that a decision somebody took."
+# branch widens the constraint, this line is what makes that a decision somebody took." SHIP-171
+# moved it again, and the pair below is now the whole point of the file's last two checks: the CHECK
+# has three states and the index still has two.
 #
-# SHIP-171's 'completed' is still absent, and that is the boundary now. LC_ALL=C so the sort is by
-# bytes rather than by whatever locale the runner inherited.
+# LC_ALL=C so the sort is by bytes rather than by whatever locale the runner inherited.
 deletion_states="$("$PSQL" "$DATABASE_URL" -tAc \
   "select pg_get_constraintdef(oid) from pg_constraint
     where conname = 'ck_account_deletion_requests_state';" \
   | grep -oE "'[a-z_]+'::text" | tr -d "'" | sed 's/::text//' | LC_ALL=C sort | tr '\n' ',' | sed 's/,$//')"
-[[ "$deletion_states" == "deferred,requested" ]] \
-  || fail "the deletion states are '$deletion_states', want 'deferred,requested' — SHIP-170 is built and SHIP-171 is not"
-ok "'requested' and 'deferred' are the states — the execution is still SHIP-171's"
+[[ "$deletion_states" == "completed,deferred,requested" ]] \
+  || fail "the deletion states are '$deletion_states', want 'completed,deferred,requested' — SHIP-169, SHIP-170 and SHIP-171 are all built"
+ok "'requested', 'deferred' and 'completed' are the states a request can be in"
 
-# The index widened with the CHECK, which is the half of 000106 that is easy to leave out. An index
-# still partial on 'requested' alone would let one account hold a deferred request and a live one.
+# **The index did *not* widen with the CHECK, and that is SHIP-171's most easily-lost decision.**
+# 000106 widened this predicate because a deferred request is an *open* request; 000105 said before
+# either existed why a completed one is not — "a completed request must not stop a later one; only
+# an *open* one does". Adding 'completed' here would be a silent, permanent refusal: the account
+# would hold one row forever and every later request would be swallowed by ON CONFLICT with the
+# executed one handed back as though it were live.
 deletion_open_predicate="$("$PSQL" "$DATABASE_URL" -tAc \
   "select indexdef from pg_indexes where indexname = 'uq_account_deletion_requests_open';" \
   | sed 's/.* WHERE //' | grep -oE "'[a-z_]+'::text" | tr -d "'" | sed 's/::text//' | LC_ALL=C sort | tr '\n' ',' | sed 's/,$//')"
 [[ "$deletion_open_predicate" == "deferred,requested" ]] \
-  || fail "uq_account_deletion_requests_open covers '$deletion_open_predicate', want 'deferred,requested' — a deferred request is an open request"
-ok "one open request per account covers both open states, so a deferral cannot become a second promise"
+  || fail "uq_account_deletion_requests_open covers '$deletion_open_predicate', want 'deferred,requested' — a deferred request is open and a completed one must not be"
+ok "the open-request index covers the two open states and not the third — a completed request never blocks a later one"
 
 # ---------------------------------------------------------------------------------------
 ticket "SHIP-170  a request during a delivery queues until the job closes, and explains why"
@@ -1880,3 +1885,440 @@ ok "one row across the whole lifecycle, and the row holds the state the person w
 [[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' | wc -l | tr -d ' ')" == "0" ]] \
   || fail "this section left per-address sign-in buckets behind, which a later track would be throttled by"
 ok "no per-address sign-in bucket was spent here, so SHIP-47's clean-up still holds at the end of the file"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-171  the clock runs out and the person is replaced by a stable pseudonym"
+
+# Docs/05 §3.1: "delete the person, retain the transaction". SHIP-169 recorded the request and the
+# promise, SHIP-170 held it while a delivery was in flight, and this is what happens when the
+# thirty days run out — from cmd/worker, because nobody presses a button to be erased on the
+# thirtieth day and §3.1 puts execution out of an ordinary administrator's reach entirely.
+#
+# # What only this can show
+#
+# internal/identity/pseudonymise_test.go holds the rules: which requests are due, what a pseudonym
+# is made of, that nothing in the schema still holds the person, and that a completed request does
+# not stop the same account asking again. cmd/worker/tasks_identity_test.go holds the pass and both
+# adapters. **What only this can show is the real binary reaching across five tables that four
+# domains own**, against rows the served API wrote, in a database that has been through every
+# section before it.
+#
+# # Own what you assert about — the rule this section had to think hardest about
+#
+# cmd/worker is one binary and a start runs *every* registered task, so this start also runs
+# job-expiry, job-expiry-warning, bid-expiry, job-auto-complete and outbox-publisher. This is
+# **section 40**, which runs before every other section that starts a worker, so a pass here reaches
+# a database the later sections have not built yet — which is the safest position in the file order
+# and is not an excuse for skipping the sweep.
+#
+#   * The three job sweeps claim what is due. The only jobs in the database at this point are this
+#     file's own: SHIP-170's fixture, which ends `Completed`, and the two created below, which are
+#     `Draft` and `Awarded`. None is `Open`, `Negotiating`, or `Delivered` and older than seventy-two
+#     hours.
+#   * bid-expiry claims live offers whose `pickup_at` has passed. Every bid this file writes collects
+#     in two days.
+#   * **outbox-publisher is the one with no "not due" state**, exactly as 61-bidding.sh records, so
+#     the worker below is pointed at a broker that is not there. Every outbox pass then fails legibly
+#     and leaves each row claimable for 80-notifications.sh.
+#
+# And the reverse direction, which is the one this task added: **nothing this section leaves behind
+# is due**, so the five later worker starts pseudonymise nobody. The last check in this section is
+# that assertion rather than a comment claiming it.
+
+# The subject: a provider, so that `provider_profiles` is in play as well as `users`.
+pseudo_email="pseudonym-$$@example.com"
+status="$(post_json "verify-pseudonym-register-$$" /v1/auth/register \
+  "{\"name\":\"Verify Pseudonym\",\"email\":\"$pseudo_email\",\"phone\":\"04925$$\",\"password\":\"$login_password\",\"role\":\"provider\"}" \
+  "$WORKDIR/pseudonym-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/pseudonym-register.json"; fail "could not register the pseudonymisation subject ($status)"; }
+pseudo_user="$(json "$WORKDIR/pseudonym-register.json" '["id"]')"
+pseudo_phone="$("$PSQL" "$DATABASE_URL" -tAc "select phone from users where id = '$pseudo_user';")"
+
+status="$(post_json "verify-pseudonym-login-$$" /v1/auth/login \
+  "{\"email\":\"$pseudo_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Pseudonym\"}" \
+  "$WORKDIR/pseudonym-login.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/pseudonym-login.json"; fail "could not sign the subject in ($status)"; }
+pseudo_access="$(json "$WORKDIR/pseudonym-login.json" '["access_token"]')"
+
+# A one-time code, so `phone_otps` holds a copy of the number. Registration has already put a copy
+# of the address in `email_verification_tokens`. Both are this package's own tables and both are
+# verbatim copies — a single join recovers the person from either while `users` looks entirely clean.
+status="$(post_json "verify-pseudonym-otp-$$" /v1/auth/request-otp \
+  "{\"phone\":\"$pseudo_phone\"}" "$WORKDIR/pseudonym-otp.json")"
+[[ "$status" == "202" ]] \
+  || { cat "$WORKDIR/pseudonym-otp.json"; fail "could not issue a one-time code ($status)"; }
+
+# A trading name, which is fleet's table and is reached through a port identity declares. Inserted
+# rather than declared through PATCH /v1/fleet/profile because that endpoint is a provider's own
+# journey and this section is about what happens to the row, not about how it got there.
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "insert into provider_profiles (provider_id, display_name, operates_as)
+   values ('$pseudo_user', 'Verify Removals $$', 'business');" >/dev/null \
+  || fail "could not declare the subject's trading name"
+
+# A customer, to own the job the notifications hang off and to be the counterparty below.
+pseudo_customer_email="pseudonym-c-$$@example.com"
+status="$(post_json "verify-pseudonym-c-register-$$" /v1/auth/register \
+  "{\"name\":\"Verify Pseudonym Customer\",\"email\":\"$pseudo_customer_email\",\"phone\":\"04926$$\",\"password\":\"$login_password\",\"role\":\"customer\"}" \
+  "$WORKDIR/pseudonym-c-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/pseudonym-c-register.json"; fail "could not register the counterparty ($status)"; }
+pseudo_customer="$(json "$WORKDIR/pseudonym-c-register.json" '["id"]')"
+
+pseudo_job="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into jobs (id, customer_id) values (gen_random_uuid(), '$pseudo_customer') returning id;" | tr -d ' ')"
+[[ -n "$pseudo_job" ]] || fail "could not create the job the notifications hang off"
+
+# Three notifications: the two contact channels, and a push row whose `address` is a *device token*
+# and must survive. Docs/05 §3.1 puts device identifiers in the deleted column too, but SHIP-172's
+# own *Done when* names them — and writing a contact pseudonym over one would destroy the only value
+# saying which handset a failed push was aimed at.
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "insert into notifications (id, event_id, event_type, job_id, recipient_id, channel, category,
+                              essential, address, subject, body)
+   values (gen_random_uuid(), gen_random_uuid(), 'job.status_changed', '$pseudo_job', '$pseudo_user',
+           'email', 'award', true, '$pseudo_email', 's', 'b'),
+          (gen_random_uuid(), gen_random_uuid(), 'job.status_changed', '$pseudo_job', '$pseudo_user',
+           'sms', 'award', true, '$pseudo_phone', 's', 'b'),
+          (gen_random_uuid(), gen_random_uuid(), 'job.status_changed', '$pseudo_job', '$pseudo_user',
+           'push', 'award', true, 'verify-device-token-$$', 's', 'b');" >/dev/null \
+  || fail "could not write the subject's notifications"
+
+# The request, through the endpoint, so the row is the one the platform actually writes.
+status="$(post_auth "verify-pseudonym-delete-$$" "$pseudo_access" /v1/account/deletion \
+  "$WORKDIR/pseudonym-delete.json")"
+[[ "$status" == "202" ]] || { cat "$WORKDIR/pseudonym-delete.json"; fail "the subject's request returned $status, want 202"; }
+pseudo_request="$(json "$WORKDIR/pseudonym-delete.json" '["id"]')"
+
+# The promise is moved into the past rather than a clock being advanced, which is the one thing a
+# shell harness cannot do to a running binary. It is honest because the column is *stored*: the
+# domain tests prove that by advancing a clock.Fixed and watching the same row fall due.
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "update account_deletion_requests
+      set requested_at = now() - interval '31 days', complete_by = now() - interval '1 day'
+    where id = '$pseudo_request';" >/dev/null \
+  || fail "could not bring the subject's promised date forward"
+
+# Read back *after* the fixture is in place and *before* the pass, so the assertion afterwards is a
+# comparison with the row rather than with a date reconstructed from an interval.
+pseudo_promised="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select to_char(complete_by at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+     from account_deletion_requests where id = '$pseudo_request';")"
+
+# A second account whose promise has *not* arrived. Without it, every assertion below is equally
+# true of a sweep that pseudonymises whatever it finds — which is the defect that would execute
+# deletions inside all five later sections that start a worker.
+pseudo_waiting_email="pseudonym-w-$$@example.com"
+status="$(post_json "verify-pseudonym-w-register-$$" /v1/auth/register \
+  "{\"name\":\"Verify Pseudonym Waiting\",\"email\":\"$pseudo_waiting_email\",\"phone\":\"04927$$\",\"password\":\"$login_password\",\"role\":\"customer\"}" \
+  "$WORKDIR/pseudonym-w-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/pseudonym-w-register.json"; fail "could not register the waiting account ($status)"; }
+pseudo_waiting="$(json "$WORKDIR/pseudonym-w-register.json" '["id"]')"
+
+status="$(post_json "verify-pseudonym-w-login-$$" /v1/auth/login \
+  "{\"email\":\"$pseudo_waiting_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Waiting\"}" \
+  "$WORKDIR/pseudonym-w-login.json")"
+[[ "$status" == "200" ]] || fail "could not sign the waiting account in ($status)"
+status="$(post_auth "verify-pseudonym-w-delete-$$" "$(json "$WORKDIR/pseudonym-w-login.json" '["access_token"]')" \
+  /v1/account/deletion "$WORKDIR/pseudonym-w-delete.json")"
+[[ "$status" == "202" ]] || fail "the waiting account could not request deletion ($status)"
+
+# A third: a provider carrying a delivery whose promise *has* arrived. Docs/05 §3.1 — "erasing a
+# party mid-delivery would strand the counterparty" — and ports.go promised that SHIP-171 would ask
+# again before it executed rather than trusting the state the row was recorded in.
+pseudo_carrier_email="pseudonym-x-$$@example.com"
+status="$(post_json "verify-pseudonym-x-register-$$" /v1/auth/register \
+  "{\"name\":\"Verify Pseudonym Carrier\",\"email\":\"$pseudo_carrier_email\",\"phone\":\"04928$$\",\"password\":\"$login_password\",\"role\":\"provider\"}" \
+  "$WORKDIR/pseudonym-x-register.json")"
+[[ "$status" == "201" ]] || { cat "$WORKDIR/pseudonym-x-register.json"; fail "could not register the carrier ($status)"; }
+pseudo_carrier="$(json "$WORKDIR/pseudonym-x-register.json" '["id"]')"
+
+status="$(post_json "verify-pseudonym-x-login-$$" /v1/auth/login \
+  "{\"email\":\"$pseudo_carrier_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Carrier\"}" \
+  "$WORKDIR/pseudonym-x-login.json")"
+[[ "$status" == "200" ]] || fail "could not sign the carrier in ($status)"
+status="$(post_auth "verify-pseudonym-x-delete-$$" "$(json "$WORKDIR/pseudonym-x-login.json" '["access_token"]')" \
+  /v1/account/deletion "$WORKDIR/pseudonym-x-delete.json")"
+[[ "$status" == "202" ]] || fail "the carrier could not request deletion ($status)"
+pseudo_carrier_request="$(json "$WORKDIR/pseudonym-x-delete.json" '["id"]')"
+
+# The delivery is created *after* the request, so the request was recorded live and the state the
+# sweep meets is one only the re-read can correct. That is the whole of ports.go's promise.
+pseudo_delivery_job="$("$PSQL" "$DATABASE_URL" -qtAc \
+  "insert into jobs (id, customer_id) values (gen_random_uuid(), '$pseudo_customer') returning id;" | tr -d ' ')"
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "insert into bids (id, job_id, provider_id, status, amount, pickup_at, deliver_by)
+   values (gen_random_uuid(), '$pseudo_delivery_job', '$pseudo_carrier', 'Accepted', 41000,
+           now() + interval '2 days', now() + interval '3 days');" >/dev/null \
+  || fail "could not accept the carrier's bid"
+move_job_for_deferral "$pseudo_delivery_job" Draft Open "$pseudo_customer"
+move_job_for_deferral "$pseudo_delivery_job" Open Awarded "$pseudo_customer"
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "update account_deletion_requests
+      set requested_at = now() - interval '31 days', complete_by = now() - interval '1 day'
+    where id = '$pseudo_carrier_request';" >/dev/null \
+  || fail "could not bring the carrier's promised date forward"
+
+# The fixture, verified rather than assumed: three requests, two due and one not, and the carrier
+# at Awarded. A sweep judged against a fixture that was never in this state proves nothing.
+read -r pseudo_due pseudo_not_due pseudo_awarded <<<"$("$PSQL" "$DATABASE_URL" -tAc \
+  "select (select count(*) from account_deletion_requests
+            where id in ('$pseudo_request', '$pseudo_carrier_request') and complete_by <= now()),
+          (select count(*) from account_deletion_requests
+            where user_id = '$pseudo_waiting' and complete_by > now()),
+          (select status from jobs where id = '$pseudo_delivery_job');" | tr '|' ' ')"
+[[ "$pseudo_due" == "2" && "$pseudo_not_due" == "1" && "$pseudo_awarded" == "Awarded" ]] \
+  || fail "the fixture is $pseudo_due due, $pseudo_not_due waiting, job '$pseudo_awarded' — want 2, 1, Awarded"
+ok "the fixture is two accounts past their promised date, one still inside it, and one of the two carrying a delivery"
+
+pushd "$ROOT/services/core" >/dev/null
+go build -o "$WORKDIR/shipper-worker-pseudonym" ./cmd/worker
+popd >/dev/null
+ok "the worker builds with the identity domain's task registered"
+
+# KAFKA_BROKERS names a port nothing listens on, deliberately — see the note above. The outbox pass
+# fails and leaves every row claimable for 80-notifications.sh; the five claim-based tasks run
+# normally against PostgreSQL and need no broker at all.
+SHIPPER_ENV=development \
+LOG_FORMAT=json \
+LOG_LEVEL=debug \
+DATABASE_URL="$DATABASE_URL" \
+REDIS_URL="$REDIS_URL" \
+KAFKA_BROKERS=localhost:1 \
+  "$WORKDIR/shipper-worker-pseudonym" >"$WORKDIR/worker-pseudonym.log" 2>&1 &
+pseudo_worker_pid=$!
+
+for _ in $(seq 1 100); do
+  pseudo_state="$("$PSQL" "$DATABASE_URL" -tAc "select state from account_deletion_requests where id = '$pseudo_request';")"
+  [[ "$pseudo_state" == "completed" ]] && break
+  sleep 0.2
+done
+
+kill -TERM "$pseudo_worker_pid" 2>/dev/null || true
+for _ in $(seq 1 50); do kill -0 "$pseudo_worker_pid" 2>/dev/null || break; sleep 0.2; done
+wait "$pseudo_worker_pid" 2>/dev/null || true
+
+[[ "$pseudo_state" == "completed" ]] \
+  || { cat "$WORKDIR/worker-pseudonym.log"; fail "the request past its promised date is '$pseudo_state' after a pass, want completed"; }
+ok "one pass of the real worker executes the request whose thirty days have run out"
+
+grep -q '"task":"account-pseudonymisation"' "$WORKDIR/worker-pseudonym.log" \
+  || { cat "$WORKDIR/worker-pseudonym.log"; fail "the identity domain's task did not register in the manifest"; }
+ok "and it is registered as account-pseudonymisation, the sixth task in a binary that runs all of them"
+
+# The pseudonym itself, derived from the account identifier — which Docs/05 §3.1 already calls the
+# pseudonym, so this is not a reversal of anything. Computed here from the same identifier rather
+# than read out of the row, so the check is that the platform wrote the value it should have.
+pseudo_token="deleted:$pseudo_user"
+pseudo_short="${pseudo_user: -12}"
+
+# Read one at a time rather than with `read -r … <<< $(… | tr '|' ' ')`, which is the shape every
+# other multi-value check in this file uses and which is wrong here: the pseudonymised **name**
+# contains a space, so word splitting hands `read` four fields for three variables. It failed as
+# `users.email is 'user'` — the second word of "Deleted user …" arriving in the email variable.
+pseudo_name="$("$PSQL" "$DATABASE_URL" -tAc "select name from users where id = '$pseudo_user';")"
+pseudo_new_email="$("$PSQL" "$DATABASE_URL" -tAc "select email::text from users where id = '$pseudo_user';")"
+pseudo_new_phone="$("$PSQL" "$DATABASE_URL" -tAc "select phone from users where id = '$pseudo_user';")"
+[[ "$pseudo_new_email" == "$pseudo_token" ]] \
+  || fail "users.email is '$pseudo_new_email', want '$pseudo_token'"
+[[ "$pseudo_new_phone" == "$pseudo_token" ]] \
+  || fail "users.phone is '$pseudo_new_phone', want '$pseudo_token'"
+[[ "$pseudo_name" == "Deleted user $pseudo_short" ]] \
+  || fail "users.name is '$pseudo_name', want 'Deleted user $pseudo_short'"
+ok "the account's name and both contact channels are the pseudonym, derived from the identifier every retained row already carries"
+
+# **Not a valid address and not a valid number**, which is what makes the pseudonymised account
+# unreachable through the front door by construction rather than by a check somebody remembered.
+# The account no longer exists to sign-in under either the old address or the new one.
+# The address that was replaced: 400 with SHIP-41's one code for both halves, which is exactly what
+# an address that never had an account gets. That is the point — the account is gone in the only
+# sense a client can observe.
+status="$(post_json "verify-pseudonym-old-signin-$$" /v1/auth/login \
+  "{\"email\":\"$pseudo_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Gone\"}" \
+  "$WORKDIR/pseudonym-old-signin.json")"
+[[ "$status" == "400" ]] || { cat "$WORKDIR/pseudonym-old-signin.json"; fail "signing in with the deleted address returned $status, want 400"; }
+[[ "$(json "$WORKDIR/pseudonym-old-signin.json" '["error"]["code"]')" == "identity_credentials_invalid" ]] \
+  || fail "the deleted address is refused with something other than SHIP-41's one code for both halves"
+
+# **The pseudonym that replaced it is refused a whole layer earlier — 422, at validation, naming the
+# email field.** That is the assertion, not the refusal: the store is never reached, because
+# `deleted:<id>` does not parse as an address. A `identity_credentials_invalid` here would mean it
+# had been looked up and merely not matched, which is a much weaker property and one a later change
+# to the hasher could undo.
+status="$(post_json "verify-pseudonym-new-signin-$$" /v1/auth/login \
+  "{\"email\":\"$pseudo_token\",\"password\":\"$login_password\",\"device_label\":\"Verify Gone\"}" \
+  "$WORKDIR/pseudonym-new-signin.json")"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/pseudonym-new-signin.json"; fail "signing in with the pseudonym returned $status, want 422 — it must be refused at validation, before the store"; }
+[[ "$(python3 -c 'import json,sys
+print(" ".join(sorted(d["field"] for d in json.load(open(sys.argv[1]))["error"]["details"])))' \
+  "$WORKDIR/pseudonym-new-signin.json")" == "email" ]] \
+  || { cat "$WORKDIR/pseudonym-new-signin.json"; fail "the pseudonym was not refused as an unusable email address"; }
+ok "the address that was replaced is refused like an address with no account, and the pseudonym never reaches the store"
+
+# **The two refusals above are the only failed sign-ins in this file, and SHIP-47 charges the
+# per-address bucket on a refused credential.** Every request in a `make verify` run arrives from
+# 127.0.0.1, so a later track that got a 429 would look like a broken endpoint rather than like this
+# section's leftovers — which is the SHIP-47 section's own argument, applied to the one place after
+# it that spends from the bucket. Cleared here rather than at the end, so the last check of the file
+# is still the assertion and not the tidy-up.
+redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' \
+  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+
+# Every session the account still held. A handset holding a refresh token issued last week keeps
+# working after the name, address and number are gone unless something ends it.
+read -r pseudo_live pseudo_reason <<<"$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) filter (where revoked_at is null), coalesce(max(revoked_reason), '')
+     from device_sessions where user_id = '$pseudo_user';" | tr '|' ' ')"
+[[ "$pseudo_live" == "0" ]] || fail "$pseudo_live sessions are still live on a pseudonymised account"
+[[ "$pseudo_reason" == "account_deleted" ]] || fail "the sessions ended for reason '$pseudo_reason', want account_deleted"
+ok "every session the account held is revoked, and the row says why"
+
+# fleet's table, through the port identity declares and cmd/worker supplies.
+pseudo_trading="$("$PSQL" "$DATABASE_URL" -tAc "select display_name from provider_profiles where provider_id = '$pseudo_user';")"
+[[ "$pseudo_trading" == "Deleted provider $pseudo_short" ]] \
+  || fail "provider_profiles.display_name is '$pseudo_trading', want 'Deleted provider $pseudo_short'"
+pseudo_operates="$("$PSQL" "$DATABASE_URL" -tAc "select operates_as from provider_profiles where provider_id = '$pseudo_user';")"
+[[ "$pseudo_operates" == "business" ]] \
+  || fail "operates_as moved to '$pseudo_operates'; this ticket replaces the identifying declaration, not the row"
+ok "the provider's trading name is replaced through fleet, and the form they trade in is not"
+
+# notifications' table, and the device token that must survive it.
+read -r pseudo_notif_email pseudo_notif_sms pseudo_notif_push <<<"$("$PSQL" "$DATABASE_URL" -tAc \
+  "select max(address) filter (where channel = 'email'),
+          max(address) filter (where channel = 'sms'),
+          max(address) filter (where channel = 'push')
+     from notifications where recipient_id = '$pseudo_user';" | tr '|' ' ')"
+[[ "$pseudo_notif_email" == "$pseudo_token" && "$pseudo_notif_sms" == "$pseudo_token" ]] \
+  || fail "the notification addresses are '$pseudo_notif_email' and '$pseudo_notif_sms' — a join from this table recovers the person"
+[[ "$pseudo_notif_push" == "verify-device-token-$$" ]] \
+  || fail "the push row's address is '$pseudo_notif_push'; that column holds a device identifier, which is SHIP-172's"
+ok "the notification addresses are replaced and the device token is not"
+
+# **The whole-schema sweep, which is the check the "irreversibly" clause actually needs.**
+#
+# A list of tables passes on the day it is written and goes on passing when somebody adds a twelfth
+# with a contact column. This asks PostgreSQL for every text-shaped column in the public schema and
+# looks for the person in all of them, including columns that do not exist yet. It is the sweep that
+# found `notifications.address` in the first place.
+#
+# **The CTE is MATERIALIZED and that is load-bearing rather than tidy.** PostgreSQL does not promise
+# an evaluation order for `AND`, so with one flat `WHERE` the planner ran `query_to_xml` *before* the
+# schema filter and asked `select count(*) from public.pg_proc` — a catalogue table, in the wrong
+# schema, with the `public.` this query used to hard-code. The fence makes the column list a finished
+# set before anything is run against it, and the schema is now interpolated rather than assumed.
+pseudonym_survivors() {
+  "$PSQL" "$DATABASE_URL" -tAc "
+    with cols as materialized (
+      select table_schema, table_name, column_name
+        from information_schema.columns
+       where table_schema = 'public'
+         and (data_type = 'text' or udt_name = 'citext')
+    )
+    select coalesce(string_agg(format('%I.%I', table_name, column_name), ', '), '')
+      from cols
+     where (xpath('/row/c/text()',
+                  query_to_xml(format('select count(*) as c from %I.%I where strpos(%I::text, %L) > 0',
+                                      table_schema, table_name, column_name, '$1'),
+                               false, true, '')))[1]::text::int > 0;"
+}
+
+# The fixture is verified first: a sweep for a value that was never stored passes forever. This is
+# the same check turned around — before the pass there were copies in more than one table, and the
+# assertion below is that there are none.
+pseudo_survivors="$(pseudonym_survivors "$pseudo_email")"
+[[ -z "$pseudo_survivors" ]] \
+  || fail "the address '$pseudo_email' survives in $pseudo_survivors — a join from any one of them recovers the person"
+pseudo_survivors="$(pseudonym_survivors "$pseudo_phone")"
+[[ -z "$pseudo_survivors" ]] \
+  || fail "the number '$pseudo_phone' survives in $pseudo_survivors"
+pseudo_survivors="$(pseudonym_survivors "Verify Removals $$")"
+[[ -z "$pseudo_survivors" ]] \
+  || fail "the trading name survives in $pseudo_survivors"
+ok "no text column anywhere in the schema still holds the address, the number or the trading name"
+
+# The fixture check the three assertions above depend on: the counterparty's address, which nothing
+# has pseudonymised, is still findable by the same sweep. Without this, an empty answer could mean
+# the sweep is broken rather than that the person is gone.
+pseudo_survivors="$(pseudonym_survivors "$pseudo_customer_email")"
+[[ -n "$pseudo_survivors" ]] \
+  || fail "the sweep finds nothing at all, so the three empty answers above prove nothing"
+ok "and the sweep still finds an address that was not deleted, so an empty answer means something"
+
+# The promise that was kept, and when it was kept. complete_by is the one instant on this row that
+# must not move: rewriting it would replace the record of what the person was told with the moment a
+# sweep happened to run, which is what updated_at is for.
+pseudo_stored_promise="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select to_char(complete_by at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+     from account_deletion_requests where id = '$pseudo_request';")"
+[[ "$pseudo_stored_promise" == "$pseudo_promised" ]] \
+  || fail "complete_by moved from $pseudo_promised to $pseudo_stored_promise; a completed request holds the promise it kept, and updated_at is what says when it was kept"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select updated_at > complete_by from account_deletion_requests where id = '$pseudo_request';")" == "t" ]] \
+  || fail "updated_at is not after complete_by, so nothing records when the promise was kept"
+ok "the completed request still holds the promise it kept, and updated_at is what says when"
+
+# The carrier, which is ports.go's promise: the delivery is re-read before anything is executed.
+read -r pseudo_carrier_state pseudo_carrier_email_now <<<"$("$PSQL" "$DATABASE_URL" -tAc \
+  "select r.state, u.email::text
+     from account_deletion_requests r join users u on u.id = r.user_id
+    where r.id = '$pseudo_carrier_request';" | tr '|' ' ')"
+[[ "$pseudo_carrier_email_now" == "$pseudo_carrier_email" ]] \
+  || fail "the provider carrying the delivery was pseudonymised; the customer's goods are moving and nobody is named as carrying them"
+[[ "$pseudo_carrier_state" == "deferred" ]] \
+  || fail "the carrier's request is '$pseudo_carrier_state', want deferred — Docs/05 §3.1 defers rather than refuses"
+ok "a party to a delivery is put back on hold at the moment of execution, not erased mid-delivery"
+
+# The account still inside its thirty days.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select email::text from users where id = '$pseudo_waiting';")" == "$pseudo_waiting_email" ]] \
+  || fail "an account whose promised date has not arrived was pseudonymised"
+ok "and an account still inside its thirty days is untouched"
+
+# **A completed request does not stop the same account asking again**, which is the whole reason
+# 'completed' joined the CHECK and not the open-request index. Asserted against the database rather
+# than through the endpoint, because a pseudonymised account cannot sign in — which is the point of
+# the two checks above it.
+"$PSQL" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -c \
+  "insert into account_deletion_requests (id, user_id, state, requested_at, complete_by)
+   values (gen_random_uuid(), '$pseudo_user', 'requested', now(), now() + interval '30 days');" >/dev/null \
+  || fail "uq_account_deletion_requests_open refused a new request from an account whose earlier one was completed — that account could never ask again"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select count(*) from account_deletion_requests where user_id = '$pseudo_user';")" == "2" ]] \
+  || fail "the account does not hold both the completed request and the new one"
+ok "a completed request is history — the same account can ask again, and both rows survive"
+
+# A second pass finds nothing, so the sweep cannot re-execute what it has already done.
+SHIPPER_ENV=development LOG_FORMAT=json LOG_LEVEL=debug \
+DATABASE_URL="$DATABASE_URL" REDIS_URL="$REDIS_URL" KAFKA_BROKERS=localhost:1 \
+  "$WORKDIR/shipper-worker-pseudonym" >"$WORKDIR/worker-pseudonym-again.log" 2>&1 &
+pseudo_worker_pid=$!
+sleep 2
+kill -TERM "$pseudo_worker_pid" 2>/dev/null || true
+for _ in $(seq 1 50); do kill -0 "$pseudo_worker_pid" 2>/dev/null || break; sleep 0.2; done
+wait "$pseudo_worker_pid" 2>/dev/null || true
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from account_deletion_requests where user_id = '$pseudo_user' and state = 'completed';")" == "1" ]] \
+  || fail "a second pass produced a second completed request"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select email::text from users where id = '$pseudo_user';")" == "$pseudo_token" ]] \
+  || fail "a second pass rewrote the pseudonym, so it is not derived from the account alone"
+ok "a second pass changes nothing — the pseudonym is stable and a completed request is not claimed again"
+
+# **The assertion the sixth task owes every later section.** Five sections after this one start
+# cmd/worker, and each start runs every registered task. Nothing left here is due, so none of them
+# pseudonymises anybody.
+pseudo_left_due="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from account_deletion_requests
+    where state in ('requested', 'deferred') and complete_by <= now();")"
+[[ "$pseudo_left_due" == "0" ]] \
+  || fail "this file leaves $pseudo_left_due open deletion requests past their promised date; the next section that starts a worker would execute them"
+ok "and this file leaves no deletion request due, so the five later worker starts execute nothing of ours"
+
+# The rate-limit hygiene the whole file depends on, re-asserted as the last thing the file does to
+# those keys. This section is the only one after SHIP-47's that spends from them — two refused
+# sign-ins against a deleted account — and it clears them where it spends them. Asserted here rather
+# than assumed, because a later track's 429 would read as its own endpoint being broken.
+[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' | wc -l | tr -d ' ')" == "0" ]] \
+  || fail "this section left per-address sign-in buckets behind, which a later track would be throttled by"
+[[ "$(post_json "verify-pseudonym-throttle-$$" /v1/auth/login \
+  "{\"email\":\"$pseudo_customer_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Cleared\"}" \
+  "$WORKDIR/pseudonym-throttle.json")" == "200" ]] \
+  || { cat "$WORKDIR/pseudonym-throttle.json"; fail "sign-in is refused at the end of this file, so a later track would be too"; }
+ok "the per-address buckets are empty at the end of the file, and a sign-in still succeeds"

@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
 )
@@ -350,4 +351,100 @@ func TestThePublicProfilesBatchReadAnswersOnlyThePublicHalf(t *testing.T) {
 	if _, present := found[uuid.Nil]; present {
 		t.Error("the nil provider is in the map")
 	}
+}
+
+// --- SHIP-171: the trading name of a deleted account ------------------------------------------
+//
+// [Service.PseudonymiseProfile] exists because `internal/identity` may not name this domain's table
+// and the composition root may not hold a second opinion about what a trading name is. What it must
+// have is exactly what [Service.Declare] has — the same bounds, refused the same way — and what it
+// must not have is any knowledge of why the name is changing.
+
+// TestPseudonymisingATradingNameReplacesItAndNothingElse is the half SHIP-171 reaches through the
+// port.
+//
+// `operates_as` is asserted **unchanged** rather than left unmentioned. It is `individual` or
+// `business`, which identifies nobody, and `ck_provider_profiles_operates_as` has no neutral third
+// value to move it to — so keeping it is a decision, and a decision worth a line that fails if
+// somebody later widens the statement to "everything in the row".
+func TestPseudonymisingATradingNameReplacesItAndNothingElse(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "pseudonymised-profile@example.com", "+61400001710")
+	svc := NewService(clock.System{})
+
+	if _, err := pool.Exec(t.Context(), `
+		INSERT INTO provider_profiles (provider_id, display_name, operates_as)
+		VALUES ($1, 'Southbank Removals', 'business')`, provider); err != nil {
+		t.Fatalf("declaring a trading name: %v", err)
+	}
+
+	renamed, err := svc.PseudonymiseProfile(t.Context(), pool, provider, "Deleted provider abc123def456")
+	if err != nil {
+		t.Fatalf("pseudonymising: %v", err)
+	}
+	if !renamed {
+		t.Error("the provider had declared a name and the write reported no row")
+	}
+
+	var displayName, operatesAs string
+	if err := pool.QueryRow(t.Context(),
+		`SELECT display_name, operates_as FROM provider_profiles WHERE provider_id = $1`, provider).
+		Scan(&displayName, &operatesAs); err != nil {
+		t.Fatalf("reading the profile back: %v", err)
+	}
+	if displayName != "Deleted provider abc123def456" {
+		t.Errorf("display_name = %q, want the pseudonym", displayName)
+	}
+	if operatesAs != "business" {
+		t.Errorf("operates_as = %q, want the unchanged 'business' — this ticket replaces the "+
+			"identifying declaration, not the row", operatesAs)
+	}
+}
+
+// TestPseudonymisingAProviderWhoDeclaredNothingIsNotAnError. Declaring a public profile is optional,
+// so most providers have no row — and an account being deleted has no obligation to have traded
+// under a name. The caller counts rows rather than branching, so this must answer false and not fail.
+func TestPseudonymisingAProviderWhoDeclaredNothingIsNotAnError(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "pseudonymised-nothing@example.com", "+61400001711")
+
+	renamed, err := NewService(clock.System{}).
+		PseudonymiseProfile(t.Context(), pool, provider, "Deleted provider abc123def457")
+	if err != nil {
+		t.Fatalf("pseudonymising a provider with no declaration: %v", err)
+	}
+	if renamed {
+		t.Error("a provider who declared nothing reported a row changed")
+	}
+}
+
+// TestPseudonymisingRefusesANameTheConstraintWould is Docs/10 §3.1's split held on both sides.
+//
+// The bounds are this domain's and `ck_provider_profiles_display_name` agrees with them; a caller
+// handing over a blank or an 81-character name must be refused *here*, with a message naming the
+// bound, rather than reaching PostgreSQL and coming back as a constraint violation inside somebody
+// else's transaction — which for the sweep means a whole batch of deletions rolled back by one
+// malformed string.
+func TestPseudonymisingRefusesANameTheConstraintWould(t *testing.T) {
+	pool := pgtest.DB(t)
+	provider := newProvider(t, pool, "pseudonymised-refused@example.com", "+61400001712")
+	svc := NewService(clock.System{})
+
+	for name, value := range map[string]string{
+		"blank":       "   ",
+		"one rune":    "x",
+		"a paragraph": strings.Repeat("a", maxDisplayName+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := svc.PseudonymiseProfile(t.Context(), pool, provider, value); err == nil {
+				t.Errorf("%q was accepted as a trading name", value)
+			}
+		})
+	}
+
+	t.Run("and no provider at all", func(t *testing.T) {
+		if _, err := svc.PseudonymiseProfile(t.Context(), pool, uuid.Nil, "Deleted provider a"); err == nil {
+			t.Error("the nil provider was accepted")
+		}
+	})
 }

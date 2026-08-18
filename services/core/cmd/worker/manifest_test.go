@@ -148,7 +148,27 @@ func TestTheRegisteredTaskSetIsWhatItSaysItIs(t *testing.T) {
 	// records milestones against jobs it created in the same run, and a job delivered seconds ago
 	// is not due for three days. The one section that makes a job due is 51-jobs-autocomplete.sh,
 	// which creates it, demonstrates it, and owns it.
+	//
+	// # SHIP-171 added the sixth, and this is what it checked before adding the line
+	//
+	// account-pseudonymisation executes deletion requests whose promised date has arrived
+	// (Docs/05 §3.1). The same two things were checked, in the same order.
+	//
+	// **§9's reopening trigger does not fire.** The one case the convention cannot cover is "a
+	// task that sweeps rows due by wall-clock alone". This is not that task: `complete_by` is a
+	// **stored** column, written from the row's own request time plus thirty days, so every
+	// request any endpoint can create is thirty days from claimable at the moment it is created.
+	// That is job-expiry's shape and job-auto-complete's.
+	//
+	// **What it does to the existing sections is nothing, and that was measured rather than
+	// assumed.** `account_deletion_requests` is written by exactly one section — 40-identity.sh,
+	// which sorts before every section that starts the worker — and every row it leaves is thirty
+	// days out. No section backdates one. This is the first task that could reach a row another
+	// section is still using, because it replaces a *user's* email address rather than moving a
+	// job or an offer, which is why the sweep was run against the whole harness rather than
+	// against its own section alone.
 	want := []string{
+		"account-pseudonymisation",
 		"bid-expiry",
 		"job-auto-complete",
 		"job-expiry",

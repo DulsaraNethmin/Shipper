@@ -586,6 +586,32 @@ func (postgresStore) updatePublicProfile(ctx context.Context, r db.Runner, provi
 	return nil
 }
 
+// replaceDisplayName overwrites a provider's trading name and leaves everything else alone
+// (SHIP-171).
+//
+// A third statement over `provider_profiles` rather than a call to
+// [postgresStore.updatePublicProfile] with one pointer set, and the difference is the read that one
+// depends on: [Service.Declare] establishes first-declaration-or-amendment under a lock, because a
+// half-declaration has to be refused. There is nothing to refuse here — an account with no row is
+// simply a provider who never declared a name — so the branch and the lock would both be ceremony
+// around a statement that is correct on its own.
+//
+// `operates_as` is untouched. It is `individual` or `business`, which identifies nobody, and
+// `ck_provider_profiles_operates_as` has no neutral third value to move it to; inventing one would
+// be a migration in fleet's own block on a column this ticket has no reading of. Recorded in
+// Docs/11 §3 rather than narrowed silently.
+//
+// The row count is the answer: one means the provider had declared a name, zero means they had not.
+func (postgresStore) replaceDisplayName(ctx context.Context, r db.Runner, providerID uuid.UUID, displayName string) (bool, error) {
+	const q = `UPDATE provider_profiles SET display_name = $2 WHERE provider_id = $1`
+
+	tag, err := r.Exec(ctx, q, providerID, displayName)
+	if err != nil {
+		return false, fmt.Errorf("fleet: replacing the trading name of %s: %w", providerID, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // publicProfile reads one provider's public half.
 //
 // No rows is the zero value rather than an error: a provider who has not said who they are is an

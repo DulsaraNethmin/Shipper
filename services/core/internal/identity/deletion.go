@@ -9,8 +9,8 @@
 // # What this file is, and what it deliberately is not
 //
 // It is the *request*, the promise, and — since SHIP-170 — whether the promise's clock has started.
-// It is not the execution: SHIP-171 pseudonymises the record and SHIP-172 removes the artefacts.
-// Nothing here deletes or pseudonymises anything, and there is no worker task.
+// It is not the execution: that is pseudonymise.go's, added by SHIP-171 and run from cmd/worker,
+// and SHIP-172 removes the artefacts. Nothing in *this* file deletes or pseudonymises anything.
 //
 // # SHIP-170: the deferral, and the room SHIP-169 left for it
 //
@@ -85,8 +85,9 @@ const DeletionWindow = 30 * 24 * time.Hour
 // pairing, which is what stops a Go constant and a CHECK constraint drifting apart when they are
 // widened on different branches.
 //
-// There are two values, and 'completed' is still SHIP-171's; adding it is an ordinary migration
-// plus a constant here, and the paired test fails until both have moved.
+// There are three values since SHIP-171, and the third is the one that had to be added in two
+// places at once: 'completed' joins ck_account_deletion_requests_state and must *not* join
+// uq_account_deletion_requests_open's predicate — see [DeletionState.Open].
 type DeletionState string
 
 const (
@@ -101,12 +102,24 @@ const (
 	// [DeletionRequested] when the delivery closes, which is re-evaluated through [ActiveJobs]
 	// rather than scheduled.
 	DeletionDeferred DeletionState = "deferred"
+
+	// DeletionCompleted is a request that has been executed (SHIP-171).
+	//
+	// The person's profile and contact details have been replaced by [PseudonymFor]'s stable
+	// values, and there is nothing left to undo: no copy of what was overwritten is kept
+	// anywhere, including on this row. What the row still holds is `complete_by`, which is the
+	// promise the platform made and kept, and `updated_at`, which is when it kept it.
+	//
+	// **It is not open**, which is the property the rest of this file is arranged around: a
+	// request that has been executed must not stop the same account asking again. See
+	// [DeletionState.Open].
+	DeletionCompleted DeletionState = "completed"
 )
 
 // Valid reports whether s is one of the states the database permits.
 func (s DeletionState) Valid() bool {
 	switch s {
-	case DeletionRequested, DeletionDeferred:
+	case DeletionRequested, DeletionDeferred, DeletionCompleted:
 		return true
 	}
 	return false
@@ -114,10 +127,16 @@ func (s DeletionState) Valid() bool {
 
 // Open reports whether a request in this state is still outstanding.
 //
-// Both states are open today, and that will stop being true at SHIP-171: a 'completed' request is
-// history, and it must not stop the same account asking again. This is the Go statement of
-// `uq_account_deletion_requests_open`'s predicate; [openDeletionStatesSQL] is the SQL one, and
-// TestTheOpenStatesInSQLAreTheOnesTheDomainDeclares holds the two together.
+// **SHIP-171 is what made this function do work.** Until 000107 every state was open and this was a
+// `return true` waiting for a reason; now [DeletionCompleted] is history and must not stop the same
+// account asking again. This is the Go statement of `uq_account_deletion_requests_open`'s predicate;
+// [openDeletionStatesSQL] is the SQL one, and TestTheOpenStatesInSQLAreTheOnesTheDomainDeclares
+// holds the two together, while TestTheOpenStatesTheIndexCoversAreTheOnesTheDomainCallsOpen holds
+// both to the index PostgreSQL actually has.
+//
+// Neither of those is a behavioural test, and a pairing guard is a text guard — so
+// TestACompletedRequestDoesNotStopTheSameAccountAskingAgain drives the store instead, because
+// nothing about reading a constant proves the query that interpolates it.
 func (s DeletionState) Open() bool {
 	switch s {
 	case DeletionRequested, DeletionDeferred:
@@ -128,16 +147,19 @@ func (s DeletionState) Open() bool {
 
 func (s DeletionState) String() string { return string(s) }
 
-// DeletionStates is every state the Go side knows about, in the order 000105 and 000106 list them.
+// DeletionStates is every state the Go side knows about, in the order 000105, 000106 and 000107
+// list them.
 //
 // Exported so the migration's pairing test can read it without this package exporting a slice
 // somebody could append to: it is returned fresh each call rather than being a package variable,
 // because a shared slice is one a caller can rewrite in place.
-func DeletionStates() []DeletionState { return []DeletionState{DeletionRequested, DeletionDeferred} }
+func DeletionStates() []DeletionState {
+	return []DeletionState{DeletionRequested, DeletionDeferred, DeletionCompleted}
+}
 
 // OpenDeletionStates is every state a request is still outstanding in, in the same order.
 func OpenDeletionStates() []DeletionState {
-	open := make([]DeletionState, 0, 2)
+	open := make([]DeletionState, 0, len(DeletionStates()))
 	for _, state := range DeletionStates() {
 		if state.Open() {
 			open = append(open, state)
@@ -229,8 +251,10 @@ var ErrDeletionRequestNotFound = errors.New("identity: no open account deletion 
 //
 // This is what makes "queues until the job closes" true with no scheduled task and no job
 // identifier on the row: the queue is a state, and reading the request is what drains it. What it
-// does not do is move on its own — a person who never asks again stays deferred until SHIP-171
-// looks. That is honest and is recorded in Docs/11 §3 rather than hidden here.
+// does not do is move on its own — a person who never asks again stays deferred until something
+// else looks. **SHIP-171 is what looks**: [Pseudonymiser.Execute] re-evaluates the deferral in both
+// directions on every request it claims, so a request nobody ever touches again is no longer one
+// that queues forever.
 func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID) (DeletionRequest, bool, error) {
 	if s.pool == nil {
 		return DeletionRequest{}, false, errUnavailable
@@ -311,8 +335,15 @@ func (s *Service) RequestDeletion(ctx context.Context, userID uuid.UUID) (Deleti
 // **the ON CONFLICT predicate cannot be parameterised**, because PostgreSQL infers a partial unique
 // index by proving the index's own predicate from the one given, and a placeholder proves nothing.
 // So there is a literal list in SQL and a [DeletionState.Open] in Go, and
-// TestTheOpenStatesInSQLAreTheOnesTheDomainDeclares is what stops the two disagreeing — which is
-// exactly the drift SHIP-171 will risk when it adds a state that must *not* join this list.
+// TestTheOpenStatesInSQLAreTheOnesTheDomainDeclares is what stops the two disagreeing.
+//
+// **SHIP-171 ran that risk and this constant did not move.** It added [DeletionCompleted], which
+// joins the CHECK and must not join this list: a completed request is history, and a list that
+// carried it would make `ON CONFLICT` swallow every later request from the same account and hand
+// back the executed one. Three things fail if it is added here — the pairing test, the index-predicate
+// test, and the two behavioural tests below them — and the *first* thing that happens at run time is
+// that PostgreSQL can no longer infer the partial index from this predicate at all, because
+// `state IN (a, b, c)` does not imply `state IN (a, b)`.
 const openDeletionStatesSQL = `('requested', 'deferred')`
 
 // recordDeletionRequest writes a request, or brings the open one the account already has into the
