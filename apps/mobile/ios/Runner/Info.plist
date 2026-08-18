@@ -71,7 +71,7 @@
 	     Docs/07 §5 asks for regardless: the ask happens after a first bid arrives, at the
 	     moment its value is obvious, and not on first launch. -->
 	<key>NSCameraUsageDescription</key>
-	<string>Shipper uses the camera to photograph goods at pickup and delivery, as proof the job was completed. If you cannot take a photo, you can record the reason instead.</string>
+	<string>Shipper uses the camera for two things: transport providers photograph the licence, vehicle registration and insurance documents they are verified against, and drivers photograph goods at pickup and delivery as proof the job was completed. If you cannot take a photo, you can record the reason instead.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

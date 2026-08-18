@@ -57,7 +57,7 @@ void main() {
     // argument of the class that consumes them — and they must agree, because a device that has
     // never been online gets whichever one happens to be reached first.
     //
-    // Holding them together here rather than importing `NudgePolicy` and `ProofImagePolicy` into
+    // Holding them together here rather than importing `NudgePolicy` and `CapturedImagePolicy` into
     // this file would be the weaker test; those two are asserted in `app_policy_wiring_test.dart`,
     // where the providers that actually apply them are built.
     test('matches what deploy/.env.example configures the platform with', () {

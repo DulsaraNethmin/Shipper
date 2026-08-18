@@ -6,7 +6,8 @@
 /// neither could obey the rule when it was written:
 ///
 /// - **SHIP-127's four-hour unsynced-nudge threshold** (`core/sync/unsynced_nudge.dart`).
-/// - **SHIP-130's proof compression budget** (`features/delivery/proof_image.dart`).
+/// - **SHIP-130's proof compression budget** (`core/capture/captured_image.dart`), which
+///   SHIP-81c gave a second reader in `features/profile/`.
 ///
 /// Both files say so in their own words, and both give the same reason for compiling the value in
 /// anyway: **each fires on a handset that by assumption has no connection.** The nudge is about

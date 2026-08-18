@@ -29,9 +29,11 @@
 ///   and has not reached the platform from what the queue still holds.
 /// - `delivery_screen.dart` — the buttons and the log, with pending marked in a word, an icon and
 ///   a sentence rather than in a colour.
-/// - `proof_camera.dart`, `proof_image.dart`, `capture_proof_controller.dart`,
-///   `proof_capture_screen.dart` — the photograph, taken by this app's own camera, compressed on
-///   the device, and queued as a file.
+/// - `capture_proof_controller.dart`, `proof_capture_screen.dart` — the photograph, taken by this
+///   app's own camera, compressed on the device, and queued as a file. **The camera, the compressor
+///   and the store are no longer here**: SHIP-81c gave them a second caller in `features/profile/`,
+///   and `Docs/07` §2 answers a second caller with a move rather than a cross-feature import, so
+///   they are `core/capture/` and this feature names the `proof/` folder it writes into.
 /// - `delivery_tracking.dart` — the three read shapes: a recorded milestone, a piece of evidence,
 ///   and who is driving.
 /// - `delivery_repository.dart` — the read shelf, and why every path on it has five segments.

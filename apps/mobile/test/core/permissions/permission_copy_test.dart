@@ -38,6 +38,29 @@ void main() {
       expect(purpose.toLowerCase(), contains('proof'));
       expect(purpose.toLowerCase(), contains('reason instead'));
     });
+
+    test('and it covers verification as well as delivery (SHIP-81c)', () {
+      // **Apple requires the purpose string to cover every use of the camera**, and SHIP-81c gave
+      // it a second one: a provider photographing the documents Docs/04 §3 collects. SHIP-179 wrote
+      // this string when proof of delivery was the only use and said so in as many words, so a
+      // reviewer meeting the onboarding flow would have found the string describing something else.
+      // That is a submission risk rather than a wording preference, which is why it is asserted.
+      //
+      // **The three kinds are named rather than the word "document" looked for**, because "document"
+      // is the sort of word a rewrite keeps while dropping what it was about. `abn_evidence` is
+      // deliberately not required: three named documents is enough for a reviewer to weigh the
+      // request, and Docs/04 §3's own table groups the fourth with them.
+      final purpose = _plistString('NSCameraUsageDescription')!.toLowerCase();
+
+      for (final word in <String>['licence', 'registration', 'insurance']) {
+        expect(
+          purpose,
+          contains(word),
+          reason: 'the camera photographs a provider\'s $word (Docs/04 §3) and the purpose string '
+              'does not say so',
+        );
+      }
+    });
   });
 
   group('Android', () {
@@ -92,6 +115,13 @@ void main() {
       expect(PermissionCopy.cameraPurpose, contains('If you cannot take a photo'));
       expect(PermissionCopy.cameraDeclined, contains('finish the delivery'));
       expect(PermissionCopy.notificationsDeclined, contains('still shows'));
+
+      // SHIP-81c's second camera surface, filled in by SHIP-81d. Docs/04 §3.1 requires a
+      // file-upload fallback "so that a refused permission never blocks verification outright", and
+      // this copy is where a provider learns there is one — a fallback nobody is told about is a
+      // fallback that does not exist for the person standing in front of the refusal.
+      expect(PermissionCopy.verificationCameraDeclined, contains('attach a photo or a scan'));
+      expect(PermissionCopy.verificationCameraDeclined, contains('device settings'));
     });
 
     test('the notification rationale states what is kept off a locked screen', () {

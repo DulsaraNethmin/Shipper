@@ -113,7 +113,7 @@ dependencies:
   # `NSMicrophoneUsageDescription` beside the camera string. This build passes `enableAudio: false`,
   # so no microphone is ever opened, and neither string nor Android's `RECORD_AUDIO` is declared — a
   # purpose string for a microphone the app does not use is worse than its absence, to a reviewer and
-  # to the person reading the prompt. `proof_never_reaches_the_gallery_test.dart` holds all three
+  # to the person reading the prompt. `test/nothing_captured_reaches_the_gallery_test.dart` holds all three
   # facts together. If App Review ever asks for the string, that is the moment to add it, and the
   # test says where. CameraX needs minSdk 21, below this project's floor of 24, so the floor that
   # exists for `flutter_secure_storage` does not move.
@@ -122,7 +122,7 @@ dependencies:
   #
   # A native compressor is a method channel with nothing behind it in a host test, and the
   # *Done when*'s "compressed" clause would then be an assertion about a mock. `image` is pure Dart,
-  # so `proof_image_test.dart` decodes and re-encodes real JPEGs on the host and measures the result
+  # so `test/core/capture/captured_image_test.dart` decodes and re-encodes real JPEGs on the host and measures the result
   # — including that the EXIF block, coordinates included, does not survive. It has **no native
   # footprint at all**, so unlike `camera` it moves neither store declaration.
   #
@@ -140,6 +140,53 @@ dependencies:
   # code enters the build**; what changes is that the dependency is now declared by the package that
   # imports it, which `depend_on_referenced_packages` is right to insist on.
   camera: ^0.12.0+2
+  # SHIP-81d. The file-upload fallback Docs/04 §3.1 requires — *"the camera permission may be
+  # declined. A file-upload fallback must exist so that a refused permission never blocks
+  # verification outright."* A provider who cannot be verified cannot bid, so a dead end here is
+  # somebody locked out of the marketplace by a permission prompt.
+  #
+  # ## `file_selector` and not `file_picker`, which is the popular answer and the wrong one
+  #
+  # `test/nothing_captured_reaches_the_gallery_test.dart` bans every package that writes to a photo
+  # library **and** `image_picker`, which delegates capture to something that might. Anything added
+  # in that space owes the same written argument `camera` gives above, and this is it.
+  #
+  # `file_picker` is the package everybody reaches for. Its `FileType.image`, `FileType.video` and
+  # `FileType.media` modes present the **photo picker** on iOS rather than the document picker — so
+  # a build could reach the photo library through a package named for files, and the person who
+  # reached for it would have had no reason to look. It is now on that test's forbidden list by
+  # name, with that reason, so the next person who tries fails a test instead of shipping it.
+  #
+  # `file_selector` is `flutter/packages`, published by flutter.dev, and it is a document picker in
+  # both platforms' own sense of the term:
+  #
+  # - **iOS** presents `UIDocumentPickerViewController` in open mode — the Files UI over iCloud
+  #   Drive and whatever document providers are installed. It needs **no usage string at all**,
+  #   which is the concrete thing the gallery guard checks: `NSPhotoLibraryUsageDescription` stays
+  #   absent, and a photo picker would have required it.
+  # - **Android** issues `ACTION_OPEN_DOCUMENT` through the Storage Access Framework, which grants
+  #   a URI for the one file the user chose and requires **none** of the media permissions that
+  #   test bans. `READ_MEDIA_IMAGES` stays absent from the manifest.
+  #
+  # **What this does not claim.** The platform's document UI can browse anything a document provider
+  # exposes, and on Android that includes the media provider — so a provider *may* hand over a photo
+  # they already have. That is the point of a file-upload fallback rather than a hole in it: what
+  # Docs/04 §3.1 forbids is this application **writing** an identity document into the camera roll,
+  # and what this application does is receive one file a person deliberately handed it. It holds no
+  # permission to read the library, never enumerates it, and never writes to it.
+  #
+  # **The native footprint, since Docs/11 §9 asks for it about anything with a native integration.**
+  # Nothing new is *collected*: the app already uploads verification documents (SHIP-81b, SHIP-81c),
+  # so the Apple privacy labels and the Play data-safety declaration do not move. Neither plugin
+  # reads a device identifier, a contact, a location or an advertising id — unlike `device_info_plus`,
+  # which §9 declines for precisely that reason. No manifest permission and no `Info.plist` key are
+  # added, which is unusual for a native integration and is the whole argument for this one. The
+  # Android floor of API 24 this project holds for `flutter_secure_storage` does not move either.
+  #
+  # Whatever the file turns out to be, it goes through `compressCaptureSync` before anything uploads
+  # it — so it is re-encoded as JPEG with the EXIF block dropped, exactly as a photograph is, and a
+  # file that is not an image at all is refused on the device rather than in a bucket.
+  file_selector: ^1.1.0
   image: ^4.9.1
   path_provider: ^2.1.6
 

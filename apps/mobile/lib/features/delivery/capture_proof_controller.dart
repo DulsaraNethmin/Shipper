@@ -2,13 +2,13 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/api/idempotency_key.dart';
-import 'package:shipper/core/policy/app_policy_controller.dart';
+import 'package:shipper/core/capture/capture_providers.dart';
+import 'package:shipper/core/capture/captured_image.dart';
 import 'package:shipper/core/queue/operation_queue.dart';
 import 'package:shipper/core/queue/queued_operation.dart';
 import 'package:shipper/core/sync/sync_worker.dart';
 import 'package:shipper/features/delivery/milestone.dart';
 import 'package:shipper/features/delivery/proof_exception_reason.dart';
-import 'package:shipper/features/delivery/proof_image.dart';
 import 'package:shipper/shared/formatting/dates.dart';
 
 /// Where one capture has got to.
@@ -67,10 +67,10 @@ final class ProofCaptureState {
 ///
 /// ## The three clauses of the *Done when*, and where each one is
 ///
-/// **Captured** is `ProofCamera`, which the screen drives — this class never sees a camera and takes
+/// **Captured** is `CaptureCamera`, which the screen drives — this class never sees a camera and takes
 /// bytes, which is what lets the whole journey be tested with real JPEG bytes and no device.
 ///
-/// **Compressed** is `compressProof`, on another isolate, against `ProofImagePolicy`.
+/// **Compressed** is `compressProof`, on another isolate, against `CapturedImagePolicy`.
 ///
 /// **Queued** is [SyncWorker.record] with `OperationKind.proof` and the stored file's path in
 /// `attachmentPath` — the column SHIP-124 wrote for this and left empty, with a comment naming this
@@ -78,7 +78,7 @@ final class ProofCaptureState {
 /// milestone request", so the row is queued and the exchange that sends it is
 /// `core/sync/operation_sender.dart`.
 ///
-/// **Never written to the photo library** is `ProofStore`, and it is the one clause that is a
+/// **Never written to the photo library** is `CapturedImageStore`, and it is the one clause that is a
 /// property of the whole application rather than of a method. See that class.
 ///
 /// ## The operation's key names the file, which is not a flourish
@@ -128,10 +128,10 @@ class CaptureProofController extends Notifier<ProofCaptureState> {
     final at = DateTime.now();
     final key = ref.read(idempotencyKeyMintProvider)();
 
-    final ProofImage image;
+    final CapturedImage image;
     try {
-      image = await ref.read(proofCompressorProvider)(bytes);
-    } on ProofImageUnreadable {
+      image = await ref.read(captureCompressorProvider)(bytes);
+    } on CapturedImageUnreadable {
       return _failed(
         'That photograph could not be read. Take it again.',
       );
@@ -144,7 +144,7 @@ class CaptureProofController extends Notifier<ProofCaptureState> {
     final String path;
     try {
       final store = await ref.read(proofStoreProvider.future);
-      final file = await store.write(image, name: '$key.$proofFileExtension');
+      final file = await store.write(image, name: '$key.$capturedImageFileExtension');
       path = file.path;
     } catch (error) {
       // A full disk, or a directory the platform would not create. Both are conditions of this
@@ -308,42 +308,19 @@ class CaptureProofController extends Notifier<ProofCaptureState> {
 final captureProofProvider = NotifierProvider.autoDispose
     .family<CaptureProofController, ProofCaptureState, String>(CaptureProofController.new);
 
-/// How a proof photograph is made small enough to send.
-///
-/// A seam rather than a direct call for one reason: the application runs the compression on another
-/// isolate, and a host test that spawned one for every capture would be testing Dart's isolates. The
-/// compressor a test substitutes is still `compressProofSync` — the real one — so what is replaced
-/// is where it runs and not what it does.
-typedef ProofCompressor = Future<ProofImage> Function(Uint8List bytes);
-
-/// See [ProofCompressor].
-final proofCompressorProvider = Provider<ProofCompressor>((ref) {
-  final policy = ref.watch(proofImagePolicyProvider);
-  return (bytes) => compressProof(bytes, policy: policy);
-});
-
-/// The compression budget this build uses. See [ProofImagePolicy].
-///
-/// **The size comes from the platform now (SHIP-167a), and the pixels do not.** `GET /v1/app/policy`
-/// carries `proof_compression_budget_bytes`, which is the operational half — what a driver on a
-/// metered connection in a yard should be asked to send, and a number `CLAUDE.md` says belongs
-/// server-side. `longestEdge` and the quality ladder stay compiled in: 1600 pixels is a legibility
-/// judgement about a licence plate photographed from two metres (`Docs/01` §4.4), not a dial
-/// operations should be able to turn, and trading evidence for bytes should be a code change
-/// somebody reviewed.
-///
-/// A device that has never been online uses [ProofImagePolicy]'s own default, which is the same
-/// mebibyte — see `compiledProofCompressionBudgetBytes`, which a test holds against it.
-final proofImagePolicyProvider = Provider<ProofImagePolicy>(
-  (ref) => ProofImagePolicy(maxBytes: ref.watch(appPolicyProvider).proofCompressionBudgetBytes),
-);
-
 /// Where compressed proof photographs are kept.
+///
+/// `CaptureFolder.proof` is delivery's half of the closed set `captured_image.dart` declares, and
+/// naming it here rather than inside the store is SHIP-81c's one API change: `ProofStore` had the
+/// directory hard-coded, which is a segment no refactoring tool follows and one a verification
+/// document must not land under.
 ///
 /// A `FutureProvider` because resolving the application's private directory is a platform call. A
 /// host test overrides it with a store over a temporary directory, the same way `queueDatabaseProvider`
 /// is overridden rather than reaching a real application-support directory.
-final proofStoreProvider = FutureProvider<ProofStore>((ref) => ProofStore.open());
+final proofStoreProvider = FutureProvider<CapturedImageStore>(
+  (ref) => CapturedImageStore.open(CaptureFolder.proof),
+);
 
 /// How the idempotency key for a queued proof is minted.
 ///

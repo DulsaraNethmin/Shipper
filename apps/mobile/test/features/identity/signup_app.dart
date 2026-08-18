@@ -21,6 +21,7 @@ import 'package:shipper/features/fleet/fleet_repository.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
 import 'package:shipper/features/jobs/jobs_repository.dart';
 import 'package:shipper/features/jobs/open_jobs_repository.dart';
+import 'package:shipper/features/profile/verification_repository.dart';
 
 import '../../core/auth/fake_token_store.dart';
 import '../../core/auth/session_fixtures.dart';
@@ -29,6 +30,7 @@ import '../delivery/fake_delivery_repository.dart';
 import '../fleet/fake_fleet_repository.dart';
 import '../jobs/fake_jobs_repository.dart';
 import '../jobs/fake_open_jobs_repository.dart';
+import '../profile/fake_verification_repository.dart';
 import 'fake_identity_repository.dart';
 
 /// The real app, with only the things a widget test cannot have.
@@ -49,6 +51,7 @@ Widget signupApp(
   FakeOpenJobsRepository? openJobs,
   FakeBiddingRepository? bidding,
   FakeDeliveryRepository? delivery,
+  FakeVerificationRepository? verification,
   FakeSessionEnder? ender,
   SyncWorker? worker,
   DateTime Function()? clock,
@@ -110,6 +113,13 @@ Widget signupApp(
       // four above and the same symptom when it is forgotten: a socket opened by a screen nobody in
       // a given test was thinking about, against nothing at all on CI.
       deliveryRepositoryProvider.overrideWithValue(delivery ?? FakeDeliveryRepository()),
+      // The provider's verification documents are read as soon as that screen is drawn (SHIP-81c),
+      // and submitting one is three requests, two of them writes and one of them straight to the
+      // object store. Same hazard as the five above and the same symptom when it is forgotten: a
+      // socket opened by a screen nobody in a given test was thinking about, against nothing at all
+      // on CI.
+      verificationRepositoryProvider
+          .overrideWithValue(verification ?? FakeVerificationRepository()),
       // A restored session refreshes as soon as the keychain answers (SHIP-50). None of these
       // tests starts with a stored token, so nothing refreshes — but a test that later does
       // would otherwise open a socket to whatever is listening on the local API port.

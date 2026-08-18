@@ -14,8 +14,8 @@ import 'package:shipper/core/policy/app_policy.dart';
 import 'package:shipper/core/policy/app_policy_cache.dart';
 import 'package:shipper/core/policy/app_policy_controller.dart';
 import 'package:shipper/core/sync/unsynced_nudge.dart';
-import 'package:shipper/features/delivery/capture_proof_controller.dart';
-import 'package:shipper/features/delivery/proof_image.dart';
+import 'package:shipper/core/capture/capture_providers.dart';
+import 'package:shipper/core/capture/captured_image.dart';
 
 import 'policy_fixture.dart';
 
@@ -83,7 +83,7 @@ void main() {
       );
       await settle(container);
 
-      expect(container.read(proofImagePolicyProvider).maxBytes, 262144);
+      expect(container.read(capturedImagePolicyProvider).maxBytes, 262144);
     });
 
     test('and follows the cache when there is no connection', () async {
@@ -93,7 +93,7 @@ void main() {
       );
       await settle(container);
 
-      expect(container.read(proofImagePolicyProvider).maxBytes, 256 * 1024);
+      expect(container.read(capturedImagePolicyProvider).maxBytes, 256 * 1024);
     });
 
     test('and the pixels stay compiled in, whatever the platform says', () async {
@@ -107,9 +107,9 @@ void main() {
       );
       await settle(container);
 
-      const compiled = ProofImagePolicy();
-      expect(container.read(proofImagePolicyProvider).longestEdge, compiled.longestEdge);
-      expect(container.read(proofImagePolicyProvider).qualities, compiled.qualities);
+      const compiled = CapturedImagePolicy();
+      expect(container.read(capturedImagePolicyProvider).longestEdge, compiled.longestEdge);
+      expect(container.read(capturedImagePolicyProvider).qualities, compiled.qualities);
     });
   });
 
@@ -123,7 +123,7 @@ void main() {
     });
 
     test('the proof budget default matches the compiled policy', () {
-      expect(const ProofImagePolicy().maxBytes, compiledAppPolicy.proofCompressionBudgetBytes);
+      expect(const CapturedImagePolicy().maxBytes, compiledAppPolicy.proofCompressionBudgetBytes);
     });
   });
 

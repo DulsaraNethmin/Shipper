@@ -27,6 +27,9 @@ import 'package:shipper/features/identity/sign_in_screen.dart';
 import 'package:shipper/features/jobs/job_detail_screen.dart';
 import 'package:shipper/features/jobs/job_locations_screen.dart';
 import 'package:shipper/features/jobs/open_job_screen.dart';
+import 'package:shipper/features/profile/capture_document_screen.dart';
+import 'package:shipper/features/profile/verification_document.dart';
+import 'package:shipper/features/profile/verification_documents_screen.dart';
 
 /// Route paths, named once.
 ///
@@ -274,6 +277,27 @@ abstract final class Routes {
   /// Two segments, and it collides with nothing: no other route begins `/account`.
   static const accountDeletion = '/account/deletion';
 
+  /// The provider's verification documents (SHIP-81c).
+  ///
+  /// `/verification/documents` rather than `/profile/verification`, and the divergence from the
+  /// feature's folder name is deliberate — a URL is a person's map of the product, and "profile" is
+  /// not what a provider is doing here. It mirrors the endpoint's own path minus its `/provider`
+  /// segment, which the app does not need because there is only one account signed in.
+  ///
+  /// Two segments, and it collides with nothing: no other route begins `/verification`.
+  static const verificationDocuments = '/verification/documents';
+
+  /// Photographing one of the four (SHIP-81c).
+  ///
+  /// Under [verificationDocuments] rather than beside it, because it is a step of that screen's job
+  /// and not a second way in. The kind is in the path rather than in a constructor argument, which
+  /// is what makes the screen deep-linkable in the same way [jobDetail] is — and it is the *wire*
+  /// spelling, so a link naming `abn_evidence` is naming the contract rather than a label.
+  static const captureDocument = '/verification/documents/:kind';
+
+  /// [captureDocument] for one kind, named by its wire spelling.
+  static String captureDocumentFor(String kind) => '/verification/documents/$kind';
+
   /// The connectivity check (SHIP-19).
   ///
   /// Reachable from **both** shells on purpose. It is the only screen that demonstrates build
@@ -329,6 +353,7 @@ const _signedInLocations = <String>{
   Routes.myBids,
   Routes.fleet,
   Routes.newVehicle,
+  Routes.verificationDocuments,
 };
 
 /// Locations a signed-in user may be at whose path carries an identifier (SHIP-77).
@@ -389,6 +414,14 @@ final _signedInPatterns = <RegExp>[
   // route reachable only through an identifier looks, from the outside, like a card that does
   // nothing when it is tapped.
   RegExp(r'^/fleet/vehicles/[^/]+$'),
+
+  // Photographing one verification document (SHIP-81c). Same reasoning again, and the segment after
+  // `documents` is a *kind* rather than an identifier — which changes nothing about this line and is
+  // worth saying, because `[^/]+` is deliberately not a list of the four: this collection decides
+  // where the router is willing to draw, and `Docs/07` §3 puts every decision about what a value may
+  // be on the platform. A `kind` outside the four is refused by `422` there and by
+  // `VerificationDocumentKind.fromWire` here, which is a parse rather than an authorisation.
+  RegExp(r'^/verification/documents/[^/]+$'),
 ];
 
 /// Whether a signed-in user may be at [location].
@@ -630,6 +663,25 @@ final routerProvider = Provider<GoRouter>((ref) {
         builder: (context, state) => VehicleScreen(
           vehicleId: state.pathParameters['id'] ?? '',
         ),
+      ),
+      // Declared **before** the list route for the reason `newVehicle` is declared before
+      // `vehicleDetail`: go_router takes the first route that matches. These two cannot actually
+      // collide — `/verification/documents` is two segments and this is three — but the pair is
+      // written in the order the next one added would need.
+      GoRoute(
+        path: Routes.captureDocument,
+        builder: (context, state) {
+          final kind = VerificationDocumentKind.fromWire(state.pathParameters['kind'] ?? '');
+          // A kind this build does not know is a link from a later build, or a typed URL. Sending
+          // it to the list is the same answer `VerificationDocument.fromJson` gives for the same
+          // input, and it is better than a screen captioned with an empty string.
+          if (kind == null) return const VerificationDocumentsScreen();
+          return CaptureDocumentScreen(kind: kind);
+        },
+      ),
+      GoRoute(
+        path: Routes.verificationDocuments,
+        builder: (context, state) => const VerificationDocumentsScreen(),
       ),
       GoRoute(
         path: Routes.accountDeletion,

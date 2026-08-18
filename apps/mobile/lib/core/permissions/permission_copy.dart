@@ -22,18 +22,64 @@
 abstract final class PermissionCopy {
   /// iOS renders this verbatim in the system camera prompt, and it is what the app shows as
   /// its own rationale beforehand on both platforms.
+  ///
+  /// ## SHIP-81c widened it, and that is a shipped string changing
+  ///
+  /// SHIP-179 wrote this when proof of delivery was the only thing this application photographed,
+  /// and it said so: *"…to photograph goods at pickup and delivery, as proof the job was
+  /// completed."* SHIP-81c gave the camera a second use — a provider photographing the four
+  /// documents `Docs/04` §3 collects — and **a purpose string that does not cover a use is a
+  /// submission risk rather than a wording preference.** Apple requires the string to describe
+  /// every reason the application opens the camera, and a reviewer reading "as proof the job was
+  /// completed" while the onboarding flow photographs a driver licence is a reviewer who has found
+  /// a discrepancy.
+  ///
+  /// **Verification is named first, deliberately.** It is the first time most providers meet this
+  /// prompt: `Docs/04` §3 collects the documents before anybody can bid, so the camera opens during
+  /// onboarding long before it opens at a delivery point.
+  ///
+  /// The two things `Docs/07` §7 requires of it are unchanged, because they are what Apple rejects
+  /// a build for missing: it says what is captured, and it says what happens if the request is
+  /// declined. The second is true of both uses — a delivery takes a recorded exception reason
+  /// (`Docs/01` §4.4, SHIP-131) and verification takes a file the provider already has
+  /// (`Docs/04` §3.1, SHIP-81d).
   static const cameraPurpose =
-      'Shipper uses the camera to photograph goods at pickup and delivery, as proof the job '
-      'was completed. If you cannot take a photo, you can record the reason instead.';
+      'Shipper uses the camera for two things: transport providers photograph the licence, '
+      'vehicle registration and insurance documents they are verified against, and drivers '
+      'photograph goods at pickup and delivery as proof the job was completed. If you cannot '
+      'take a photo, you can record the reason instead.';
 
-  /// Shown when the camera has been declined.
+  /// Shown when the camera has been declined **at a delivery**.
   ///
   /// `Docs/01` §4.4 allows a recorded exception reason in place of a photo, so a refusal is a
   /// route through the job rather than the end of it — `Docs/07` §7 calls a camera flow that
   /// dead-ends on a denied permission a defect.
+  ///
+  /// [verificationCameraDeclined] is the same sentence for the other camera surface, and the two
+  /// are separate because the routes on are different: a delivery records a reason and finishes,
+  /// and a verification document is attached from a file. One string covering both would have to
+  /// offer each user the other's way out.
   static const cameraDeclined =
       'Shipper cannot open the camera. You can record a reason for the missing photo and '
       'finish the delivery, or turn the camera on in your device settings.';
+
+  /// Shown when the camera has been declined **while photographing a verification document**.
+  ///
+  /// `Docs/04` §3.1 puts a hard requirement under this sentence: *"the camera permission may be
+  /// declined. A file-upload fallback must exist so that a refused permission never blocks
+  /// verification outright."* A provider who cannot photograph their licence cannot be verified,
+  /// and a provider who cannot be verified cannot bid — so a dead end here is not an inconvenience,
+  /// it is somebody locked out of the marketplace by a permission prompt.
+  ///
+  /// **SHIP-81c left this honestly short of that requirement and SHIP-81d fills it.** Until the
+  /// fallback existed the sentence offered settings alone, because copy promising a button that was
+  /// not there is worse than copy that admits where the provider stands. It now offers the file
+  /// first and settings second — the order matters, because a provider standing in front of a
+  /// refused permission wants the way *on* rather than the way *back*, and the document they need
+  /// is very often already a photo or a scan on the phone in their hand.
+  static const verificationCameraDeclined =
+      'Shipper cannot open the camera. You can attach a photo or a scan of the document from '
+      'this device instead, or turn the camera on in your device settings and try again.';
 
   /// The heading above [notificationsPurpose].
   static const notificationsTitle = 'Know as soon as something happens';

@@ -26,7 +26,7 @@
 /// project exists the change is one class and one line in `main.dart`.
 ///
 /// It is the shape every other platform channel in this client already has — `RunningBuild`,
-/// `StoreOpener`, `ProofCompressor` — for the reason those have one: a host test has no plugin
+/// `StoreOpener`, `CaptureCompressor` — for the reason those have one: a host test has no plugin
 /// behind a channel, and a seam is what lets the behaviour around it be demonstrated rather than
 /// asserted.
 library;

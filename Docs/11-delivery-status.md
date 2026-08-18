@@ -16213,6 +16213,116 @@ not fix it — the routing is a product decision, and changing it would alter wh
 sections see. The section works around it with `offered_by: customer`, which is a combination the
 platform genuinely emits, and says why in a comment.
 
+### SHIP-81c — the client half of `Docs/04` §3.1, and the move that made it possible (wave 16)
+
+Wave 14's SHIP-81b built the platform half and recorded, in this section, exactly why it stopped there: the capture experience *"is not built"*, `apps/mobile/lib/features/verification/**` **cannot exist**, and reusing what delivery already had *"requires moving all three to `core/`… which is a refactor of another feature's directory, with no ticket"*. Wave 15's `ship-15af-ship-81c-decision` closed the first half by writing the decision into `Docs/07` §2. This ticket is the second half, and the move is most of it.
+
+#### The move, and the one API decision inside it
+
+`ProofCamera` and `PlatformProofCamera` (`features/delivery/proof_camera.dart`), and `ProofImagePolicy`, `ProofImage` and `ProofStore` (`proof_image.dart`), are now `core/capture/capture_camera.dart` and `core/capture/captured_image.dart` — renamed to `CaptureCamera`, `PlatformCaptureCamera`, `CapturedImagePolicy`, `CapturedImage` and `CapturedImageStore`, with every paragraph rewritten. The precedent is `ProviderOnly`, moved to `core/auth/` at SHIP-100, and `provider_only.dart:67-80` is the template the copy rewrite followed: *"The copy generalised in the move, deliberately."* A class that kept a doc comment about proof of delivery while a provider's licence went through it is documentation that is wrong about the code, which is worse than documentation that is missing.
+
+**`ProofStore.folder` was `static const folder = 'proof'`, and that is the one substantive API decision the move took.** A driver licence must not land under `proof/`, and the *Done when* says so. Three ways to parameterise it were available: a `String folder` field, which makes the destination a parameter and `'../../DCIM'` a string, when the whole of the class's guarantee is that the destination is *not* one; a validated `String`, which closes that and leaves the set of directories open to grep alone; and **a closed `CaptureFolder` enum, which is what was written** — the same move `OperationKind` makes with a private constructor in `core/queue`, so an unlisted destination does not compile and the two places this application writes images are in one readable list. The names are the platform's own: the object key `POST /v1/provider/verification/documents/uploads` mints is `verification/<provider>/<uuid>`, so the handset's directory and the bucket's prefix read the same word.
+
+The two providers that are genuinely shared — the compression budget and the compressor — moved to `core/capture/capture_providers.dart`. The **store** providers did not: each caller names its own folder, so `proofStoreProvider` stays in `features/delivery/` and `verificationStoreProvider` is in `features/profile/`, one line each.
+
+#### It is `features/profile/`, and there is no eighth feature
+
+`Docs/07` §2 assigns verification evidence to `profile/` — *"capture as well as display"* — and `architecture_test.dart` holds `lib/features` to the closed list of seven. The stub was an eight-line `library;`. It now holds five files and its own doc comment saying what each is for, plus a sixth from SHIP-81d.
+
+The entry point is a button on the **provider feed**, in `features/jobs/`, which imports nothing from `features/profile/`: what connects them is `Routes.verificationDocuments`, a constant in `core/routing/`. That is the arrangement `manage-vehicles` already has with `features/fleet/`, and it is what §2's rule leaves available — a route name is not an import.
+
+#### The upload does not go through the offline queue, and that is a decision
+
+Wave 14 measured the mechanical obstacle and it is real: `OperationKind`'s constructor is private, so this would need a third kind, and `ApiOperationSender._sendWithProof` derives its presign path by chopping the last segment off `/v1/jobs/{id}/milestones` — which for this pair of nested routes gives `/v1/provider/verification/uploads`, served by nothing. **The product reason is the one that decided it.** `Docs/07` §4 puts the queue where it is needed — *"pickup bays, warehouses and rural routes have no usable signal"* — and verification is onboarding; the queue's guarantee is FIFO within an ordering key and a document submission is ordered against nothing; and a queued submission would confirm the wrong thing, because the provider's next question is "may I bid yet" and an object with no row is *"evidence of nothing"*. What is kept from the queue's design is the half that matters: the compressed file survives a failure, and the idempotency key belongs to the action rather than to the attempt.
+
+So `VerificationRepository.submit` performs all three requests as one operation — presign, PUT to the store on `ObjectUploader`'s own transport, submit — because two of the three are useless alone and a caller that could reach the middle could leave somebody's licence in a bucket with no row, which is the one outcome invisible from both ends.
+
+#### `Docs/04` §3.1's three guarantees, and which line holds each
+
+- **Never written to the photo library** — unchanged, and deliberately so. It was SHIP-130's property and it moved with the code rather than being rewritten. The guard did too: `proof_never_reaches_the_gallery_test.dart` is now `test/nothing_captured_reaches_the_gallery_test.dart`, at the root beside `architecture_test.dart`, because **every assertion in it was already whole-client** — the move changed no `Directory` and no glob.
+- **Compressed on the device** — `submit` takes a `CapturedImage` rather than bytes, so the compressor is not something it can be called without having run, and `content_length` is signed against the compressed size.
+- **Cleared from app storage once uploaded** — discarded after the submission returns, and **only after**. Every failing path leaves the file, which is what makes a retry a second *upload* rather than a second photograph, and it is why the image is written down instead of held in memory.
+
+#### The camera purpose string was widened, and that supersedes SHIP-179
+
+SHIP-179 wrote *"Shipper uses the camera to photograph goods at pickup and delivery, as proof the job was completed…"* when proof of delivery was the only use. It is now the two-use string naming the licence, registration and insurance documents first — in `PermissionCopy.cameraPurpose` **and** in `ios/Runner/Info.plist`, which `permission_copy_test.dart` already held byte-for-byte together and now also holds to naming all three documents. **A shipped string changing is worth a sentence**: Apple requires the purpose string to cover every use of the camera, and a reviewer meeting the onboarding flow while the string described a delivery would have found a discrepancy. Verification is named first because it is the first time most providers meet the prompt — `Docs/04` §3 collects the documents before anybody can bid.
+
+#### No `expires_at`, and that is a refusal rather than an omission
+
+`DocumentSubmission` gained an optional `expires_at` in wave 16's Phase 0 and this client does not collect one. `Docs/04` §3's *Decision required* — which documents must be renewed and how often, Track-X row **X-4** — is owned by legal and insurance advisers and *"remains genuinely outside engineering's competence to settle"*. A screen asking every provider for a date would be this application answering it four times over, and getting one of the four wrong by construction: an ABN extract does not lapse. The field is stated at submission or never and the table is append-only, so collecting it later is a text field and a second submission; collecting it now and being wrong is a data-cleanup.
+
+#### The mutation, and the guard it found inert
+
+**Two mutations, both killed, and the second is the finding.**
+
+*`CaptureFolder.verification('verification')` → `('proof')`* — a driver licence filed under the delivery folder. Killed by one assertion, in `verification_repository_test.dart`, on the store's own directory path. That is the layer that holds it: the enum makes an *unlisted* destination uncompilable and says nothing about what the listed ones are called, so a test on the name is the only thing between the two.
+
+*The name guard in `CapturedImageStore.write` reduced to `name.isEmpty`* — killed by `captured_image_test.dart`'s "a destination is never a parameter", but **read the failure**: the refusal came from `PathNotFoundException` out of `writeAsBytes`, not from the store. The "belt and braces beside the check above, and the one that survives a change to it" was **inert**, inherited verbatim from `ProofStore`: it compared `file.absolute.path.startsWith(folder.absolute.path)` on the *joined* string, and `/tmp/root/verification/../x.jpg` starts with `/tmp/root/verification`. Probed directly, all three of an absolute path, `../x.jpg` and `../../DCIM/x.jpg` passed it. So the store had one guard wearing a two-layer disguise, and on a handset where the target directory happens to exist the mutation would have written the photograph outside the store rather than failing.
+
+It is closed. `CapturedImageStore.isInside` normalises both paths with `Uri.normalizePath` before comparing, is **public so it can be tested without going through the name guard** — a second layer only reachable through the first is a second layer nobody can demonstrate, which is exactly how the previous one survived every test this store has had — and reverting it to the inert form fails its own test by name.
+
+#### What this does not build
+
+- **The file-upload fallback `Docs/04` §3.1 requires**, which is SHIP-81d. `PermissionCopy.verificationCameraDeclined` is honestly short of it in this ticket and offers settings alone, because copy promising a button that is not there is worse than copy that says where the provider stands.
+- **Any rendering of a submitted image.** `download_url` is a credential with a lifetime of minutes and the contract says not to cache one, so `VerificationDocument` does not model it. The screen that reviews these images is the administrator's, SHIP-155, on the administrator's own credential.
+- **`GET /v1/provider/verification`** — the *state*. `Docs/04` §4's five outcomes are a different question from evidence, and a screen showing "3 of 4 sent" beside a state would invite reading the first as progress towards the second. Nothing here says a document arriving is a decision being taken.
+
+**No Go, no migration, no route, no contract change** — `git diff --name-only develop...HEAD` is `apps/mobile/**` and `Docs/11` alone, so there is no constraint to sweep `scripts/verify/*.sh` for and `make verify` has nothing of this ticket's to exercise.
+
+| Surface | What |
+|---|---|
+| SHIP-81c | `core/capture/` — `CaptureCamera`, `CapturedImage{,Policy,Store}` and `CaptureFolder`, moved out of `features/delivery/` and renamed; `features/profile/` grows five files — the four kinds, the three-request repository, the capture controller, the list screen and the camera screen; two routes and their `_signedIn*` entries; the camera purpose string widened in both places, superseding SHIP-179's; `CapturedImageStore.isInside` replaces an inert path check; the gallery guard moved to the test root and its hard-coded source path replaced by a sweep for `CameraController(`; 22 Dart tests |
+
+### SHIP-81d — the fallback, and the two packages whose names mean the same thing (wave 16)
+
+`Docs/04` §3.1: *"The camera permission may be declined. A file-upload fallback must exist so that a refused permission never blocks verification outright."* SHIP-81c left this honestly unbuilt and said so in `PermissionCopy.verificationCameraDeclined`, which offered settings and nothing else. This is the button.
+
+**The stakes are not a convenience.** A provider who cannot photograph their licence cannot be verified, and a provider who cannot be verified cannot bid — so a dead end here is somebody locked out of the marketplace by a permission prompt. `Docs/07` §7 calls a camera flow that dead-ends on a denied permission a defect in as many words.
+
+#### `file_selector`, and why the obvious package is the wrong one
+
+`test/nothing_captured_reaches_the_gallery_test.dart` bans `image_picker` by name — *"delegates capture to the platform camera app, which may keep its own copy"* — along with every gallery package, and it checks `pubspec.yaml` and the import lines **separately**, because a dependency added without a pubspec entry once slipped past it. Anything added in that space owes the same written argument `camera` already carries, and `pubspec.yaml` now carries this one beside the dependency.
+
+`file_picker` is the package everybody reaches for and it is the wrong one: its `FileType.image`, `FileType.video` and `FileType.media` modes present the **photo picker** on iOS rather than the document picker. A build could therefore reach the photo library through a package named for files, and the person who reached for it would have had no reason to look. **It is now on that test's forbidden list by name, with that reason.**
+
+`file_selector` is `flutter/packages`, published by flutter.dev, and it is a document picker in both platforms' own sense:
+
+- **iOS** presents `UIDocumentPickerViewController` in open mode and needs **no usage string at all** — which is the concrete thing the guard asserts: `NSPhotoLibraryUsageDescription` stays absent, and a photo picker would have required it.
+- **Android** issues `ACTION_OPEN_DOCUMENT` through the Storage Access Framework, which grants a URI for the one file the user chose and requires **none** of the media permissions the guard bans. `READ_MEDIA_IMAGES` stays absent.
+
+**No manifest permission and no `Info.plist` key are added**, which is unusual for a native integration and is the whole argument for this one. Nothing new is collected, so neither store declaration moves, and the Android floor of API 24 does not move either.
+
+**What this does not claim, stated because the *Done when* says "a picker that reaches no photo library".** The platform's document UI browses whatever a document provider exposes, and on Android that includes the media provider — so a provider *may* hand over a photo they already have. That is the point of a file-upload fallback rather than a hole in one: the document is very often already a scan or a photo on the phone, and what `Docs/04` §3.1 forbids is this application **writing** an identity document into a camera roll. The application holds no permission to read the library, never enumerates it, and never writes to it. The clause is met in every sense that is enforceable; it is not met in the sense of "the person cannot navigate to their own photos", and nothing short of removing the fallback could meet that.
+
+#### It is offered whether or not the camera opened
+
+A refused permission is the case the document names and the case where this is the only route on — there it is a `FilledButton` and the sole action. On a working camera it is a quiet `TextButton` under the shutter, the same shape `proof_capture_screen.dart` gives its exception route, because photographing stays the obvious path. The reason it is there at all is that the document is often already on the phone: an insurance certificate emailed as a scan, an ABN extract downloaded from the tax office. Making somebody photograph a screen is worse evidence for the administrator who has to judge it legible by eye (`Docs/04` §3).
+
+**The file goes through the same compressor a photograph does**, which is what makes the fallback safe rather than a second path with different guarantees: `compressCaptureSync` re-encodes to JPEG and drops the EXIF block, so a photo the provider took on that phone does not arrive carrying a coordinate. A file that is not an image is refused on the device rather than in a bucket. Cancelling the picker is not an error and says nothing.
+
+#### It is in `features/profile/` rather than `core/`
+
+`Docs/07` §2's rule for `core/` is a second caller, and this has one. It is also the one piece of verification capture `features/delivery/` must **not** acquire: `Docs/01` §4.4 makes proof of delivery a photograph taken at the delivery point, and a file chosen from a phone is not evidence a delivery happened. A refused camera there has its own answer and it is a recorded exception reason (SHIP-131).
+
+#### The mutation, and the near-miss it caught
+
+**Declared `file_picker` in `pubspec.yaml` beside `file_selector`.** It ran twice and the two runs are the finding.
+
+*Run 1 survived*, and the guard was not the reason. An earlier edit that added `file_picker` to `_forbiddenPackages` had **aborted on a later assertion in the same script and never written the file** — so the ban existed in a script and not in the repository, and a commit claiming it would have been false. This is the recorded trap exactly: *"`git diff` silence is not evidence… checksum or print the file after mutating, not only after restoring."* The ban was reapplied and **printed** rather than asserted.
+
+*Run 2 killed it*, in `nothing_captured_reaches_the_gallery_test.dart`'s first test, naming the package and the reason. The layer is the pubspec sweep, and there is a second underneath it for the case where an import lands before a dependency does.
+
+**One thing the first attempt measured on the way past.** `file_picker: ^8.x` **cannot resolve in this project at all** — `package_info_plus ^10.2.1` requires `win32 ^6.0.1` and every `file_picker` from 8.0.6 to 12.0.0-beta.1 requires `win32 ^5.x`. Only `^12.0.0` resolves. That is not a guard and must not be mistaken for one: it is a transitive accident on a platform this application does not ship to, and it would evaporate the moment `package_info_plus` moves. The named ban is what holds.
+
+#### What this does not build
+
+- **A picker on the delivery side.** See above; it would be the wrong answer to a different question.
+- **A retry of the picker itself.** A platform that would not open one says so and leaves both routes on the screen; there is no permission to re-request, so there is nothing to retry that a second tap does not already do.
+
+| Surface | What |
+|---|---|
+| SHIP-81d | `file_selector ^1.1.0` with its argument in `pubspec.yaml`, and `file_picker` added to the gallery guard's forbidden list by name; `features/profile/document_file_source.dart` — the `DocumentFileSource` port, the `UIDocumentPickerViewController`/`ACTION_OPEN_DOCUMENT` implementation restricted to the platform's accepted image types, and `DocumentFileUnavailable`; the fallback offered from both the refused panel and the working camera; `PermissionCopy.verificationCameraDeclined` rewritten to name it; 9 Dart tests, four of which walk all four kinds through a refused camera |
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

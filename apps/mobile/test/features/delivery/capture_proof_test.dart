@@ -5,7 +5,7 @@
 // than of this journey.
 //
 // Everything below the fake camera is the real application: the real router, the real compressor,
-// the real `ProofStore` over a temporary directory, and SHIP-124's real queue over a real SQLite
+// the real `CapturedImageStore` over a temporary directory, and SHIP-124's real queue over a real SQLite
 // file. The camera is the one thing a host test cannot have — there is no device — so it is the one
 // thing replaced, and it is replaced with something that returns **real JPEG bytes** so that the
 // compression and the file that comes out of it are real too.
@@ -18,8 +18,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as img;
 import 'package:shipper/core/errors/api_failure.dart';
 import 'package:shipper/core/queue/queued_operation.dart';
-import 'package:shipper/features/delivery/proof_camera.dart';
-import 'package:shipper/features/delivery/proof_image.dart';
+import 'package:shipper/core/capture/capture_camera.dart';
+import 'package:shipper/core/capture/captured_image.dart';
 
 import '../../core/sync/sync_fixture.dart';
 import 'delivery_app.dart';
@@ -39,7 +39,7 @@ void main() {
 
     for (var frame = 0; frame < 100; frame++) {
       // `runAsync` steps outside the test's fake clock, which is what lets the **real** file I/O
-      // underneath this finish: `ProofStore.write` creates a directory and writes half a megabyte,
+      // underneath this finish: `CapturedImageStore.write` creates a directory and writes half a megabyte,
       // and `dart:io` completes those on the real event loop rather than on the fake one every other
       // await in a widget test runs on.
       await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 10)));
@@ -64,7 +64,7 @@ void main() {
   testWidgets('the delivery is photographed, compressed and queued with its milestone',
       (tester) async {
     final original = photograph(width: 2400, height: 1800);
-    final camera = FakeProofCamera(bytes: original);
+    final camera = FakeCaptureCamera(bytes: original);
     final root = temporary();
 
     // Nothing may be accepted: an operation the platform takes is deleted, and a queue emptied by
@@ -75,7 +75,7 @@ void main() {
       tester,
       harness: harness,
       jobId: job,
-      overrides: withDevice(camera, ProofStore(root)),
+      overrides: withDevice(camera, CapturedImageStore(root, folder: CaptureFolder.proof)),
     );
 
     // Delivered is not one of the three plain buttons — a plain one would queue an operation whose
@@ -120,7 +120,7 @@ void main() {
     final stored = File(path!);
     expect(stored.existsSync(), isTrue);
     expect(
-      stored.path.startsWith(ProofStore(root).directory.path),
+      stored.path.startsWith(CapturedImageStore(root, folder: CaptureFolder.proof).directory.path),
       isTrue,
       reason: 'inside this application’s own directory — see '
           'proof_never_reaches_the_gallery_test.dart for the rest of that claim',
@@ -136,7 +136,7 @@ void main() {
     expect(img.findFormatForData(bytes), img.ImageFormat.jpg);
     expect(
       img.decodeJpg(bytes)!.width,
-      const ProofImagePolicy().longestEdge,
+      const CapturedImagePolicy().longestEdge,
       reason: 'and downscaled, not merely re-encoded',
     );
 
@@ -150,14 +150,14 @@ void main() {
     // SHIP-131 is the ticket that turns this into a route through the job — the reasoned exception
     // needs `proof.exception_reason`, which is SHIP-116 on the platform and no screen here yet. What
     // this ticket owes is that the refusal is explained rather than looking like a broken camera.
-    final camera = FakeProofCamera(problem: ProofCameraProblem.refused);
+    final camera = FakeCaptureCamera(problem: CameraProblem.refused);
     final harness = SyncHarness.create(sender: ScriptedSender(thereafter: const ApiUnreachable()));
 
     await openDelivery(
       tester,
       harness: harness,
       jobId: job,
-      overrides: withDevice(camera, ProofStore(temporary())),
+      overrides: withDevice(camera, CapturedImageStore(temporary(), folder: CaptureFolder.proof)),
     );
 
     await tester.tap(find.byKey(const Key('milestone-record-delivered')));
@@ -176,7 +176,7 @@ void main() {
   testWidgets('bytes that are not an image are refused, and nothing is queued', (tester) async {
     // The one failure in this journey that is not retryable: a file that is not an image will not
     // become one on the next attempt. It leaves no row and no file behind.
-    final camera = FakeProofCamera(bytes: Uint8List.fromList(const [0, 1, 2, 3, 4]));
+    final camera = FakeCaptureCamera(bytes: Uint8List.fromList(const [0, 1, 2, 3, 4]));
     final root = temporary();
     final harness = SyncHarness.create(sender: ScriptedSender(thereafter: const ApiUnreachable()));
 
@@ -184,7 +184,7 @@ void main() {
       tester,
       harness: harness,
       jobId: job,
-      overrides: withDevice(camera, ProofStore(root)),
+      overrides: withDevice(camera, CapturedImageStore(root, folder: CaptureFolder.proof)),
     );
 
     await tester.tap(find.byKey(const Key('milestone-record-delivered')));
@@ -200,8 +200,8 @@ void main() {
     );
     expect(await harness.queue.count(), 0);
     expect(
-      ProofStore(root).directory.existsSync() &&
-          ProofStore(root).directory.listSync().isNotEmpty,
+      CapturedImageStore(root, folder: CaptureFolder.proof).directory.existsSync() &&
+          CapturedImageStore(root, folder: CaptureFolder.proof).directory.listSync().isNotEmpty,
       isFalse,
       reason: 'and no photograph was written for an operation that does not exist',
     );
