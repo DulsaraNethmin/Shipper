@@ -204,6 +204,24 @@ Hand-written validators returning `[]httpx.FieldError`, in `internal/validate`. 
 
 **One exception, taken deliberately at SHIP-60: the Australian state is returned as its upper-case abbreviation** (`NSW`, `VIC`), because a client prints it rather than branching on it, and the lower snake case form would have every client upper-casing it back. Any case, and the spelled-out name, are accepted on input. This is narrow on purpose and does not loosen the rule for enums a client *does* branch on — job status in particular stays lower snake case on the wire, through `Status.Wire()`.
 
+### 4.8 Rate limits
+
+**Every route on the manifest belongs to one of seven limit classes, and `Docs/12` is the authority
+for which.** The numbers are decided there rather than derived from `Docs/01`, which states no
+rate-limiting requirement anywhere, so the reason lives beside each class and a number changed
+without its reason is a defect.
+
+What matters here is the shape rather than the figures. A route names **one bucket class**, which is
+what SHIP-183a's gate holds and what makes "registered without a limit" a build failure rather than
+a silent default to unlimited. A route may additionally carry a **silent per-destination limit** — a
+message-sending endpoint must not answer 429, because refusing discloses that the destination has an
+account — or an **attempt limit** that retires a guessable artefact. Those two are domain concerns,
+written inside the transaction, and are not interchangeable with a bucket.
+
+**Do not key a limit on a network address without checking `Docs/12` §8.** Eleven routes do, and
+none of them is enforceable behind a load balancer until the trusted-proxy configuration exists;
+the other 75 key on the authenticated subject and are unaffected.
+
 ## 5. Identity and tokens
 
 | Element | Position |

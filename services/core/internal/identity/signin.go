@@ -232,10 +232,16 @@ func (s *Service) upgradeStoredPassword(ctx context.Context, r db.Runner, user U
 // The two limits on sign-in (SHIP-47).
 //
 // Constants here rather than configuration, and it is the scope decision SHIP-39's TTL names:
-// internal/config is a shared surface (Docs/10 §9.2) and three tracks were open. These are also
-// not a lever anybody has asked to pull without a deploy — SHIP-183's API-wide review is where
-// every public endpoint's limit gets considered together, and that is the ticket that should
-// decide whether any of them belong in configuration.
+// internal/config is a shared surface (Docs/10 §9.2) and three tracks were open.
+//
+// SHIP-183 has now reviewed the whole surface and kept them here. Docs/12 §7 carries the reason:
+// eighty-six routes would be 172 environment variables that nobody maintains correctly, and a
+// per-route override is a number free to drift from the reason written beside it — which is the
+// failure the document exists to prevent, reintroduced through the back door. What an incident
+// actually wants is global rather than per-route, so the lever is a burst scale and a rate scale
+// applied to every class, defaulting to these figures. SHIP-183a builds it.
+//
+// These two are Docs/12's Credential class, reused verbatim rather than re-derived.
 const (
 	// signInAccountCapacity is how many failed sign-ins one address may make in a burst, and
 	// signInAccountInterval how fast that allowance returns.
