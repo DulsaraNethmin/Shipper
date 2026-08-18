@@ -48,8 +48,8 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 
-/// Packages whose whole purpose is to put an image in the device's gallery, plus the one that
-/// delegates capture to an application that might.
+/// Packages whose whole purpose is to put an image in the device's gallery, plus the two that
+/// reach one on the way to doing something else.
 ///
 /// **Adding anything to this list is a decision about SHIP-130's and SHIP-81c's *Done when*.** There
 /// is no allow-list beside it on purpose: the answer is not "which file may use it".
@@ -61,6 +61,13 @@ const _forbiddenPackages = <String, String>{
   'saver_gallery': 'saves images to the gallery',
   'image_picker': 'delegates capture to the platform camera app, which may keep its own copy',
   'flutter_image_gallery_saver': 'saves images to the gallery',
+  // Added by SHIP-81d, which needed a file picker and had to choose between two packages whose
+  // names suggest the same thing. `file_picker`'s image, video and media modes present the **photo**
+  // picker on iOS rather than the document picker, so a build could reach the photo library through
+  // a package named for files — and the person who reached for it would have had no reason to look.
+  // `file_selector` is what this client depends on instead, and `pubspec.yaml` argues the choice at
+  // length beside the dependency.
+  'file_picker': 'its image and media modes present the iOS photo picker, not the document picker',
 };
 
 /// Symbols that write to a shared photo library, in any of the three languages this app is built
@@ -98,8 +105,9 @@ void main() {
     final offences = <String>[];
 
     for (final entry in _forbiddenPackages.entries) {
-      // A dependency line, not a mention: the reasoning for *not* depending on `image_picker` is
-      // written down in `capture_camera.dart` and must not fail its own test.
+      // A dependency line, not a mention: the reasoning for *not* depending on `image_picker` or on
+      // `file_picker` is written down in `capture_camera.dart` and in `pubspec.yaml`, and must not
+      // fail its own test.
       if (RegExp('^\\s{2}${RegExp.escape(entry.key)}:', multiLine: true).hasMatch(pubspec)) {
         offences.add('${entry.key} — ${entry.value}');
       }
@@ -112,9 +120,9 @@ void main() {
           'library.\n'
           'These dependencies would put one there, or hand the capture to something that might:\n\n'
           '  ${offences.join('\n  ')}\n\n'
-          'core/capture/capture_camera.dart argues why `camera` was chosen over `image_picker`\n'
-          'and what the difference costs. If the decision has genuinely changed, change it\n'
-          'there first.\n',
+          'core/capture/capture_camera.dart argues why `camera` was chosen over `image_picker`,\n'
+          'and pubspec.yaml argues why `file_selector` was chosen over `file_picker`. If a\n'
+          'decision has genuinely changed, change it there first.\n',
     );
   });
 
@@ -155,6 +163,11 @@ void main() {
     // The guard that holds whatever the Dart does. Without one of these an application cannot write
     // to the shared media collections on Android 10 and later, so this is the platform enforcing the
     // *Done when* rather than this repository hoping for it.
+    //
+    // **It is also what makes SHIP-81d's fallback a document picker rather than a gallery one.**
+    // `file_selector` reaches the file system through `ACTION_OPEN_DOCUMENT`, which grants a URI for
+    // the one file the user chose and needs none of the permissions below. A package that enumerated
+    // the photo library would need `READ_MEDIA_IMAGES` and would fail here.
     final manifests = <File>[
       File('android/app/src/main/AndroidManifest.xml'),
       File('android/app/src/debug/AndroidManifest.xml'),
@@ -180,6 +193,10 @@ void main() {
     // The same guard on the other platform. `PHPhotoLibrary` refuses without one, and App Review
     // rejects a binary that calls the API and does not declare it — so its absence is both the
     // enforcement and the statement to the reviewer.
+    //
+    // It is also the iOS half of SHIP-81d's argument: `UIDocumentPickerViewController` needs no
+    // usage string at all, because the user picks the file in a system UI this application never
+    // sees. A photo picker would need `NSPhotoLibraryUsageDescription` and would fail here.
     final plist = File('ios/Runner/Info.plist').readAsStringSync();
 
     for (final key in _forbiddenPlistKeys) {

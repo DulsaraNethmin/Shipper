@@ -224,11 +224,10 @@ void main() {
   });
 
   group('the camera refusing', () {
-    testWidgets('says so, and SHIP-81c offers nothing else', (tester) async {
-      // **Recorded as a gap rather than dressed up.** `Docs/04` §3.1 requires a file-upload
-      // fallback so that a refused permission never blocks verification outright, and `Docs/07` §7
-      // calls a camera flow that dead-ends on a denied permission a defect. SHIP-81c does not build
-      // it; SHIP-81d does, and this test is what changes when it lands.
+    testWidgets('says so, and leaves no shutter behind it', (tester) async {
+      // What is offered instead is SHIP-81d's, and `verification_fallback_test.dart` is where the
+      // route on is walked. This one holds the other half: the screen stops offering a camera that
+      // will not open, rather than leaving a button that appears to do nothing.
       final camera = FakeCaptureCamera(problem: CameraProblem.refused);
 
       await openCapture(

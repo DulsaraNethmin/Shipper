@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shipper/core/auth/provider_only.dart';
 import 'package:shipper/core/capture/capture_camera.dart';
 import 'package:shipper/core/permissions/permission_copy.dart';
+import 'package:shipper/features/profile/document_file_source.dart';
 import 'package:shipper/features/profile/verification_document.dart';
 import 'package:shipper/features/profile/verification_documents_controller.dart';
 
@@ -26,7 +27,7 @@ import 'package:shipper/features/profile/verification_documents_controller.dart'
 /// | | Proof of delivery | A verification document |
 /// |---|---|---|
 /// | Where it goes | the offline queue, sent later | three requests, now |
-/// | What a refusal offers | a recorded exception reason (`Docs/01` §4.4) | a file the provider already has (`Docs/04` §3.1) |
+/// | What a refusal offers | a recorded exception reason (`Docs/01` §4.4) | a file the provider already has (`Docs/04` §3.1, SHIP-81d) |
 /// | What "done" says | "on this phone, Shipper will send it" | "Shipper has it, somebody will review it" |
 ///
 /// A single screen parameterised over those three would be a screen whose every branch is one
@@ -52,6 +53,15 @@ class _CaptureDocumentScreenState extends ConsumerState<CaptureDocumentScreen> {
   CaptureCamera? _camera;
   CameraProblem? _problem;
   var _opening = true;
+
+  /// Whether the platform would not open a document picker at all (SHIP-81d).
+  ///
+  /// Its own flag rather than a stage on the controller, because nothing was submitted: the
+  /// controller's state is about an image on its way to the platform, and this is about a screen
+  /// that could not obtain one. Rare — unlike a camera there is no permission to refuse — and worth
+  /// saying rather than swallowing, because when the camera has also been refused this is a
+  /// provider with no route on at all.
+  var _pickerFailed = false;
 
   @override
   void initState() {
@@ -136,6 +146,38 @@ class _CaptureDocumentScreenState extends ConsumerState<CaptureDocumentScreen> {
     return sent;
   }
 
+  /// The file-upload fallback (SHIP-81d).
+  ///
+  /// `Docs/04` §3.1 requires it *"so that a refused permission never blocks verification
+  /// outright"*, and it is offered **whether or not the camera opened** — for two reasons. A
+  /// refused permission is the case the document names, and it is the case where this is the only
+  /// route on. But the document a provider needs is very often already on their phone: an insurance
+  /// certificate emailed as a scan, an ABN extract downloaded from the tax office. Making them
+  /// photograph a screen would be worse evidence for the administrator who has to read it.
+  ///
+  /// A cancelled picker is not a failure and says nothing: the provider opened it, changed their
+  /// mind, and comes back to the screen they left.
+  Future<void> _chooseFile() async {
+    final Uint8List? bytes;
+    try {
+      bytes = await ref.read(documentFileSourceProvider).pick();
+    } on DocumentFileUnavailable {
+      if (!mounted) return;
+      setState(() => _pickerFailed = true);
+      return;
+    }
+
+    if (bytes == null || !mounted) return;
+
+    // The camera is released first if it is open. The same reason the shutter releases it: nothing
+    // is going to be photographed now, and a preview running behind a compression is a warm handset.
+    await _camera?.stop();
+    if (mounted) setState(() => _camera = null);
+
+    final sent = await _submit(bytes);
+    if (!sent && mounted && _problem == null) await _open();
+  }
+
   /// A second attempt at the upload, from the image already on this device.
   ///
   /// **Not a second photograph**, which is the whole reason the compressed file outlives a failure:
@@ -170,14 +212,21 @@ class _CaptureDocumentScreenState extends ConsumerState<CaptureDocumentScreen> {
               key: Key('capture-document-uploading'),
               words: 'Sending it to Shipper…',
             ),
-          _ when blocked => _CameraRefused(failure: state.message, onRetry: _retry),
+          _ when blocked => _CameraRefused(
+              failure: state.message,
+              pickerFailed: _pickerFailed,
+              onRetry: _retry,
+              onChooseFile: _chooseFile,
+            ),
           _ => _CameraOrOpening(
               kind: widget.kind,
               opening: _opening,
               camera: _camera,
               failure: state.message,
+              pickerFailed: _pickerFailed,
               onShutter: _shutter,
               onRetry: _retry,
+              onChooseFile: _chooseFile,
             ),
         },
       ),
@@ -192,16 +241,20 @@ class _CameraOrOpening extends StatelessWidget {
     required this.opening,
     required this.camera,
     required this.failure,
+    required this.pickerFailed,
     required this.onShutter,
     required this.onRetry,
+    required this.onChooseFile,
   });
 
   final VerificationDocumentKind kind;
   final bool opening;
   final CaptureCamera? camera;
   final String? failure;
+  final bool pickerFailed;
   final Future<void> Function() onShutter;
   final Future<void> Function() onRetry;
+  final Future<void> Function() onChooseFile;
 
   @override
   Widget build(BuildContext context) {
@@ -253,24 +306,64 @@ class _CameraOrOpening extends StatelessWidget {
             ),
           ),
         ),
+        // Quiet, and under the shutter rather than beside it: photographing is the ordinary path
+        // and stays the obvious one. It is here as well as on the refused panel because the
+        // document is often already on the phone — see `_chooseFile`.
+        Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: TextButton(
+            key: const Key('capture-document-choose-file'),
+            onPressed: () => unawaited(onChooseFile()),
+            child: const Text('Attach a file instead'),
+          ),
+        ),
+        if (pickerFailed)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+            child: Text(
+              _pickerUnavailable,
+              key: const Key('capture-document-picker-failed'),
+              style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.error),
+            ),
+          ),
       ],
     );
   }
 }
 
-/// The camera will not open.
+/// What a provider reads when the platform would not open a picker.
 ///
-/// **This is a dead end until SHIP-81d, and it is recorded as one rather than dressed up.**
-/// `Docs/04` §3.1 requires a file-upload fallback *"so that a refused permission never blocks
-/// verification outright"*, and `Docs/07` §7 calls a camera flow that dead-ends on a denied
-/// permission a defect. SHIP-81c stops here honestly — settings, or the image already on the phone
-/// if one attempt has been made — and SHIP-81d is the ticket that puts a second button under this
-/// sentence.
+/// Written once and shown from both panels. It is **not** in `PermissionCopy`, which is for the
+/// words shown around a *permission* — there is none to refuse here, and putting this beside the
+/// camera and notification strings would suggest there is.
+const _pickerUnavailable =
+    'Shipper could not open your files. Try again, or photograph the document instead.';
+
+/// The camera will not open, and the way on (SHIP-81d).
+///
+/// **Not an error screen, and it must never be drawn as one.** `Docs/04` §3.1 requires a file-upload
+/// fallback *"so that a refused permission never blocks verification outright"*, and `Docs/07` §7
+/// calls a camera flow that dead-ends on a denied permission a defect. What makes the difference
+/// between a defect and a route through is not the copy; it is that the button underneath it
+/// submits something.
+///
+/// The button is a `FilledButton` rather than the quiet `TextButton` the working screen carries,
+/// because here it is the *only* thing to do. Settings is the second sentence of
+/// `PermissionCopy.verificationCameraDeclined` and has no button at all — it leaves the application,
+/// and a provider who has just declined a permission is being offered the way on before the way
+/// back.
 class _CameraRefused extends StatelessWidget {
-  const _CameraRefused({required this.failure, required this.onRetry});
+  const _CameraRefused({
+    required this.failure,
+    required this.pickerFailed,
+    required this.onRetry,
+    required this.onChooseFile,
+  });
 
   final String? failure;
+  final bool pickerFailed;
   final Future<void> Function() onRetry;
+  final Future<void> Function() onChooseFile;
 
   @override
   Widget build(BuildContext context) {
@@ -287,6 +380,24 @@ class _CameraRefused extends StatelessWidget {
           key: const Key('capture-document-declined'),
           style: theme.textTheme.bodyLarge,
         ),
+        const SizedBox(height: 20),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton(
+            key: const Key('capture-document-choose-file-blocked'),
+            onPressed: () => unawaited(onChooseFile()),
+            style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 20)),
+            child: const Text('Attach a file instead'),
+          ),
+        ),
+        if (pickerFailed) ...<Widget>[
+          const SizedBox(height: 12),
+          Text(
+            _pickerUnavailable,
+            key: const Key('capture-document-picker-failed-blocked'),
+            style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.error),
+          ),
+        ],
         if (failure != null) ...<Widget>[
           const SizedBox(height: 16),
           Text(

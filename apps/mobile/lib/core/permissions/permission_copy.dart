@@ -71,13 +71,15 @@ abstract final class PermissionCopy {
   /// and a provider who cannot be verified cannot bid — so a dead end here is not an inconvenience,
   /// it is somebody locked out of the marketplace by a permission prompt.
   ///
-  /// **SHIP-81c leaves this honestly short of that requirement.** The fallback is SHIP-81d, and
-  /// until it exists this sentence offers settings and nothing else — because copy that promised a
-  /// button which was not there would be worse than copy that admits where the provider stands.
-  /// The screen's own note records the same gap in the same words.
+  /// **SHIP-81c left this honestly short of that requirement and SHIP-81d fills it.** Until the
+  /// fallback existed the sentence offered settings alone, because copy promising a button that was
+  /// not there is worse than copy that admits where the provider stands. It now offers the file
+  /// first and settings second — the order matters, because a provider standing in front of a
+  /// refused permission wants the way *on* rather than the way *back*, and the document they need
+  /// is very often already a photo or a scan on the phone in their hand.
   static const verificationCameraDeclined =
-      'Shipper cannot open the camera, so this document cannot be photographed on this device. '
-      'Turn the camera on in your device settings and try again.';
+      'Shipper cannot open the camera. You can attach a photo or a scan of the document from '
+      'this device instead, or turn the camera on in your device settings and try again.';
 
   /// The heading above [notificationsPurpose].
   static const notificationsTitle = 'Know as soon as something happens';

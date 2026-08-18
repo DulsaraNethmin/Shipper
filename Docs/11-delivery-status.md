@@ -15910,6 +15910,56 @@ It is closed. `CapturedImageStore.isInside` normalises both paths with `Uri.norm
 |---|---|
 | SHIP-81c | `core/capture/` — `CaptureCamera`, `CapturedImage{,Policy,Store}` and `CaptureFolder`, moved out of `features/delivery/` and renamed; `features/profile/` grows five files — the four kinds, the three-request repository, the capture controller, the list screen and the camera screen; two routes and their `_signedIn*` entries; the camera purpose string widened in both places, superseding SHIP-179's; `CapturedImageStore.isInside` replaces an inert path check; the gallery guard moved to the test root and its hard-coded source path replaced by a sweep for `CameraController(`; 22 Dart tests |
 
+### SHIP-81d — the fallback, and the two packages whose names mean the same thing (wave 16)
+
+`Docs/04` §3.1: *"The camera permission may be declined. A file-upload fallback must exist so that a refused permission never blocks verification outright."* SHIP-81c left this honestly unbuilt and said so in `PermissionCopy.verificationCameraDeclined`, which offered settings and nothing else. This is the button.
+
+**The stakes are not a convenience.** A provider who cannot photograph their licence cannot be verified, and a provider who cannot be verified cannot bid — so a dead end here is somebody locked out of the marketplace by a permission prompt. `Docs/07` §7 calls a camera flow that dead-ends on a denied permission a defect in as many words.
+
+#### `file_selector`, and why the obvious package is the wrong one
+
+`test/nothing_captured_reaches_the_gallery_test.dart` bans `image_picker` by name — *"delegates capture to the platform camera app, which may keep its own copy"* — along with every gallery package, and it checks `pubspec.yaml` and the import lines **separately**, because a dependency added without a pubspec entry once slipped past it. Anything added in that space owes the same written argument `camera` already carries, and `pubspec.yaml` now carries this one beside the dependency.
+
+`file_picker` is the package everybody reaches for and it is the wrong one: its `FileType.image`, `FileType.video` and `FileType.media` modes present the **photo picker** on iOS rather than the document picker. A build could therefore reach the photo library through a package named for files, and the person who reached for it would have had no reason to look. **It is now on that test's forbidden list by name, with that reason.**
+
+`file_selector` is `flutter/packages`, published by flutter.dev, and it is a document picker in both platforms' own sense:
+
+- **iOS** presents `UIDocumentPickerViewController` in open mode and needs **no usage string at all** — which is the concrete thing the guard asserts: `NSPhotoLibraryUsageDescription` stays absent, and a photo picker would have required it.
+- **Android** issues `ACTION_OPEN_DOCUMENT` through the Storage Access Framework, which grants a URI for the one file the user chose and requires **none** of the media permissions the guard bans. `READ_MEDIA_IMAGES` stays absent.
+
+**No manifest permission and no `Info.plist` key are added**, which is unusual for a native integration and is the whole argument for this one. Nothing new is collected, so neither store declaration moves, and the Android floor of API 24 does not move either.
+
+**What this does not claim, stated because the *Done when* says "a picker that reaches no photo library".** The platform's document UI browses whatever a document provider exposes, and on Android that includes the media provider — so a provider *may* hand over a photo they already have. That is the point of a file-upload fallback rather than a hole in one: the document is very often already a scan or a photo on the phone, and what `Docs/04` §3.1 forbids is this application **writing** an identity document into a camera roll. The application holds no permission to read the library, never enumerates it, and never writes to it. The clause is met in every sense that is enforceable; it is not met in the sense of "the person cannot navigate to their own photos", and nothing short of removing the fallback could meet that.
+
+#### It is offered whether or not the camera opened
+
+A refused permission is the case the document names and the case where this is the only route on — there it is a `FilledButton` and the sole action. On a working camera it is a quiet `TextButton` under the shutter, the same shape `proof_capture_screen.dart` gives its exception route, because photographing stays the obvious path. The reason it is there at all is that the document is often already on the phone: an insurance certificate emailed as a scan, an ABN extract downloaded from the tax office. Making somebody photograph a screen is worse evidence for the administrator who has to judge it legible by eye (`Docs/04` §3).
+
+**The file goes through the same compressor a photograph does**, which is what makes the fallback safe rather than a second path with different guarantees: `compressCaptureSync` re-encodes to JPEG and drops the EXIF block, so a photo the provider took on that phone does not arrive carrying a coordinate. A file that is not an image is refused on the device rather than in a bucket. Cancelling the picker is not an error and says nothing.
+
+#### It is in `features/profile/` rather than `core/`
+
+`Docs/07` §2's rule for `core/` is a second caller, and this has one. It is also the one piece of verification capture `features/delivery/` must **not** acquire: `Docs/01` §4.4 makes proof of delivery a photograph taken at the delivery point, and a file chosen from a phone is not evidence a delivery happened. A refused camera there has its own answer and it is a recorded exception reason (SHIP-131).
+
+#### The mutation, and the near-miss it caught
+
+**Declared `file_picker` in `pubspec.yaml` beside `file_selector`.** It ran twice and the two runs are the finding.
+
+*Run 1 survived*, and the guard was not the reason. An earlier edit that added `file_picker` to `_forbiddenPackages` had **aborted on a later assertion in the same script and never written the file** — so the ban existed in a script and not in the repository, and a commit claiming it would have been false. This is the recorded trap exactly: *"`git diff` silence is not evidence… checksum or print the file after mutating, not only after restoring."* The ban was reapplied and **printed** rather than asserted.
+
+*Run 2 killed it*, in `nothing_captured_reaches_the_gallery_test.dart`'s first test, naming the package and the reason. The layer is the pubspec sweep, and there is a second underneath it for the case where an import lands before a dependency does.
+
+**One thing the first attempt measured on the way past.** `file_picker: ^8.x` **cannot resolve in this project at all** — `package_info_plus ^10.2.1` requires `win32 ^6.0.1` and every `file_picker` from 8.0.6 to 12.0.0-beta.1 requires `win32 ^5.x`. Only `^12.0.0` resolves. That is not a guard and must not be mistaken for one: it is a transitive accident on a platform this application does not ship to, and it would evaporate the moment `package_info_plus` moves. The named ban is what holds.
+
+#### What this does not build
+
+- **A picker on the delivery side.** See above; it would be the wrong answer to a different question.
+- **A retry of the picker itself.** A platform that would not open one says so and leaves both routes on the screen; there is no permission to re-request, so there is nothing to retry that a second tap does not already do.
+
+| Surface | What |
+|---|---|
+| SHIP-81d | `file_selector ^1.1.0` with its argument in `pubspec.yaml`, and `file_picker` added to the gallery guard's forbidden list by name; `features/profile/document_file_source.dart` — the `DocumentFileSource` port, the `UIDocumentPickerViewController`/`ACTION_OPEN_DOCUMENT` implementation restricted to the platform's accepted image types, and `DocumentFileUnavailable`; the fallback offered from both the refused panel and the working camera; `PermissionCopy.verificationCameraDeclined` rewritten to name it; 9 Dart tests, four of which walk all four kinds through a refused camera |
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |

@@ -116,11 +116,11 @@ void main() {
       expect(PermissionCopy.cameraDeclined, contains('finish the delivery'));
       expect(PermissionCopy.notificationsDeclined, contains('still shows'));
 
-      // SHIP-81c's second camera surface. **This one is deliberately weaker than the others until
-      // SHIP-81d lands**: Docs/04 §3.1 requires a file-upload fallback "so that a refused permission
-      // never blocks verification outright", and SHIP-81c does not build it — so all this copy can
-      // honestly offer is the way back through settings. When SHIP-81d lands, this assertion is what
-      // should change with it.
+      // SHIP-81c's second camera surface, filled in by SHIP-81d. Docs/04 §3.1 requires a
+      // file-upload fallback "so that a refused permission never blocks verification outright", and
+      // this copy is where a provider learns there is one — a fallback nobody is told about is a
+      // fallback that does not exist for the person standing in front of the refusal.
+      expect(PermissionCopy.verificationCameraDeclined, contains('attach a photo or a scan'));
       expect(PermissionCopy.verificationCameraDeclined, contains('device settings'));
     });
 
