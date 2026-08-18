@@ -15496,6 +15496,25 @@ is true and worth making: strip the signed URLs out of the body and the key goes
 console that stores the response keeps nothing outliving the credential. The harness makes the same
 check the same way, and both fail loudly if the fixture stops signing at all.
 
+#### `make verify` found a defect the Go suite could not, for the fifth time
+
+The object-key check above passed in `internal/admin` and **failed against MinIO**, and the cause is
+worth carrying because it is not about this endpoint. Both checks stripped the signed URLs out of the
+response and then looked for the key in what was left. **`encoding/json` escapes `&` as `\u0026`**,
+a real pre-signed URL carries six query parameters, so replacing the *decoded* URL in the *raw* body
+matched nothing — the strip did nothing and reported nothing, and the key was then found where it had
+always been.
+
+The Go test passed because **the fake signed a one-parameter URL with no `&` in it**. That is wave
+11's recorded rule — "if your mutation survives, suspect your fixture" — arriving through a check
+rather than a mutation, and it is the shape wave 12 named: a domain test driven by a fake proves the
+domain's response, not the adapter's behaviour.
+
+Both are fixed and neither by narrowing: the fake now signs a URL with an ampersand in it, and **both
+checks re-serialise the parsed page with `download_url` removed** rather than doing text surgery on
+the response, which cannot be fooled by an encoding. Each also fails loudly when the page is empty or
+the URL is missing, so the strip cannot silently do nothing again.
+
 #### What was declined, and why
 
 **The platform does not re-ask the store for each object's entity tag and compare.** `000201` stores

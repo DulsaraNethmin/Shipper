@@ -3295,15 +3295,25 @@ ok "a reviewer opens a provider's file and gets Docs 04 §3's documents, each wi
 # and is made here, is that it appears nowhere the expiry does not reach.
 grep -q '"object_key"' "$WORKDIR/admin-evid-first.json" \
   && { cat "$WORKDIR/admin-evid-first.json"; fail "the viewer carries an object_key field"; }
+#
+# **The stripping is done on the parsed page and not on the raw text**, and the difference is a
+# defect this section caught that the Go suite did not: `encoding/json` escapes `&` to `\u0026`,
+# a pre-signed URL carries six of them, so replacing the *decoded* URL in the *raw* body matches
+# nothing and reports nothing. The domain's fake signed a one-parameter URL with no ampersand and
+# passed. Both are fixed; this is the shape that cannot be fooled by an encoding.
 python3 - "$WORKDIR/admin-evid-first.json" "$evid_licence_key" <<'EVIDKEY' || fail "the object key outlives the credential beside it"
 import json, sys
-raw = open(sys.argv[1]).read()
 key = sys.argv[2]
-if key not in raw:
+page = json.load(open(sys.argv[1]))
+if key not in open(sys.argv[1]).read():
     print("the signed URL does not name the object, so this check would pass vacuously"); sys.exit(1)
-for entry in json.load(open(sys.argv[1]))["data"]:
-    raw = raw.replace(entry["download_url"], "")
-if key in raw:
+if not page["data"]:
+    print("the page carries no documents, so nothing is being stripped"); sys.exit(1)
+for entry in page["data"]:
+    if not entry.get("download_url"):
+        print("a document came back with no URL, so nothing is being stripped"); sys.exit(1)
+    del entry["download_url"]
+if key in json.dumps(page):
     print("the object key survives outside the signed URL"); sys.exit(1)
 EVIDKEY
 ok "and no durable handle comes with it — the key is inside the signature and nowhere else"

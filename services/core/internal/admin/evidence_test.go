@@ -110,8 +110,15 @@ func (f *fakeEvidenceStore) PresignDownload(
 
 	f.signed++
 	f.downloadsSigned = append(f.downloadsSigned, key)
-	return fmt.Sprintf("https://store.example.test/%s?get=%d", key, f.signed),
-		time.Now().Add(ttl), nil
+
+	// **Two query parameters, and the `&` between them is load-bearing.** A one-parameter URL
+	// is not escaped by `encoding/json`; a real pre-signed URL carries six and every `&`
+	// becomes `\u0026` in the response body. A fake that produced the unescaped shape made
+	// TestTheDocumentViewerCarriesNoDurableObjectKey pass while the same check in
+	// `scripts/verify/90-admin.sh` failed against MinIO — the fixture, not the code. See that
+	// test's own note.
+	return fmt.Sprintf("https://store.example.test/%s?X-Amz-Expires=%d&X-Amz-Signature=%d",
+		key, int(ttl.Seconds()), f.signed), time.Now().Add(ttl), nil
 }
 
 // testEvidence adapts `internal/profiles` to the port this domain declares.
@@ -418,8 +425,17 @@ func TestVerificationImagesRenderThroughShortLivedSignedURLs(t *testing.T) {
 // right to: an assertion that would fail on every correct implementation of a pre-signed URL is an
 // assertion about the wrong thing. It is recorded here rather than quietly narrowed.
 //
-// Asserted against the raw body as well as the decoded struct, because a field the response type
-// does not declare is exactly the one a decode would drop.
+// # It is asserted on the parsed body with the URLs removed, and the first version was not
+//
+// Removing the *decoded* URL from the *raw* text does not work and looks as though it does:
+// `encoding/json` escapes `&` to `\u0026`, a pre-signed URL carries six of them, and the
+// substitution therefore matches nothing while reporting nothing. The harness caught it against
+// MinIO and this suite did not, because the fake's URL had one query parameter and no `&`. Both
+// halves are fixed: the fake signs a URL with an ampersand in it, and the check below re-serialises
+// the parsed page with `download_url` removed rather than doing text surgery on the response.
+//
+// The `"object_key"` field check stays on the raw body, because a field the response type does not
+// declare is exactly the one a decode would drop.
 func TestTheDocumentViewerCarriesNoDurableObjectKey(t *testing.T) {
 	f := newEvidenceFixture(t, RoleModerator)
 	provider := f.provider(t, "nokey")
@@ -443,18 +459,33 @@ func TestTheDocumentViewerCarriesNoDurableObjectKey(t *testing.T) {
 			"bucket holding identity documents, and it would outlive the credential beside it")
 	}
 
-	// The body with every signed URL removed. What is left is what a console could keep.
-	page := decodeEvidence(t, body)
-	stripped := body
-	for _, d := range page.Data {
-		if d.DownloadURL == "" {
-			t.Fatalf("the %s came back with no URL, so nothing is being stripped", d.Kind)
-		}
-		stripped = strings.ReplaceAll(stripped, d.DownloadURL, "")
+	// The parsed page with every signed URL removed, re-serialised. What is left is what a
+	// console could keep after the credential has expired.
+	var page map[string]any
+	if err := json.Unmarshal([]byte(body), &page); err != nil {
+		t.Fatalf("decoding the page: %v", err)
 	}
-	if strings.Contains(stripped, document.ObjectKey) {
+	rows, ok := page["data"].([]any)
+	if !ok || len(rows) == 0 {
+		t.Fatalf("the page carries no documents, so nothing is being stripped: %s", body)
+	}
+	for _, row := range rows {
+		entry, ok := row.(map[string]any)
+		if !ok {
+			t.Fatalf("a document is not an object: %v", row)
+		}
+		if url, _ := entry["download_url"].(string); url == "" {
+			t.Fatal("a document came back with no URL, so nothing is being stripped")
+		}
+		delete(entry, "download_url")
+	}
+	stripped, err := json.Marshal(page)
+	if err != nil {
+		t.Fatalf("re-encoding the page: %v", err)
+	}
+	if strings.Contains(string(stripped), document.ObjectKey) {
 		t.Errorf("the object key %q survives outside the signed URL, so it outlives the "+
-			"credential that was supposed to bound it", document.ObjectKey)
+			"credential that was supposed to bound it.\n%s", document.ObjectKey, stripped)
 	}
 }
 
