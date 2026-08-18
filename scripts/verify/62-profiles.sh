@@ -641,18 +641,29 @@ status="$(curl -s -o "$WORKDIR/prof-exp-read.json" -w '%{http_code}' \
   "http://localhost:$VERIFY_PORT/v1/provider/verification/documents")"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/prof-exp-read.json"; fail "reading the documents back answered $status"; }
 
+# **Compared as an instant rather than as a string**, which is Docs/11 §9's recorded trap: this
+# machine runs at UTC+05:30 and CI at UTC, PostgreSQL renders a `timestamptz` in the session's zone,
+# and Go marshals whatever location it was handed. `2027-03-01T05:30:00+05:30` and
+# `2027-03-01T00:00:00Z` are the same moment, and a transcribed string asserts a timezone rather
+# than a date. This check cost one harness run to learn, again.
 python3 - "$WORKDIR/prof-exp-read.json" "$prof_expiring_id" <<'PROFEXP' || fail "the provider's own read does not carry the expiry they stated"
-import json, sys
+import datetime, json, sys
 docs = {d["id"]: d for d in json.load(open(sys.argv[1]))["data"]}
 stated = docs.get(sys.argv[2])
 if stated is None:
     print("the submitted document is not on the provider's own list"); sys.exit(1)
-if stated.get("expires_at") != "2027-03-01T00:00:00Z":
-    print("expires_at reads", stated.get("expires_at")); sys.exit(1)
+
+def instant(value):
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+want = datetime.datetime(2027, 3, 1, tzinfo=datetime.timezone.utc)
+if stated.get("expires_at") is None or instant(stated["expires_at"]) != want:
+    print("expires_at reads", stated.get("expires_at"), "which is not", want.isoformat())
+    sys.exit(1)
 # The credential's clock and the document's clock are two different facts, and a client that
 # confused them would show somebody their licence expiring this afternoon.
-if stated["expires_at"] == stated["download_expires_at"]:
-    print("the document's expiry and the URL's expiry are the same value"); sys.exit(1)
+if instant(stated["expires_at"]) == instant(stated["download_expires_at"]):
+    print("the document's expiry and the URL's expiry are the same instant"); sys.exit(1)
 if not any(d.get("expires_at") is None for d in docs.values()):
     print("every document states an expiry, so 'null means never told' is not being exercised")
     sys.exit(1)

@@ -3645,9 +3645,16 @@ if current in by_id:
     print("the current licence is on the queue and does not lapse for ten years"); sys.exit(1)
 
 # Soonest first: the entry that has been out of date longest is at the top.
-dates = [r["expires_at"] for r in rows]
+#
+# Parsed rather than compared as strings. PostgreSQL renders a `timestamptz` in the session's
+# zone, so a page whose rows carried two different offsets would sort correctly by instant and
+# incorrectly by text — and this machine is not UTC.
+import datetime
+def instant(value):
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+dates = [instant(r["expires_at"]) for r in rows]
 if dates != sorted(dates):
-    print("the queue is not soonest first:", dates[:5]); sys.exit(1)
+    print("the queue is not soonest first:", [d.isoformat() for d in dates[:5]]); sys.exit(1)
 
 # The horizons the query used, so an empty "expiring" half can be told from an unconfigured one.
 if page.get("lead_times") is None:
