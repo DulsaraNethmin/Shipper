@@ -56,13 +56,42 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 199 | 615 |
-| Remaining | 38 | 123 |
-| **Total** | 237 | 738 |
+| **Done** | 203 | 631 |
+| Remaining | 35 | 110 |
+| **Total** | 238 | 741 |
 
-**Measured on `develop` at `45154a8`** — the wave-16 count-line commit, which is `develop`'s tip as
-this is written and therefore a ref that stays true. `make status` prints 199 / 237 and 615 / 738 on
-it, with both guards green.
+**Measured on `develop` at `abb3d04`** — wave 17's last merge, which is `develop`'s tip as this is
+written and is also where `origin/develop` points, so it is a ref that stays true. `make status`
+prints 203 / 238 and 631 / 741 on it, with both guards green. **A parser written for this pass
+reproduced every one of those figures before a row below it was written** — 238 rows and 741 points
+read off `Docs/09`, 203 declared and 631 points read off `Docs/11-done.txt`, 35 open against 110
+remaining, and the nine milestone rows cell for cell. That check is the only thing that separates a
+measured figure from a copied one, and this file has been wrong five times for skipping it.
+
+**Wave 17 delivered four tickets and 16 points, and created one row.** SHIP-17b (M0, 5) on
+`ship-17b-contract-authenticated-surface`; SHIP-183 (M7, 5) on `ship-183-api-rate-limit-review`;
+SHIP-183a (M7, 3) on `ship-183a-apply-subject-keyed-limits`; and SHIP-183b (M7, 3) on
+`ship-183b-trusted-proxy-address-limits`, which is the row the wave created — split out of SHIP-183a
+when applying the limits proved to be two jobs rather than one. **M0 went 34 → 35 of 39 and M7 went
+10 of 23 → 13 of 24.** `make verify` went **1032 → 1048 checks, and 18 → 20 sections.** The set is
+the difference between `Docs/11-done.txt` at `45154a8` and at `abb3d04`, with the points read off
+`Docs/09`'s rows rather than off the dispatch list.
+
+**Wave 17 was not a wave, and the topology says so rather than the plan.** Every branch's merge base
+is the previous branch's merge commit: `git merge-base <merge>^1 <merge>^2` returns `45154a8`,
+`52e314b`, `8092cef`, `30a6094`, `fffb885` and `386ef9b` for the six branches in merge order, each
+one the tip `develop` had reached when that branch was cut. **This was a sequence of single-lane
+sessions rather than concurrent lanes**, which is why nothing in it conflicted anywhere and why the
+`merge=union` reordering of `routes_golden.txt` that follows every real wave has nothing to report
+here. **Read the delivery figures with that in mind**: sixteen points on a strictly serial chain is
+not comparable with sixteen across four lanes, and a later pass should not read the two as one trend.
+
+**The board has run out of code work this repository can start, and that is this pass's finding.**
+The two rows §6 last called startable and sensible — SHIP-17b and SHIP-183 — are both closed by this
+wave, and **all five rows whose dependency columns are now satisfied are struck on something outside
+the repository.** Track X has stopped being the binding constraint on the schedule and become the
+binding constraint on there being a next ticket at all. §6 has the measurement, including what each
+Track-X row releases when it lands.
 
 **The total grew by five rows and 21 points while four tickets were finished, and that is the wave
 rather than an accounting artefact.** Wave 16 measured three rows the board called startable, found
@@ -268,7 +297,41 @@ That distinction is worth keeping in mind rather than rounding away: six domains
 | Branch | At | Holds |
 |---|---|---|
 | `main` | PR #19 | **Wave 1, released 11 August 2026.** Now well behind `develop` |
-| `develop` | wave 16 merged, at `45154a8` | Everything below. **Cut new branches from here** |
+| `develop` | wave 17 merged, at `abb3d04` | Everything below. **Cut new branches from here** |
+
+**`develop` is 491 commits ahead of `main` at `abb3d04`, and holds seventeen waves.** The other two
+readings, re-measured on that ref rather than adjusted: `--first-parent` **110**, `--no-merges`
+**379**. **Wave 17's delta is 15 / 6 / 9 and the three tie out exactly** — 9 commits across six
+branches (`ship-15ak` 1, `ship-15al` 2, `ship-17b` 1, `ship-183` 1, `ship-183a` 2, `ship-183b` 2),
+plus 6 merge commits, plus **no direct commit on `develop` at all**: 9 non-merge, 6 first-parent,
+9 + 6 = 15 total. **The identity §2 tracks holds for the third consecutive wave**, and this is the
+first wave to satisfy it with a zero.
+
+**`origin/develop` points at `abb3d04`, so wave 17 is pushed and the owner's gate has been taken.**
+That is the first time this section has been able to say so: every previous pass recorded a `develop`
+some number of commits ahead of its remote, waiting. Nothing here is outstanding.
+
+**The count-line commit moved onto the ticket branch this wave, which is why the identity balances at
+zero.** §3's check count was rewritten by `34e7810`, the SHIP-183b commit, on `ship-183b`'s own
+branch rather than by a direct commit on `develop` after the merge. `git rev-list --first-parent
+--no-merges 45154a8..develop` returns nothing at all. **The identity is unchanged and its second term
+simply went to zero** — first-parent delta equals branch count plus however many count-line commits
+were made on `develop`, and six equals six plus none. **A later pass counting branches and reading a
+first-parent delta that matches exactly should not conclude the practice is fixed**: it balances this
+way only while the count line rides in on a branch, and `CLAUDE.md` permits either.
+
+**The release check was re-run on `abb3d04` and passes**: `git merge-tree --write-tree main develop`
+and `git rev-parse develop^{tree}` are **both `7c8f10c3ffd7d6151bc667614895cf13789ee356`**, so a
+`develop` → `main` merge produces exactly `develop`'s tree. **Every commit on either branch changes
+this, so re-run the pair immediately before cutting the release.** The historical notes below are
+kept for their reasoning.
+
+**Commit granularity still has no trend and seven waves now say so**: 32, 31, 39, 29, 17, 18, 15.
+**Wave 17's 15 is the smallest the table has recorded** and it is the serial shape rather than a
+slowdown — one lane at a time cannot produce the commit volume four lanes do, whatever it delivers.
+
+**What this section said when wave 16 was the tip, kept for its figures.** The deltas below
+were measured on `45154a8` and `81e52f2` and are true of those refs.
 
 **`develop` is 476 commits ahead of `main` at `45154a8`, and holds sixteen waves.** The other two
 readings, re-measured on that ref rather than adjusted: `--first-parent` **104**, `--no-merges`
@@ -312,6 +375,34 @@ That figure is `git rev-list --count main..develop`, and it is worth naming the 
 The wave-7 pass recorded the ordinary way this goes wrong and it is worth keeping: **that wave's dispatch brief circulated 206 / 45 / 152**, every one exactly one low, because they were measured at `0abdc50` before `develop`'s last commit landed. A count of `develop` taken before `develop`'s last commit is wrong by construction, and so is a count taken by the commit that writes it.
 
 **Run the revert check before cutting it.** `main`'s history contains a revert, which is the shape where a merge silently resurrects deletions, and the two commands for establishing that it is safe are below. This is not hypothetical here: PR #19 had exactly that shape.
+
+### The wave-17 branches, in merge order
+
+All six were merged locally with `--no-ff`, none through a pull request. **Two of the six carry no
+backlog ticket** — `ship-15ak` is wave 16's own reconciliation, merged after that wave's count line,
+and `ship-15al` is a repair — so the wave's four tickets sit on four branches, one each.
+
+| Merge commit | Branch | Tip | Commits | Brought |
+|---|---|---|---|---|
+| `52e314b` | `ship-15ak-wave-16-reconciliation` | `5e0453f` | 1 | Wave 16's reconciliation — no ticket of its own |
+| `8092cef` | `ship-15al-flutter-codegen-staleness` | `7c3f4e4` | 2 | The Flutter codegen staleness repair — no ticket of its own |
+| `30a6094` | `ship-17b-contract-authenticated-surface` | `973c53b` | 1 | SHIP-17b |
+| `fffb885` | `ship-183-api-rate-limit-review` | `7cff794` | 1 | SHIP-183 |
+| `386ef9b` | `ship-183a-apply-subject-keyed-limits` | `1dccc0f` | 2 | SHIP-183a |
+| `abb3d04` | `ship-183b-trusted-proxy-address-limits` | `34e7810` | 2 | SHIP-183b, and §3's check-count line |
+
+**Every tip was resolved with `git rev-parse <merge>^2` on this tree**, so a row whose tip and second
+parent disagree would be a row naming the wrong branch. All six agree and all six are ancestors of
+`abb3d04`. The *Brought* column is the per-tip difference against `Docs/11-done.txt` at `45154a8`
+rather than the dispatch list, and every branch name tells the truth about what its branch carried.
+
+**Every branch was cut from the previous branch's merge commit, and that is the wave's whole
+character.** `git merge-base <merge>^1 <merge>^2` gives `45154a8`, `52e314b`, `8092cef`, `30a6094`,
+`fffb885` and `386ef9b` down the table — each the tip `develop` had reached at the time. **No two of
+these branches were ever live at once.** So the conflict matrix §7 usually carries is empty by
+construction rather than by luck, nothing reordered `routes_golden.txt`, and none of the
+worktree-isolation rules in `CLAUDE.md` was exercised. **A pass comparing wave 17 with waves 11 to 16
+is comparing a queue with a fan-out**, and the figures do not transfer in either direction.
 
 ### The wave-13 branches, in merge order
 
@@ -16667,6 +16758,68 @@ sentence below is why this was not simply written into the table when it was fir
 still governs the next proposal: §9 has the entry, the two measured blockers and the proposed backlog rows in full.
 
 ## 6. Ready to start now
+
+**Recomputed on `develop` at `abb3d04`, after wave 17 merged**, by parsing `Docs/09`'s dependency
+column against `Docs/11-done.txt` with a parser that reproduced `make status` cell for cell before a
+row below was written. Strict build order says the next ticket is the lowest-numbered open one, which
+is still **SHIP-24**, still blocked on X-2. **Ten tickets have every dependency met: five code
+tickets worth 19 points, plus five Track-X tickets worth 12.**
+
+**The set went 12 → 15 → 12 → 10, and for the first time the code half of it is empty.** Wave 17
+closed both rows the last pass called startable and sensible — SHIP-17b and SHIP-183 — and closed
+SHIP-183a and SHIP-183b behind them. **What is left has every dependency met and not one of the five
+is buildable in this repository.**
+
+| Ticket | Pts | Area | Held? |
+|---|---|---|---|
+| ~~SHIP-156~~ | 3 | **Strike carried, ninth consecutive pass — and re-measured this time rather than carried.** The conversation exists; the report mechanism does not. There is no `reports` table in any migration, no report route on `routes_golden.txt`, and no `Docs/09` row that builds one. A queue over reports cannot be built until something can create a report | — |
+| ~~SHIP-172~~ | 5 | **Struck by X-4**, which no parser can see. Every declared dependency is met and SHIP-171a supplied the delete in wave 16; what is missing is a legal answer about retention, and deleting verification evidence is the exact act a retention obligation constrains. §5 has the reasoning | — |
+| ~~SHIP-174~~ | 3 | Struck — needs a Datadog account, and **no Track-X row procures one.** §5's own test names this as the gap it would catch | — |
+| ~~SHIP-178~~ | 3 | Struck — needs store-console access, which is X-2 and X-3 | — |
+| ~~SHIP-182~~ | 5 | Struck — needs a deployed environment | — |
+
+Plus **X-1, X-3, X-4, X-5 and X-10**, none of which is code and none of which has started. **X-5 and
+X-10 need no third party at all.**
+
+**The startable-and-sensible set is empty, and that is a first for this file.** Every previous pass
+could name at least one row somebody could pick up; this one cannot. **The board is not short of
+work — 35 tickets and 110 points remain — it is short of any work that does not begin outside this
+repository.** That is a scheduling fact rather than an engineering one, and it is the whole content
+of this pass.
+
+### What each Track-X row releases, measured transitively
+
+**New this pass, because "Track X is the binding constraint" has been true for seven passes without
+anyone saying which part of it binds hardest.** Computed by walking `Docs/09`'s dependency graph
+forward from each startable row over the 35 open tickets — the transitive closure, not the direct
+dependants.
+
+| Row | Pts | Unblocks | Worth |
+|---|---|---|---|
+| **X-4** Legal brief | 3 | 13 rows — X-7, X-8, X-9, SHIP-58, 59, 63, 72, 73, 74, 75, 180, 181, 185 | **42 points** |
+| **X-1** D-U-N-S number | 2 | 5 rows — X-2, SHIP-24, 25, 180, 185 | 16 points |
+| **X-3** Google Play Console | 2 | 4 rows — SHIP-26, 27, 181, 185 | 11 points |
+| **X-10** Firebase project | 3 | 3 rows — SHIP-144, 145, 146 | 10 points |
+| SHIP-174 Datadog | 3 | 4 rows — SHIP-175, 176, 177, 184 | 10 points |
+| **X-5** Pilot metro area | 2 | nothing | 0 |
+| SHIP-156, SHIP-172, SHIP-178, SHIP-182 | 16 | nothing | 0 |
+
+**X-4 is the single highest-leverage item in the plan and it is a three-point conversation with a
+lawyer.** It gates 42 of the 110 open points — more than the next two combined — and it is the only
+row here whose downstream set contains an entire chain rather than a fan. **X-1 → X-2 remains the
+longest pole in elapsed time**, per §5, and the two facts do not compete: X-1 should be started
+because it is slow, X-4 because it is worth the most. Neither is code and neither has begun.
+
+**SHIP-174 is the one strike a person inside this repository could lift alone**, and it is worth
+naming beside the X rows because it behaves like one: three points of account signup releases 10
+points across four rows, and §5's test says the honest fix is a Track-X row that procures Datadog
+rather than a strike carried in this table. **That row still does not exist.**
+
+**SHIP-172 is the row to watch**, unchanged from the last pass. It is blocked on X-4 alone — a legal
+answer, not an engineering one — and everything it needs from this repository has existed since
+wave 16.
+
+### What this section said before wave 17 merged, kept for its reasoning
 
 **Recomputed on `develop` at `45154a8`, after wave 16 merged**, by parsing `Docs/09`'s dependency
 column against `Docs/11-done.txt`. Strict build order says the next ticket is the lowest-numbered open
