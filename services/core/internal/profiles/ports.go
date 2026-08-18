@@ -27,10 +27,27 @@ import (
 //
 // Docs/06 §5.2 and Docs/04 §3.1 both put the bytes outside this service entirely: the provider
 // photographs their licence, the client is handed a short-lived pre-signed URL, and the image
-// travels from the handset to the store with the API in neither direction. So this port has no Put,
-// no Get and no Delete — there is no method here that moves a byte, because no byte ever reaches the
+// travels from the handset to the store with the API in neither direction. So this port has no Put
+// and no Get — there is no method here that moves a byte, because no byte ever reaches the
 // platform. What the implementation is asked for is permission, in the form of a URL, and permission
 // is all it can give.
+//
+// # There is no Delete either, and SHIP-171a corrected the reason rather than the fact
+//
+// This paragraph read "no Put, no Get and no Delete" and gave one reason for all three. The reason
+// is right for two of them and was never right for the third: **a delete moves no byte**, so
+// "nothing here moves a byte" never explained its absence, and SHIP-171a proved the point by
+// adding `Delete` to `internal/platform/storage` on exactly that argument.
+//
+// The fact is unchanged and the honest reason is a shorter one: **this domain has no act that
+// removes a verification document.** Docs/04 §3 keeps the evidence trail — a decision is made
+// against the documents that were reviewed, and a package that could delete one while rendering it
+// is a capability nothing here needs. Removing them is SHIP-172's cascade, on Docs/05 §3.1's other
+// half, and it is blocked on X-4's retention answer; when that arrives, whichever domain performs
+// the act declares the port for it, and this file is where profiles' half would go. **An
+// implementation existing is not a reason for a consumer to declare a method** — that is this
+// package's own rule about who declares an interface, read in the direction it is usually read
+// from.
 //
 // # What the four arguments are, and why the domain supplies every one of them
 //

@@ -871,6 +871,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-170** | M7 | The deferral. A deletion request made while the account is party to a job between `Awarded` and `Delivered` is recorded as `deferred` with the platform's own explanation beside it, and **both parties count** — `Docs/05` §3.1 says a *party* mid-delivery, and the endpoint is `RequireUser` with no role predicate, so a lookup reading `jobs.customer_id` alone would pass every customer-side assertion and erase a driver mid-delivery. It is `internal/identity`'s **first port over another domain** rather than over an adapter, following `admin.JobParties`: one method answering yes or no, with the statement that spans `jobs` and `bids` in `cmd/api`. **No job identifier is stored** — the deferral is re-read on every call, in both directions, so it cannot go stale and the row stays what `000105` built it to be. `000106` widens the CHECK *and* the open-request index, which is the half a reader would miss: a deferred request is an open request, and an index still partial on `'requested'` would let one account hold two promises. It answers `deletion.go:200`'s question — the two statements became three and one transaction, because the re-read is now followed by a write. The mutation dropping the provider half is reported below with the layer that killed it — *see below* |
 | **SHIP-173** | M7 | The account deletion screen — the client half of the two, and the only place in the app that reaches `POST /v1/account/deletion`. **It renders `deferred` because SHIP-170 exists**, which is why the two were one lane: `contracts/paths/identity.yaml` had already told clients to branch on `state` rather than assume it, and a screen shipped before the state would have told somebody mid-delivery their account goes on the fifteenth. Consequences are `Docs/05` §3.1's split rather than a warning — what is deleted for good, and **what stays under a pseudonym**, which is the half nobody expects. The confirmation is tested in **both** directions: opening the dialog sends nothing and dismissing it sends nothing, which is `award_test.dart`'s argument that a confirmation tested only in the accepting direction is one nobody has checked. It draws **no job** on a screen both roles reach, and a repeat is not read as a new request — asking again is how a deferral lifts, so the button stays and the second call is what the test asserts. Entry point is a third app-bar action on the signed-in shell, because there is no settings screen and inventing one for a single action would be building what a later ticket has to reconcile with — *see below* |
 | **SHIP-171** | M7 | The clock runs out and the person stops being a person. `Docs/05` §3.1's *delete the person, retain the transaction*, executed from **cmd/worker's sixth registered task** because nobody presses a button to be erased on the thirtieth day. **`'completed'` joins the CHECK and must not join the open-request index** — `000105` said why before either state existed and `000106` named this ticket doing it — and the mutation adding it to `openDeletionStatesSQL` is killed **behaviourally** as well as by the pairing guard: PostgreSQL stops being able to infer the partial index from the `ON CONFLICT` predicate, and sixteen tests fail on the running query. The pseudonym is a **pure function of `users.id`**, which `Docs/05` §3.1 already calls the pseudonym, and it is deliberately **not a valid address or number**, so the account is unreachable at sign-in by construction rather than by a check. Five tables across four domains, one transaction; the two outside `internal/identity` are reached through a port it declares. **`notifications.address` is the finding** — a stored copy of the contact channel keyed to the account, which no list of tables would have caught and a **whole-schema sweep** did. `users.password_hash` is declared out of scope with its reason — *see below* |
+| **SHIP-171a** | M7 | `internal/platform/storage` can remove an object, and the three places saying it could not now say what changed. **It is the second application of SHIP-115's narrowing rather than an exception to it**: the rule that was always doing the work is *no transfer through this service*, and a DELETE carries no body in either direction exactly as a HEAD does not. **The one API decision was argued from a measurement rather than from the specification** — the running store answers **204 to a DELETE of a key that has never existed**, so idempotence is the store's behaviour and not a translation this package performs, and the only thing that answers **404 is a missing bucket**. That inverts `S3.Stored`'s treatment of 404 and the inversion is the point: folding it in would make a service pointed at the wrong bucket report every deletion as done. `internal/profiles`' statement turned out to be about something else and was **clarified rather than reversed** — a delete moves no byte, so *nothing here moves a byte* never explained its absence. **Nothing belonging to anybody is deleted by this row**: no domain declares a port for it, no composition root calls it, and every object the tests remove was created to be removed — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -15849,6 +15850,105 @@ The section starts its worker with `KAFKA_BROKERS=localhost:1`, `61-bidding.sh`'
 - **SHIP-172**, which depends on it: verification documents, message bodies, device tokens and attributable images are removed rather than replaced, and that is a different act with different failure modes.
 - **Notifications to a pseudonymised account are not suppressed.** A person who is still party to a retained job can be a recipient of a later `job.status_changed`; the row would be written with the pseudonym as its address and would fail to dispatch, legibly, climbing `attempts`. It has no ticket. `internal/notifications` is nobody's this wave and the fix is that domain's, not a statement in `cmd/worker`.
 - **The retention period for the pseudonymised transaction records is still X-4's.** `Docs/05` §3.1 calls it *"the one genuinely open element"* and it does not block this ticket: the **split** — what is deleted and what is retained under a pseudonym — is settled in that document as a design decision, and how long the retained side persists is the open question. Nothing here shortens or lengthens anything.
+
+### SHIP-171a — the platform can delete an object, and reversing a stated position in writing
+
+`Docs/09` calls SHIP-172 startable and it was not. **Nothing in production code could remove an
+object from the store**: `internal/platform/storage` stated in three places that it has no delete,
+and a cascade that removes verification documents and attributable images cannot be built by a
+platform whose storage adapter has no verb for it. This row builds that verb and stops.
+
+#### The criterion, clause by clause
+
+> **Done when:** `internal/platform/storage` issues a delete for a key the platform named,
+> demonstrated against the real object store rather than a fake, and the three places stating that
+> this package has no delete say what changed and why; nothing belonging to a person is deleted by
+> this row — it builds the call SHIP-172 makes.
+
+| Clause | Where it is met | How it is demonstrated |
+|---|---|---|
+| **Issues a delete for a key the platform named** | `S3.Delete`, signing DELETE through the same unexported `presign` every other method uses, after the same `validateObjectKey` | `TestDeleteRemovesAnObjectThePlatformStored`, and `scripts/verify/01-storage.sh` against the running store |
+| **Against the real object store rather than a fake** | Every test in the row is an integration test against the MinIO `make up` starts, in this worktree's own bucket | The four Go tests, plus the harness spending a pre-signed DELETE of its own and reading the key back |
+| **The three statements say what changed and why** | `s3.go`'s header, `doc.go` §"Files do not pass through this service", and `internal/profiles/ports.go` | Below — and the third is a different statement and was **clarified rather than reversed** |
+| **Nothing belonging to a person is deleted** | No port, no caller, no composition root, no worker wiring | `grep` for `\.Delete(` outside the package returns nothing; every object removed by a test was created by that test |
+
+**All four are met.**
+
+#### The narrowing is SHIP-115's, applied a second time
+
+`s3.go:28` recorded that SHIP-114 stated the rule as *"this package makes no request to the object
+store, ever"*, and that **SHIP-115 had already narrowed it once** — `S3.Stored` exists because with
+the bytes going client-to-store a metadata request is the only moment the platform can learn that an
+upload happened. The narrowed rule that was always doing the work is **no transfer through this
+service**, and a HEAD carries no body in either direction.
+
+A DELETE carries no body in either direction either. So this is that same narrowing a second time
+rather than an exception to the architecture, and the three comments say so rather than being
+quietly deleted. Nothing about the upload path changes: files still do not pass through this service.
+
+#### The one API decision, and it was settled by a measurement
+
+**A delete of a key that holds nothing is a success.** The argument is in `S3.Delete`'s doc comment
+and it rests on what the store actually does rather than on what the specification says:
+
+```
+DELETE of an existing key      -> 204
+DELETE of a key deleted a moment ago -> 204
+DELETE of a key never uploaded -> 204
+DELETE against a bucket that does not exist -> 404 NoSuchBucket
+```
+
+Measured against the running MinIO before a line of Go was written. Three consequences follow, and
+the third is the one that would have been got wrong by reasoning alone:
+
+- **This package could not report "there was nothing there" cheaply or correctly** even if it wanted
+  to. The store does not distinguish them, so distinguishing them means a HEAD first — a second round
+  trip, and a race in which an object removed between the two reports a failure that did not happen.
+- **The caller does not want it.** SHIP-172 cascades a deletion and must be re-runnable after a
+  partial failure; its second pass meets keys the first already removed. A caller forced to handle
+  that would be handling a case that is not a failure. **So the doc comment says plainly that silence
+  here is not evidence anything was ever there**, which is the honest cost of the decision.
+- **404 is a fault here, and that is the opposite of `S3.Stored`.** Because a missing *key* answers
+  204, the only thing that answers 404 is a missing *bucket*. Folding it into success — the obvious
+  move for anybody pattern-matching to `Stored`, which folds 404 into "not found" — would make a
+  service pointed at the wrong bucket report every deletion as done while nothing was deleted. That
+  is the same shape as `Stored`'s refusal to read 403 as "the driver never uploaded", pointing at
+  destroyed evidence rather than at a misplaced blame. **The rule is: 2xx is success, everything else
+  is an error, and no status is translated.**
+
+`TestDeleteRefusesAWrongCredentialRatherThanReportingSuccess` is the pairing that makes the decision
+safe, and it asserts the object is still there afterwards — which is the half a status code cannot
+say.
+
+#### `internal/profiles` was a different statement, and the honest change was smaller
+
+`ports.go` read *"this port has no Put, no Get and no Delete — there is no method here that moves a
+byte"*. **The reason is right for two of the three and was never right for the third.** A delete
+moves no byte, which is precisely the argument this ticket used to add one; so "nothing here moves a
+byte" never explained the absence of a Delete, and reversing the sentence would have been reversing
+a claim it does not make.
+
+What is written instead is the reason that is true: **`profiles` has no act that removes a
+verification document.** `Docs/04` §3 keeps the evidence trail, and removal is SHIP-172's cascade,
+blocked on X-4. When it arrives, whichever domain performs the act declares the port for it — an
+implementation existing is not a reason for a consumer to declare a method, which is this package's
+own rule about who declares an interface read in the less usual direction.
+
+**There is a fourth statement and it was left alone.** `internal/delivery/ports.go:86` carries the
+same sentence about proof photographs, word for word, and `internal/delivery` is nobody's this wave.
+It is wrong in exactly the way `profiles`' was and it needs the same one-paragraph correction.
+
+#### What this does not build
+
+- **No port in `internal/identity`, `internal/profiles` or anywhere else.** A port with no
+  implementation and no caller is dead code, and the interface belongs to whichever domain
+  eventually performs the act.
+- **No object store in `cmd/worker`.** `storage.NewS3` is constructed at
+  `cmd/api/routes_delivery.go` and `routes_profiles.go` and nowhere else; wiring one into a binary
+  no registered task consumes is dead code the manifest test exists to prevent.
+- **No change to the deletion state machine.** `pseudonymise.go` closes an executed request to
+  `completed`, and an "artefacts pending" state only SHIP-172 could exit would strand rows on
+  `develop` for as long as X-4 is unanswered.
 
 ## 4. Partly done — do not treat these as finished
 

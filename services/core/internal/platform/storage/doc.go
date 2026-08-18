@@ -41,8 +41,8 @@
 // a photograph through the API would occupy a request goroutine and a server timeout for
 // the duration, and would put megabytes of image through a service sized for JSON.
 //
-// The consequence for this package is nearly total: there is no upload, no download, no listing
-// and no delete. s3.go's header has what follows from that, including why the signature is written
+// The consequence for this package is nearly total: there is no upload, no download and no
+// listing. s3.go's header has what follows from that, including why the signature is written
 // against the standard library rather than an SDK.
 //
 // **SHIP-114 wrote that as "makes no request to the object store, ever", and SHIP-115 narrowed
@@ -52,6 +52,17 @@
 // always doing the work is **no transfer through this service**, and a metadata request carries no
 // body in either direction. Docs/11 §3 records the change and why the alternative — recording the
 // client's word for it — was refused.
+//
+// **The same sentence ended "and no delete" until SHIP-171a, which narrowed it a second time on
+// the same argument.** `S3.Delete` removes the object under one key this platform named. A DELETE
+// carries no body in either direction either, so this is one narrowing applied twice rather than
+// an exception granted once. What forced it is the other half of Docs/05 §3.1: SHIP-171 replaces
+// the person and retains the transaction, SHIP-172 *removes* the artefacts, and a platform whose
+// storage adapter has no verb for removal cannot do the second. **SHIP-171a built the capability
+// and used it on nothing** — no domain declared a port for it, no composition root calls it, and
+// nothing belonging to a person was deleted by the row that added it. `S3.Delete` carries the
+// argument for treating a key that holds nothing as a success, which is that row's one API
+// decision.
 //
 // The database keeps the metadata and the access controls (Docs/06 §4). Nothing here is
 // authoritative about which job a file belongs to or who may see it — that is the delivery

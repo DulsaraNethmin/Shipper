@@ -18,14 +18,15 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
 
-// The S3 implementation: pre-signed URLs, and one metadata request (SHIP-114, SHIP-115).
+// The S3 implementation: pre-signed URLs, and two requests of its own (SHIP-114, SHIP-115,
+// SHIP-171a).
 //
 // # No object's bytes pass through this service, and everything below follows from that
 //
 // Worth stating before the first line of signing code, because it is what decides the shape of
 // everything here. doc.go's rule is that files do not pass through this service: the platform
-// hands a client a URL and the client moves the bytes. There is no upload path, no download path,
-// no bucket listing and no delete.
+// hands a client a URL and the client moves the bytes. There is no upload path, no download path
+// and no bucket listing.
 //
 // **SHIP-114 stated that more strongly — "this package makes no request to the object store,
 // ever" — and SHIP-115 had to narrow it.** [S3.Stored] asks the store what it holds under a key,
@@ -34,7 +35,26 @@ import (
 // learn that an upload happened at all. The narrowed rule is the one that was always doing the
 // work — **no transfer through this service** — and a HEAD carries no body in either direction.
 //
-// One request of one shape, against an object this platform named, and still no SDK. The signing
+// # SHIP-171a narrowed it a second time, and it is the same narrowing rather than an exception
+//
+// **This sentence ended "and no delete" until SHIP-171a.** [S3.Delete] removes one object this
+// platform named, and it meets the rule that was always doing the work exactly as [S3.Stored]
+// does: **a DELETE carries no body in either direction.** Nothing is transferred through this
+// service and nothing about the client-to-store upload path changes, so this is the second
+// application of SHIP-115's narrowing rather than an exception to it.
+//
+// What made it necessary is Docs/05 §3.1's other half. SHIP-171 replaces the person and retains
+// the transaction; SHIP-172 *removes* the artefacts, and an artefact in this store cannot be
+// removed by a platform whose storage adapter has no verb for it. **SHIP-171a builds the call and
+// makes none** — no domain acquired a port for it and nothing belonging to a person is deleted by
+// the ticket that added the method.
+//
+// The three places stating that this package has no delete were reversed in writing rather than
+// quietly edited: here, in doc.go, and in internal/profiles/ports.go — which turns out to be a
+// statement about something else and is clarified rather than reversed. Docs/11 §3 has the
+// argument in full.
+//
+// Two requests of two shapes, against objects this platform named, and still no SDK. The signing
 // algorithm is a published specification and about eighty lines of HMAC; the SDK is a transport, a
 // retry policy, a credential chain and a dozen modules, and the one request below is
 // `http.Client.Do` against a URL this file already knows how to sign. The same round trip is
@@ -433,6 +453,79 @@ func (s *S3) Stored(
 	// comparison rather than hidden inside a quoted string.
 	return resp.Header.Get("Content-Type"), resp.ContentLength,
 		strings.Trim(resp.Header.Get("ETag"), `"`), true, nil
+}
+
+// Delete removes the object stored under key, and reports only whether the store did as it was
+// asked (SHIP-171a).
+//
+// # Deleting a key that holds nothing is a success, and the store is what decides that
+//
+// This is the one API decision in the ticket, so it is argued here rather than assumed.
+//
+// It would have been possible to report "there was nothing there" as a distinct answer, the way
+// [S3.Stored] reports found. **It is not possible to do so cheaply or correctly**, and it is not
+// wanted. S3 defines DELETE on an object as idempotent, and the store this platform runs against
+// behaves accordingly: a DELETE of a key that has never existed answers **204**, exactly as a
+// DELETE of a key that did. Measured against the running MinIO rather than taken from the
+// specification. So this package could only manufacture the distinction by asking first — a second
+// round trip, and a race in which an object removed between the HEAD and the DELETE reports a
+// failure that did not happen.
+//
+// It is not wanted because of who calls it. SHIP-172 cascades a deletion across artefacts, and a
+// cascade must be re-runnable after a partial failure: the second pass meets keys the first one
+// already removed, and a caller forced to distinguish them would be handling a case that is not a
+// failure. **The desired state is that nothing is stored under this key, and that state holds
+// either way.**
+//
+// **So silence here is not evidence that anything was ever there**, and a caller that needs to know
+// must ask [S3.Stored] first and accept the race. Nothing in the platform needs to.
+//
+// # 404 is a fault here, and that is the opposite of [S3.Stored]
+//
+// Worth reading beside that method rather than pattern-matched to it. There, 404 means the client
+// has not uploaded yet and is folded into a normal answer. Here it cannot be, and the measurement
+// above is why: because a missing *key* answers 204, the only thing that answers **404 is a missing
+// bucket** — `NoSuchBucket`, a configuration fault. Folding it into success would make a service
+// pointed at the wrong bucket report every deletion as done while nothing was deleted, which is the
+// same shape as [S3.Stored]'s refusal to read 403 as "the driver never uploaded", in the direction
+// that destroys evidence instead of blaming somebody for losing it.
+//
+// So the rule is the plain one: **2xx is success and everything else is an error**, with the
+// store's own refusal quoted into it. No status is translated.
+func (s *S3) Delete(ctx context.Context, key string) error {
+	if err := validateObjectKey(key); err != nil {
+		return err
+	}
+
+	seconds, err := signedSeconds(metadataTTL)
+	if err != nil {
+		return err
+	}
+
+	signed, err := s.presign(s.clock.Now().UTC(), http.MethodDelete, key, seconds, nil)
+	if err != nil {
+		return err
+	}
+
+	// The method has to be the one that was signed, for [S3.Stored]'s reason: SigV4 covers it in
+	// the canonical request, so a DELETE spent against a GET-signed URL is SignatureDoesNotMatch
+	// and looks exactly like a wrong secret.
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, signed, nil)
+	if err != nil {
+		return fmt.Errorf("storage: deleting %q: %w", key, err)
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("storage: deleting %q: %w", key, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("storage: deleting %q: the store answered %s%s",
+			key, resp.Status, describeBody(resp.Body))
+	}
+	return nil
 }
 
 // signedSeconds is X-Amz-Expires: a lifetime as the integer count of seconds the protocol carries.
