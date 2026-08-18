@@ -832,6 +832,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-81b** | M3 | The evidence behind a verification record: `provider_verification_documents` (`000201`, `internal/profiles`' second table), a pre-signed upload URL, the submission that turns an uploaded object into one of `Docs/04` §3's four documents, and a read that mints a fresh signed URL per request. **The platform is not in the path of the bytes and never sees an image** — it signs, the handset PUTs to the store, and the record is written only after the store is *asked* what it holds. **`profiles.Documents` is a second type rather than a wider `Service`**, because `routes_admin.go` constructs a `Service` to decide a verification and has no business holding a signer. **No expiry column and no renewal cadence** — that is X-4's and SHIP-159's. **The client half was not taken**, for a reason that is a finding rather than scheduling — *see below* | 
 | **SHIP-170** | M7 | The deferral. A deletion request made while the account is party to a job between `Awarded` and `Delivered` is recorded as `deferred` with the platform's own explanation beside it, and **both parties count** — `Docs/05` §3.1 says a *party* mid-delivery, and the endpoint is `RequireUser` with no role predicate, so a lookup reading `jobs.customer_id` alone would pass every customer-side assertion and erase a driver mid-delivery. It is `internal/identity`'s **first port over another domain** rather than over an adapter, following `admin.JobParties`: one method answering yes or no, with the statement that spans `jobs` and `bids` in `cmd/api`. **No job identifier is stored** — the deferral is re-read on every call, in both directions, so it cannot go stale and the row stays what `000105` built it to be. `000106` widens the CHECK *and* the open-request index, which is the half a reader would miss: a deferred request is an open request, and an index still partial on `'requested'` would let one account hold two promises. It answers `deletion.go:200`'s question — the two statements became three and one transaction, because the re-read is now followed by a write. The mutation dropping the provider half is reported below with the layer that killed it — *see below* |
 | **SHIP-173** | M7 | The account deletion screen — the client half of the two, and the only place in the app that reaches `POST /v1/account/deletion`. **It renders `deferred` because SHIP-170 exists**, which is why the two were one lane: `contracts/paths/identity.yaml` had already told clients to branch on `state` rather than assume it, and a screen shipped before the state would have told somebody mid-delivery their account goes on the fifteenth. Consequences are `Docs/05` §3.1's split rather than a warning — what is deleted for good, and **what stays under a pseudonym**, which is the half nobody expects. The confirmation is tested in **both** directions: opening the dialog sends nothing and dismissing it sends nothing, which is `award_test.dart`'s argument that a confirmation tested only in the accepting direction is one nobody has checked. It draws **no job** on a screen both roles reach, and a repeat is not read as a new request — asking again is how a deferral lifts, so the button stays and the second call is what the test asserts. Entry point is a third app-bar action on the signed-in shell, because there is no settings screen and inventing one for a single action would be building what a later ticket has to reconcile with — *see below* |
+| **SHIP-171** | M7 | The clock runs out and the person stops being a person. `Docs/05` §3.1's *delete the person, retain the transaction*, executed from **cmd/worker's sixth registered task** because nobody presses a button to be erased on the thirtieth day. **`'completed'` joins the CHECK and must not join the open-request index** — `000105` said why before either state existed and `000106` named this ticket doing it — and the mutation adding it to `openDeletionStatesSQL` is killed **behaviourally** as well as by the pairing guard: PostgreSQL stops being able to infer the partial index from the `ON CONFLICT` predicate, and sixteen tests fail on the running query. The pseudonym is a **pure function of `users.id`**, which `Docs/05` §3.1 already calls the pseudonym, and it is deliberately **not a valid address or number**, so the account is unreachable at sign-in by construction rather than by a check. Five tables across four domains, one transaction; the two outside `internal/identity` are reached through a port it declares. **`notifications.address` is the finding** — a stored copy of the contact channel keyed to the account, which no list of tables would have caught and a **whole-schema sweep** did. `users.password_hash` is declared out of scope with its reason — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -15419,6 +15420,126 @@ so an allow-list cannot outlive the copy it records.
 | Surface | What |
 |---|---|
 | Provider disclosure channels | The enumeration above; `test/support/disclosure.dart`, the first shared Flutter test helper root; closed-world guards on the open job screen and bid panel, the provider feed, the provider's own bids, and the negotiation screen; the money-by-shape hole closed and proved by mutation |
+
+### SHIP-171 — the person is replaced, the transaction is kept, and the copies were the hard part
+
+`Docs/05` §3.1's adopted model is *"delete the person, retain the transaction"*. SHIP-169 recorded the request and the date the person was told, SHIP-170 held it while a delivery was in flight, and this is what happens when the thirty days run out: `account-pseudonymisation`, the **sixth** task in `cmd/worker`, claims the open requests whose `complete_by` has arrived and replaces the account holder with a stable pseudonym in five tables belonging to four domains, in one transaction.
+
+There is **no endpoint**. `Docs/05` §3.1 puts execution out of an ordinary administrator's reach entirely, and nobody presses a button to be erased on the thirtieth day.
+
+#### The criterion, clause by clause
+
+> **Done when:** Profile and contact data are irreversibly replaced by a stable pseudonym.
+
+| Clause | Where it is met | How it is demonstrated |
+|---|---|---|
+| **Profile and contact data** | `users.name`, `users.email`, `users.phone`; `email_verification_tokens.email` and `phone_otps.phone`, which are verbatim copies; `provider_profiles.display_name`; `notifications.address` on the email and SMS channels | `TestExecutingADueRequestReplacesProfileAndContactData`, `TestAPassPseudonymisesTheAccountsWhoseWindowHasClosed`, and `scripts/verify/40-identity.sh` against the running binary |
+| **Irreversibly** | Nothing anywhere records what was overwritten — not the request row, not `audit_log`, not a log line. Every statement is an `UPDATE` naming columns, with no `RETURNING` and no prior `SELECT`, so no variable in the process ever holds the replaced value | `TestNothingInTheSchemaStillHoldsThePerson` and the harness's `pseudonym_survivors` — a **sweep of every text-shaped column in the public schema**, not a list of tables |
+| **A stable pseudonym** | `identity.PseudonymFor` is a pure function of `users.id` — no counter, no clock, no random source | `TestThePseudonymIsAPureFunctionOfTheAccount`, `TestPseudonymisingTwiceWritesTheSameValues`, and a second worker pass in the harness that changes nothing |
+
+**All three are met.** What is declared out of scope, with reasons, is below.
+
+#### `'completed'` joins the CHECK and must not join the index, and this is the ticket's one irreversible mistake
+
+`000105` wrote the argument before either later state existed — *"Partial rather than total because the states above will grow. A completed request must not stop a later one; only an open one does"* — and `000106` named this ticket doing it: *"SHIP-171's `'completed'` is the state that must **not** join this predicate."* So `000107` widens `ck_account_deletion_requests_state` and **does not touch `uq_account_deletion_requests_open`**.
+
+Adding it to that predicate would be a silent, permanent refusal: the account would hold one row forever, and every later request would be swallowed by `ON CONFLICT … DO NOTHING` with the executed request handed back as though it were live. Four things now hold the two halves together, and the fourth is new because the first three are all text guards:
+
+- `identity.DeletionState.Open()`, which until this ticket was a `return true` waiting for a reason.
+- `openDeletionStatesSQL`, unchanged at `('requested', 'deferred')`.
+- `TestTheOpenStatesInSQLAreTheOnesTheDomainDeclares` and `TestTheOpenStatesTheIndexCoversAreTheOnesTheDomainCallsOpen`, which read a constant and an `indexdef` respectively.
+- **`TestACompletedRequestDoesNotStopTheSameAccountAskingAgain`**, which runs the query. A pairing guard is a text guard, and nothing behavioural had ever proved that a completed request lets the same account ask again.
+
+#### The mutation, and the layer that killed it
+
+Adding `'completed'` to `openDeletionStatesSQL` alone — the SQL half and not the Go half, which is exactly the drift `deletion.go` predicted. Checked first that no fixture in the repository already carried the literal; `grep -rn` over `*.go`, `*.sh` and `*.sql` returned nothing.
+
+**It was killed at three layers, and the behavioural one fired first.**
+
+| Layer | What failed |
+|---|---|
+| **PostgreSQL, at run time** | `ON CONFLICT (user_id) WHERE state IN (…)` can no longer infer the partial unique index, because `state IN (a, b, c)` does not imply `state IN (a, b)`. **SQLSTATE 42P10**, on every deletion request. Sixteen tests in `internal/identity` failed on the running query |
+| **The pairing guard** | `TestTheOpenStatesInSQLAreTheOnesTheDomainDeclares` — *"openDeletionStatesSQL names 3 states and OpenDeletionStates() has 2"* |
+| **The sweep's own guard** | `cmd/worker`'s `TestAPassPseudonymisesTheAccountsWhoseWindowHasClosed` — the claim picked up a *completed* request and `Pseudonymiser.Execute` refused it by name |
+
+`TestTheOpenStatesTheIndexCoversAreTheOnesTheDomainCallsOpen` correctly **passed**: that mutation changes neither the index nor `Open()`, so the index and the domain still agree. Restored by `cp` from a snapshot taken before the mutation, confirmed with `shasum -a 256 -c` — `deletion.go: OK`, `03fc61e6…`.
+
+#### The pseudonym, and why deriving it from the account identifier is not a reversal
+
+`PseudonymFor(id)` returns one token and two rendered names, all derived from `users.id`:
+
+```
+Token       deleted:0198a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b   -> users.email, users.phone, and every copy
+Name        Deleted user 0c1d2e3f4a5b                       -> users.name
+TradingName Deleted provider 0c1d2e3f4a5b                   -> provider_profiles.display_name
+```
+
+**Stable** because it is a pure function: the same account pseudonymises to the same values on a replay, a restore, or a second machine. **Unique** because `uq_users_email` and `uq_users_phone` are both `UNIQUE` over `NOT NULL` columns and the input is a primary key. **Not a reversal** because `Docs/05` §3.1 already calls that identifier the pseudonym — *"a deleted user becomes a stable pseudonymous identifier"* — and every retained job, bid, transition and audit row references it and goes on doing so. What would be a reversal is a stored mapping back to the address, and there is none.
+
+**The contact values are deliberately not address-shaped, and that is a decision rather than laziness.** The obvious pseudonym is `deleted-<id>@deleted.invalid`: unique, stable, and undeliverable because RFC 2606 reserves the TLD. It was rejected because it is still *presentable* — the identifier is visible to a counterparty in ordinary API responses, so anybody could reconstruct that address and hand it to sign-in, a resend, or a password reset. `deleted:<id>` cannot be handed to any of them: `plausibleEmail` and `validE164` both refuse it, so the pseudonymised account is unreachable through the front door by construction rather than by a check somebody remembered to add. The harness asserts both directions — the old address answers `401`, the pseudonym answers `400`.
+
+The short form is the **last** twelve hex digits rather than the first eight. In a UUIDv7 the leading digits are a millisecond timestamp, so an eight-character prefix would render two accounts registered inside the same minute identically on a screen — which is the one thing the short form exists to avoid.
+
+#### `notifications.address` is the finding, and a list of tables would never have caught it
+
+Scoping this ticket meant sweeping every text column in the schema for a value that can be joined back to an account. `users` and identity's own two copies are obvious. **`notifications.address` is not**, and its own migration says exactly what it holds: *"an email address, or an E.164 number. Resolved once, when the row is written, from users."* It is keyed by `recipient_id`, which is a foreign key to `users`. One join recovers the person from a table nobody was thinking about, while `users` looks entirely clean.
+
+So the *irreversibly* guard is a **sweep rather than a list**, in both the Go tests and the harness: it asks `information_schema` for every text-shaped column in the public schema and looks for the person in all of them, **including columns that do not exist yet**. A copy added by a later ticket fails here. Both sweeps also check the *fixture* in the same run — that the value was in more than one table before, and that an address which was **not** deleted is still findable afterwards — because a sweep whose whole assertion is an absence can pass by being broken.
+
+Three copies are **out of reach or out of scope**, each recorded rather than left to be rediscovered:
+
+- **`driver_assignments.driver_name` and `driver_mobile`** carry **no account reference at all** — a driver may be a third party with no account, which is the whole reason the columns exist. Nothing can decide whether a given row is a provider's own details. **Out of reach**, and it needs a ticket if `Docs/05` §3.1 is to be met in full.
+- **`job_messages.body` and `disputes.description`** are prose somebody wrote, not identifying columns. SHIP-172's *"message bodies"*.
+- **`device_tokens.token`** and `notifications.address` **on the push channel** are device identifiers, named in SHIP-172's own *Done when*. The sweep excludes `channel = 'push'` deliberately, and overwriting it would destroy the only value saying which handset a failed push was aimed at.
+
+#### What is beyond the clause and was taken anyway, and the one column left alone
+
+**Every live device session is revoked**, with a fourth value on `ck_device_sessions_revoked_reason` — `account_deleted`, added by `000107` and paired to a Go constant by the test `000104` planted. A session is neither profile nor contact data, so this is beyond the criterion; it is here because the criterion would otherwise be satisfied by an account somebody can still use. A handset holding a refresh token issued last week keeps working after the name, address and number are gone, because `refreshDeviceSession` reads `revoked_at` and has never heard of a pseudonym.
+
+**`users.password_hash` is left alone, and it is the one column still holding something derived from the person.** It is neither profile nor contact data — it is a one-way function of a secret they chose — and both uses of it are already closed: the address it belonged to no longer exists, and the value that replaced it cannot reach the store because `plausibleEmail` refuses it first. Overwriting it with something the hasher cannot parse would turn an unreachable sign-in into a `500` if anybody ever widened that validator, which is a worse failure than the one it fixes; overwriting it with a hash of something random would be correct and would make the writer non-deterministic, which is the one property the *stable* clause needs. **Handed to SHIP-172 rather than narrowed quietly here.**
+
+**`provider_profiles.operates_as` is left alone too.** It is `individual` or `business`, which identifies nobody, and `ck_provider_profiles_operates_as` has no neutral third value; inventing one would be a migration in fleet's block on a column this ticket has no reading of. Asserted *unchanged* by a test, so that a later widening of the statement to "everything in the row" fails rather than passing.
+
+#### Two ports, and the asymmetry between them is deliberate
+
+`internal/identity` may not import `internal/fleet` or `internal/notifications`, so it declares `PersonalDetails` — *"every store outside internal/identity that keeps a copy of the account holder's own name, address or number"* — and `cmd/worker` supplies the adapter. One port rather than one per table, because two would be two interfaces describing one act and would make the third copy somebody finds later a third interface rather than a line in one adapter.
+
+The adapter reaches the two stores **differently, on purpose**, which is `cmd/api/routes_bidding.go`'s own distinction:
+
+- **`provider_profiles.display_name` through `fleet.Service.PseudonymiseProfile`**, because `display_name` has a policy attached — `minDisplayName` and `maxDisplayName` agree with `ck_provider_profiles_display_name` deliberately, and the pair is tested. A statement in the composition root would be a second opinion about what a trading name may be. This is the one method on `fleet.Service` with no caller at all: no credential, no subject, reached on a schedule, so SHIP-78a's provider-only rule is **exempt with its reason written down** rather than silently unclassified — a distinction `TestEveryServiceMethodIsClassified` caught on the first `make check` of this branch, which is that guard working rather than a near miss.
+- **`notifications.address` with a statement in `cmd/worker`**, because it is a stored value with no policy and `internal/notifications` declares no port for it. `activeJobLookup` reading `jobs` and `bids` is the precedent sitting in the same file.
+
+`activeJobLookup` itself is now a **second copy**, in `cmd/worker` beside `cmd/api`'s, exactly as `presentedJobs` is. Two composition roots are two binaries, neither imports the other, and both are exercised — that one by the deletion endpoint and this one by `tasks_identity_test.go` against a real database.
+
+#### The delivery is re-read at the moment of execution, which is what `ports.go` promised
+
+`ports.go` wrote it down at SHIP-170: *"SHIP-171 asks again before it executes, which is the check that actually protects the counterparty."* A request recorded live thirty days ago may belong to somebody who won a job last week, and the row holds **no job identifier** precisely so that the answer cannot go stale. So the sweep asks again, and the answer decides all three outcomes:
+
+| The account is | The request was | Outcome |
+|---|---|---|
+| party to a delivery | either | `held` — deferred again, thirty days re-recorded |
+| not a party | `deferred` | `restarted` — live, and the thirty days start **now** |
+| not a party | `requested` | `executed` |
+
+The middle row is why the claim takes **both** open states rather than only `requested`, and it closes a gap SHIP-169 wrote down and left open: *"a person who never asks again stays deferred until SHIP-171 looks."* This is the looking. A deferral that lifts here is deliberately **not** executed in the same pass — the person is owed the window they were promised, and SHIP-170's rule is that it starts when the deferral lifts rather than having run while they waited.
+
+`complete_by` is the one instant on this row that is **not** rewritten when a request completes. It is the promise the platform made and kept; `updated_at`, the trigger `000105` installed for this ticket, is what says when it was kept. Both are asserted in the harness.
+
+#### The sixth worker task, and what was measured about every other section
+
+`cmd/worker` is one binary and a start runs **every** registered task, so this now runs inside `50-jobs.sh`, `51-jobs-autocomplete.sh`, `61-bidding.sh`, `80-notifications.sh` and `81-notifier.sh`, none of which mentions deletion. `TestTheRegisteredTaskSetIsWhatItSaysItIs` is the speed bump and it was read rather than edited past.
+
+**`Docs/11` §9's reopening trigger does not fire.** The one case the convention cannot cover is *"a task that sweeps rows due by wall-clock alone"*. This is not that task: `complete_by` is a **stored** column, written from the row's own request time plus thirty days, so every request any endpoint can create is thirty days from claimable at the moment it is created. That is `job-expiry`'s shape and `job-auto-complete`'s, and it is conspicuously not `outbox-publisher`'s.
+
+**What it does to the existing sections was measured, not assumed.** `grep -rn 'account_deletion' scripts/verify/` returns `40-identity.sh` and nothing else — one section writes that table, it sorts before every section that starts a worker, and every row it leaves was created through the endpoint with a promise thirty days out. No section backdates one. The sweep is nevertheless the first task that can reach a row another section is still *using*: an expiry moves a job or an offer somebody else created, and this replaces a **user's** email address, while every section downstream signs somebody in. So `40-identity.sh` ends with the assertion it owes them — that no open request is left past its promised date — rather than a comment claiming it.
+
+The section starts its worker with `KAFKA_BROKERS=localhost:1`, `61-bidding.sh`'s recipe and for its reason: `outbox-publisher` has no "not due" state, and a drain in section 40 would publish rows `80-notifications.sh` reads.
+
+#### What this does not build
+
+- **SHIP-172**, which depends on it: verification documents, message bodies, device tokens and attributable images are removed rather than replaced, and that is a different act with different failure modes.
+- **Notifications to a pseudonymised account are not suppressed.** A person who is still party to a retained job can be a recipient of a later `job.status_changed`; the row would be written with the pseudonym as its address and would fail to dispatch, legibly, climbing `attempts`. It has no ticket. `internal/notifications` is nobody's this wave and the fix is that domain's, not a statement in `cmd/worker`.
+- **The retention period for the pseudonymised transaction records is still X-4's.** `Docs/05` §3.1 calls it *"the one genuinely open element"* and it does not block this ticket: the **split** — what is deleted and what is retained under a pseudonym — is settled in that document as a design decision, and how long the retained side persists is the open question. Nothing here shortens or lengthens anything.
 
 ## 4. Partly done — do not treat these as finished
 

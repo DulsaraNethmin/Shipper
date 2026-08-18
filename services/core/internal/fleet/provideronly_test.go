@@ -106,6 +106,12 @@ var exemptFromProviderOnly = map[string]string{
 	"EligibleFor": "same predicate, asked about one job: a customer is answered false by the SQL",
 	"ProviderJobFor": "reads `readable`, which is `eligible` plus the caller's own bids — a customer " +
 		"matches neither branch and is answered ErrJobNotOffered by the query",
+
+	"PseudonymiseProfile": "SHIP-171's sweep, and the one method here with no caller at all: it is " +
+		"reached from cmd/worker through a port internal/identity declares, on a schedule, with no " +
+		"credential and no subject. A role check would be asking whether a background task is a " +
+		"provider. What it may write is bounded instead — the same display-name rule Declare " +
+		"applies — and it changes nothing for an account that never declared a name",
 }
 
 // TestEveryFleetMethodRefusesACustomer is SHIP-78a's acceptance criterion.

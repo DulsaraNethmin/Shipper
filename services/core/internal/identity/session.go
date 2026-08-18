@@ -73,7 +73,7 @@ const (
 // constraint cannot drift into disagreeing (Docs/10 §3.4) — TestRevokedReasonsMatchTheConstraint
 // is what holds the two together.
 //
-// Three, and each has a ticket behind it rather than being a value somebody might want later.
+// Four, and each has a ticket behind it rather than being a value somebody might want later.
 const (
 	// revokedReasonTokenReused is SHIP-40: a token that had already been rotated away was
 	// presented again.
@@ -84,6 +84,15 @@ const (
 
 	// revokedReasonByOwner is SHIP-46: the person revoked it from their device list.
 	revokedReasonByOwner = "revoked_by_owner"
+
+	// revokedReasonAccountDeleted is SHIP-171: the account was pseudonymised.
+	//
+	// The person did not end this session and may never have seen the device again. It is
+	// ended because the account they signed in to no longer identifies anybody, and a
+	// credential issued before that must not outlive it — an account whose name, address and
+	// number have been replaced while a handset still holds a working refresh token has not
+	// been deleted in any sense the person would recognise.
+	revokedReasonAccountDeleted = "account_deleted"
 )
 
 // revokedReasons is the closed list, for the test that reads the CHECK constraint back.
@@ -91,6 +100,7 @@ var revokedReasons = []string{
 	revokedReasonTokenReused,
 	revokedReasonSignedOut,
 	revokedReasonByOwner,
+	revokedReasonAccountDeleted,
 }
 
 // RefreshToken is an issued refresh token and the instant it stops being usable.

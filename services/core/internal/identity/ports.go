@@ -114,3 +114,46 @@ type ActiveJobs interface {
 	// rather than an absence.
 	HasActiveJob(ctx context.Context, r db.Runner, userID uuid.UUID) (bool, error)
 }
+
+// PersonalDetails is every store outside internal/identity that keeps a copy of the account
+// holder's own name, address or number (SHIP-171).
+//
+// # Why the copies have to be reached at all
+//
+// "Irreversibly replaced" is a claim about the whole database rather than about `users`. A row
+// elsewhere holding the original address beside a foreign key to the account is a reverse mapping
+// whatever the account row now says — `select n.address from notifications n where n.recipient_id
+// = $1` recovers the person from a table nobody was thinking about. So the sweep replaces the
+// copies in the same transaction as the original, or it has not replaced anything.
+//
+// # Why it is one port and not one per table
+//
+// The two implementations that exist today live in `provider_profiles` and `notifications`, which
+// belong to two other domains. Two ports would be two interfaces describing one act — "replace this
+// person's details wherever you keep them" — and would make the third copy somebody finds later a
+// third interface rather than a line in one adapter. cmd/worker supplies it, which is where a
+// dependency between domains is allowed to be visible; the measured precedents are
+// `cmd/api/routes_identity.go`'s activeJobLookup and `cmd/api/routes_bidding.go`'s offerorDirectory.
+//
+// # What it deliberately does not cover
+//
+// Not `internal/identity`'s own tables. `email_verification_tokens.email` and `phone_otps.phone` are
+// verbatim copies of the two contact channels and are replaced by [postgresStore] directly, because
+// this package owns them and a port over its own schema would be the repository interface Docs/06
+// §4.1 refuses.
+//
+// Not artefacts. Message bodies, device tokens, verification documents and attributable images are
+// SHIP-172's, and Docs/05 §3.1 puts them in the same column as the contact details for a reason —
+// but *removing* an artefact and *replacing* an identifier are different acts with different
+// failure modes, and the ticket boundary is where Docs/09 put it.
+type PersonalDetails interface {
+	// Replace overwrites every identifying value it holds for userID and reports how many rows
+	// it changed.
+	//
+	// The count is for the log and for a test, not for a decision: zero is an ordinary answer,
+	// because a customer has no provider profile and an account that has never been notified
+	// has no notifications. An implementation that cannot reach one of its stores returns an
+	// error rather than a partial count — the caller is inside the transaction that also moves
+	// the request to [DeletionCompleted], so a failure here means neither happens.
+	Replace(ctx context.Context, r db.Runner, userID uuid.UUID, with Pseudonym) (int, error)
+}

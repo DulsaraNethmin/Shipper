@@ -478,6 +478,46 @@ func (s *Service) PublicProfiles(ctx context.Context, r db.Runner, providerIDs [
 	return s.store.publicProfiles(ctx, r, wanted)
 }
 
+// PseudonymiseProfile replaces the trading name of a provider whose account has been deleted
+// (SHIP-171).
+//
+// # Why this is here rather than an UPDATE in cmd/worker
+//
+// `provider_profiles` is this domain's table and `display_name` is the one column in it with a
+// policy attached: `minDisplayName` and `maxDisplayName` are stated above, they agree with
+// `ck_provider_profiles_display_name` deliberately, and the pair is tested. A statement written in
+// the composition root would be a second opinion about what a trading name may be, in a file whose
+// job is wiring — which is `cmd/api/routes_bidding.go`'s own argument for reading the public profile
+// through [Service.PublicProfiles] instead of joining to the table.
+//
+// # Why it takes a name and knows nothing about deletion
+//
+// `internal/identity` declares the port, `cmd/worker` supplies the adapter, and this is what the
+// adapter calls. Domains do not import each other, so nothing here has heard of a deletion request
+// — what arrives is a string, checked against the same bounds any other declaration is checked
+// against, and refused in the same way. A `fleet` that knew why the name was changing would be a
+// `fleet` that had learnt about `account_deletion_requests`.
+//
+// # A provider with no declaration is not an error
+//
+// Declaring a public profile is optional, so most providers have no row and the answer is false with
+// no error. The caller counts rows changed rather than branching on it: an account being
+// pseudonymised has no obligation to have traded under a name.
+func (s *Service) PseudonymiseProfile(ctx context.Context, r db.Runner, providerID uuid.UUID, displayName string) (bool, error) {
+	if providerID == uuid.Nil {
+		return false, fmt.Errorf("fleet: pseudonymising a profile needs a provider")
+	}
+
+	name := collapse(displayName)
+	if n := len([]rune(name)); n < minDisplayName || n > maxDisplayName {
+		return false, fmt.Errorf(
+			"fleet: %q is %d characters and a trading name is %d to %d",
+			name, n, minDisplayName, maxDisplayName)
+	}
+
+	return s.store.replaceDisplayName(ctx, r, providerID, name)
+}
+
 // normalise tidies and deduplicates every supplied list, returning a copy.
 //
 // Done before validation for the reason [VehicleFields.normalise] is: what is validated is then
