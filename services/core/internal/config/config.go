@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"strconv"
@@ -64,6 +65,7 @@ type Config struct {
 	Push         Push
 	Geocoding    Geocoding
 	Pagination   Pagination
+	RateLimits   RateLimits
 	Storage      Storage
 	Verification Verification
 	App          App
@@ -277,6 +279,39 @@ type Pagination struct {
 
 	// MaxPageSize is the ceiling a larger ?limit= is narrowed to, never an error.
 	MaxPageSize int
+}
+
+// RateLimits is the global lever over every rate-limit class (SHIP-183, SHIP-183a).
+//
+// # Why there is no per-route setting here, and never should be
+//
+// Docs/12 §7 decided it. The service serves 86 routes; a pair of variables each would be 172 of
+// them, and `deploy/.env.example` documents every variable this service reads — nobody maintains
+// 172 of those correctly. Worse, a per-route override is a number that can drift from the reason
+// written beside it in Docs/12 with nothing to notice, which is the exact failure that document
+// exists to prevent, reintroduced through the back door.
+//
+// What an incident actually wants is **"everything tighter, now"** while something is being
+// attacked, or **"looser, now"** because a real customer's NAT is being throttled. Both are global,
+// and both are one of these two values.
+//
+// The revisit trigger is named in Docs/12 §10 rather than left to judgement: the first incident that
+// genuinely wants one route different from the rest. At that point the answer is a per-**class**
+// override map — seven values a person can hold in their head — and not a per-route one.
+//
+// # Why two and not one
+//
+// Capacity governs the burst and interval governs the sustained rate, and they are independent.
+// Scaling capacity alone changes what a cold start can absorb and leaves the long-run rate exactly
+// where it was; scaling the rate alone does the opposite. A single "tighten by half" cannot say
+// which of those it meant, and the two incidents that produce it want different answers.
+type RateLimits struct {
+	// BurstScale multiplies every class's capacity. 1.0 is the figure Docs/12 §3 argues for.
+	BurstScale float64
+
+	// RateScale multiplies every class's sustained rate, which means it divides the interval:
+	// at 2.0 a token comes back twice as fast.
+	RateScale float64
 }
 
 // Email configures the transactional email adapter (SHIP-32), first consumed by the
@@ -842,6 +877,19 @@ func Load() (*Config, error) {
 			DefaultPageSize: l.boundedInt("PAGINATION_DEFAULT_PAGE_SIZE", 20, 1, 500),
 			MaxPageSize:     l.boundedInt("PAGINATION_MAX_PAGE_SIZE", 100, 1, 500),
 		},
+		RateLimits: RateLimits{
+			// The default is the document. A deployment that sets neither runs exactly
+			// the figures Docs/12 §3 argues for, which is what makes the reasons there
+			// worth reading.
+			//
+			// The bounds are what an incident could plausibly want rather than taste. A
+			// hundredth is a near-freeze that still lets a token through — the class
+			// keeps a floor of one, so nothing becomes an off switch — and a hundredfold
+			// is well past any legitimate loosening, which makes a misplaced decimal
+			// point a startup failure rather than an unlimited API.
+			BurstScale: l.boundedFloat("RATE_LIMIT_BURST_SCALE", 1.0, 0.01, 100.0),
+			RateScale:  l.boundedFloat("RATE_LIMIT_RATE_SCALE", 1.0, 0.01, 100.0),
+		},
 		Storage: Storage{
 			// The published host port, not the compose-internal name — see [Storage.Endpoint].
 			// It matches the Makefile's STORAGE_ENDPOINT, which derives the port rather than
@@ -1098,6 +1146,33 @@ func (l *loader) boundedInt(key string, def, low, high int) int {
 		return def
 	}
 	return n
+}
+
+// boundedFloat reads a scaling factor and refuses one outside its range.
+//
+// Separate from boundedInt rather than a conversion of it because the values this reads are
+// deliberately fractional: "half as much burst" is the ordinary incident response, and rounding it
+// to a whole number would make the only usable setting "the same or more".
+//
+// A non-numeric value is an error rather than a fallback to the default, for the reason every
+// loader here shares: a deployment that set the variable meant something by it, and quietly running
+// the default is how a tightening somebody applied during an incident turns out never to have
+// applied.
+func (l *loader) boundedFloat(key string, def, low, high float64) float64 {
+	v, ok := l.lookup(key)
+	if !ok {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		l.errf("%s: %q is not a number", key, v)
+		return def
+	}
+	if math.IsNaN(f) || f < low || f > high {
+		l.errf("%s: must be between %g and %g, got %q", key, low, high, v)
+		return def
+	}
+	return f
 }
 
 // boolean reads a flag, accepting everything strconv.ParseBool does — 1/0, t/f, true/false,

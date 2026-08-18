@@ -31,7 +31,7 @@ import (
 // and TestEveryRouteIsInTheContract, which compare the served surface against committed files.
 
 func identityRouter() http.Handler {
-	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard())
+	return newRouter(testDeps(), idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard())
 }
 
 // postJSON drives a route the way a client does, with a fresh idempotency key each time so that
@@ -167,7 +167,7 @@ func TestRegisterWithoutADatabaseIsUnavailable(t *testing.T) {
 	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
 
 	rec := httptest.NewRecorder()
-	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
+	newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
@@ -215,7 +215,7 @@ func TestRequestOTPWithoutADatabaseIsUnavailable(t *testing.T) {
 	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
 
 	rec := httptest.NewRecorder()
-	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
+	newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
@@ -264,7 +264,7 @@ func TestVerifyEmailRefusesAnEmptyToken(t *testing.T) {
 	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
 
 	rec := httptest.NewRecorder()
-	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
+	newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
@@ -373,7 +373,7 @@ func TestLoginWithoutADatabaseIsUnavailable(t *testing.T) {
 	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
 
 	rec := httptest.NewRecorder()
-	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
+	newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
@@ -475,7 +475,7 @@ func TestLogoutWithACredentialButNoDatabaseIsUnavailable(t *testing.T) {
 	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
 
 	rec := httptest.NewRecorder()
-	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
+	newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
@@ -561,7 +561,7 @@ func TestRevokingAnIdentifierThatIsNotAUUIDIsANotFound(t *testing.T) {
 	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
 
 	rec := httptest.NewRecorder()
-	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
+	newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (%s)", rec.Code, rec.Body)
@@ -584,7 +584,7 @@ func TestTheDeviceListWithACredentialButNoDatabaseIsUnavailable(t *testing.T) {
 	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
 
 	rec := httptest.NewRecorder()
-	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
+	newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
@@ -642,7 +642,7 @@ func TestRefreshRefusesAnUnusableTokenWithOneCode(t *testing.T) {
 	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
 
 	rec := httptest.NewRecorder()
-	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
+	newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
@@ -684,7 +684,7 @@ func TestRefreshWithoutADatabaseIsUnavailable(t *testing.T) {
 	req.Header.Set(httpx.HeaderIdempotencyKey, t.Name())
 
 	rec := httptest.NewRecorder()
-	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
+	newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
@@ -774,7 +774,7 @@ func TestAccountDeletionWithACredentialButNoDatabaseIsUnavailable(t *testing.T) 
 	req.Header.Set(httpx.HeaderAuthorization, "Bearer "+token)
 
 	rec := httptest.NewRecorder()
-	newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
+	newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard()).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)

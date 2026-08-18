@@ -31,6 +31,7 @@ func echoSubjectRoute(auth Auth) Route {
 		Pattern: "/whoami",
 		Group:   GroupV1,
 		Auth:    auth,
+		Limit:   LimitWrite,
 		Handler: func(Deps) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				subject, ok := authctx.SubjectFrom(r.Context())
@@ -51,7 +52,7 @@ func routerFor(t *testing.T, rs []Route, g guards) http.Handler {
 	t.Helper()
 
 	mux := http.NewServeMux()
-	attachRoutes(mux, rs, GroupV1, testDeps(), g)
+	attachRoutes(mux, rs, GroupV1, testDeps(), g, testLimiter())
 
 	return httpx.Chain(
 		http.StripPrefix(apiPrefix, httpx.ResolveSubject(testAuthenticator())(mux)),
@@ -165,7 +166,7 @@ func TestARouteWhoseAuthClassIsUnenforcedRefusesToStart(t *testing.T) {
 			}()
 
 			attachRoutes(http.NewServeMux(), []Route{echoSubjectRoute(auth)},
-				GroupV1, testDeps(), nil)
+				GroupV1, testDeps(), nil, testLimiter())
 		})
 	}
 }
@@ -179,12 +180,13 @@ func TestAPublicRouteNeedsNoGuard(t *testing.T) {
 		Pattern: "/open",
 		Group:   GroupV1,
 		Auth:    Public,
+		Limit:   LimitPublicRead,
 		Handler: func(Deps) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
 			})
 		},
-	}}, GroupV1, testDeps(), nil)
+	}}, GroupV1, testDeps(), nil, testLimiter())
 
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/open", nil))
@@ -222,7 +224,7 @@ func TestOperationalRoutesArePublic(t *testing.T) {
 // only thing that separates these two requests.** With the nil scope this shipped with, the
 // second caller is handed the first caller's stored response body; with SubjectScope it is not.
 func TestOneCallersIdempotencyKeyCannotReadAnothers(t *testing.T) {
-	router := newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard())
+	router := newRouter(testDeps(), idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard())
 
 	alice, _, _ := testAccessToken(t, identity.RoleCustomer)
 	bob, _, _ := testAccessToken(t, identity.RoleProvider)
@@ -269,7 +271,7 @@ func TestOneCallersIdempotencyKeyCannotReadAnothers(t *testing.T) {
 // is safe: the fingerprint covers the body, so reading a stranger's response means already
 // holding the secret material in their request.
 func TestAnonymousCallersStillGetIdempotency(t *testing.T) {
-	router := newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard())
+	router := newRouter(testDeps(), idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard())
 
 	post := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/v1/not-a-real-endpoint", strings.NewReader("{}"))

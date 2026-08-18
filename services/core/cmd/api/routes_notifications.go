@@ -48,6 +48,7 @@ func init() {
 			Pattern: "/notifications/device-tokens",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return notificationsHandler(d).Register() },
 		},
 		Route{
@@ -55,6 +56,7 @@ func init() {
 			Pattern: "/notifications/device-tokens/current",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return notificationsHandler(d).Deregister() },
 		},
 
@@ -70,6 +72,7 @@ func init() {
 			Pattern: "/notifications/preferences",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return notificationsHandler(d).Preferences() },
 		},
 		Route{
@@ -77,6 +80,7 @@ func init() {
 			Pattern: "/notifications/preferences",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return notificationsHandler(d).UpdatePreferences() },
 		},
 	)

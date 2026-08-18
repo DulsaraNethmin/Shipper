@@ -47,6 +47,7 @@ func init() {
 			Pattern: "/auth/register",
 			Group:   GroupV1,
 			Auth:    Public,
+			Limit:   LimitMessage,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).Register() },
 		},
 		Route{
@@ -57,6 +58,7 @@ func init() {
 			Pattern: "/auth/login",
 			Group:   GroupV1,
 			Auth:    Public,
+			Limit:   LimitCredential,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).Login() },
 		},
 		Route{
@@ -66,6 +68,7 @@ func init() {
 			Pattern: "/auth/logout",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).Logout() },
 		},
 		Route{
@@ -75,6 +78,7 @@ func init() {
 			Pattern: "/auth/sessions",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).Devices() },
 		},
 		Route{
@@ -82,6 +86,7 @@ func init() {
 			Pattern: "/auth/sessions/{id}",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).RevokeDevice() },
 		},
 		Route{
@@ -89,6 +94,7 @@ func init() {
 			Pattern: "/auth/verify-email",
 			Group:   GroupV1,
 			Auth:    Public,
+			Limit:   LimitCredential,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).VerifyEmail() },
 		},
 		Route{
@@ -96,6 +102,7 @@ func init() {
 			Pattern: "/auth/resend-verify",
 			Group:   GroupV1,
 			Auth:    Public,
+			Limit:   LimitMessage,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).ResendVerification() },
 		},
 		Route{
@@ -103,6 +110,7 @@ func init() {
 			Pattern: "/auth/request-otp",
 			Group:   GroupV1,
 			Auth:    Public,
+			Limit:   LimitMessage,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).RequestOTP() },
 		},
 		Route{
@@ -110,6 +118,7 @@ func init() {
 			Pattern: "/auth/verify-phone",
 			Group:   GroupV1,
 			Auth:    Public,
+			Limit:   LimitCredential,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).VerifyPhone() },
 		},
 		Route{
@@ -121,6 +130,7 @@ func init() {
 			Pattern: "/auth/refresh",
 			Group:   GroupV1,
 			Auth:    Public,
+			Limit:   LimitCredential,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).Refresh() },
 		},
 		Route{
@@ -140,6 +150,7 @@ func init() {
 			Pattern: "/account/deletion",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return identityHandler(d).RequestAccountDeletion() },
 		},
 	)

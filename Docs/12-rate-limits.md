@@ -313,13 +313,60 @@ eleven share one bucket per class and the first deployment throttles the entire 
 caller. Applying these limits **before** a trusted-proxy hop count or CIDR allow-list exists takes
 the blast radius of that gap from the two routes that have it today to eleven.
 
-**The other 75 routes are keyed on the authenticated subject and are unaffected**, because a user
-id, an administrator id and a driver token's job all survive a proxy untouched. **That is the
-scheduling consequence worth carrying forward:** SHIP-183a can ship 75 routes' limits immediately
-and must hold the eleven behind the deployment work. Splitting it that way is a smaller change and
-a safer one, and it is the reason this section exists rather than a sentence in §3.
+**The other 75 routes are unaffected by the proxy**, because a user id, an administrator id and a
+driver token's job all survive one untouched. **That is the scheduling consequence worth carrying
+forward:** SHIP-183a can ship those limits immediately and must hold the eleven behind the
+deployment work. Splitting it that way is a smaller change and a safer one, and it is the reason
+this section exists rather than a sentence in §3.
 
-## 9. Revisit triggers, collected
+> **Corrected by SHIP-183a: 74 of those 75 take a bucket, not all 75.** The count is 86 − 11, which
+> sweeps `GET /health` in with them — and `/health` is `Unlimited`, so it is keyed on nothing and
+> enforces its class by having none. The sentence above is right about the proxy and off by one
+> about the work. **SHIP-183a's *Done when* inherited the same figure**, so it reads "each of the 75
+> routes" against 74 that carry a limiter; §5's table is what was transcribed and it is the
+> authority. Worth stating rather than quietly fixing, because the next person to recount will get
+> 74 and needs to know which of the two figures was wrong.
+
+## 9. What SHIP-183a decided, which this document left open
+
+Three questions were named here as SHIP-183a's to answer. They are recorded here rather than only in
+the code, because the next change to any of them is a change to this document's reasoning.
+
+**One bucket per class per caller, not one per route.** §3's figures are budgets for a *kind* of
+work, and this document already said so where it justified `Upload`: thirty "covers a provider's four
+verification documents **and** a job's proof set in one burst", which are two routes sharing one
+allowance. Per-route buckets would silently multiply every figure by the number of routes in its
+class — 36 × 60 writes in a burst rather than 60 — and §7's conclusion that an override belongs at
+the class rather than the route is the same judgement reached from the other end. The key is
+`route:<class>:<caller>`.
+
+**The caller is `httpx.SubjectScope`, which is narrower than §5's wording.** §5 says the driver
+classes key on "the job" and the rest on "the subject". An account holder is keyed on the account,
+exactly as written. The other two credential systems are keyed on the **credential**, because
+`internal/admin`'s and `internal/delivery`'s grant accessors are unexported — deliberately, so that
+nothing outside those domains can read a grant at all — and exporting them for a rate-limit key would
+undo a separation `CLAUDE.md` names as an invariant.
+
+That is strictly tighter for the driver: one token is one job, so two links for one job are two
+buckets rather than one, and a leaked link is still bounded to the job it was issued for. **It
+loosens exactly one thing and the cost is worth naming rather than burying — an administrator who
+signs in again gets a fresh allowance**, because a new session is a new credential. That bypass is
+self-limiting: a sign-in costs an argon2id derivation and is itself `Credential`-classed, so it is a
+slower way to spend an allowance than waiting for the refill.
+
+**The limiter runs inside the auth guard, and this is the load-bearing one.** These classes key on
+the authenticated caller, and there is no caller until the guard has run. Wrapped the other way
+round, every unauthenticated request keys on the same value — `route:<class>:anonymous` — and the
+first attacker to empty that bucket refuses every anonymous request to every route in the class. A
+limiter converted into a denial of service is worse than no limiter. The consequence to state rather
+than discover: **traffic the guard refuses is not counted at all**, and bounding that is what §8's
+address-keyed classes are for.
+
+**The lever is two floating-point scalars, `RATE_LIMIT_BURST_SCALE` and `RATE_LIMIT_RATE_SCALE`**,
+both defaulting to 1.0, both bounded 0.01–100, applied to every class. Neither can reach zero: a
+class keeps a floor of one token and one millisecond, so these are a dial and not an off switch.
+
+## 10. Revisit triggers, collected
 
 | Trigger | What changes |
 |---|---|

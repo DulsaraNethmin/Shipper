@@ -35,6 +35,7 @@ func adminRoute() Route {
 		Pattern: "/admin/session-probe",
 		Group:   GroupV1,
 		Auth:    RequireAdmin,
+		Limit:   LimitWrite,
 		Handler: func(Deps) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if _, ok := authctx.SubjectFrom(r.Context()); ok {
@@ -95,7 +96,7 @@ func TestWithNoAdminGuardTheClassIsAbsentAndTheRouteRefusesToStart(t *testing.T)
 		}
 	}()
 
-	attachRoutes(http.NewServeMux(), []Route{adminRoute()}, GroupV1, testDeps(), g)
+	attachRoutes(http.NewServeMux(), []Route{adminRoute()}, GroupV1, testDeps(), g, testLimiter())
 }
 
 // Supplying a guard is the whole of what SHIP-147 has to do to serve the class: the route attaches,
@@ -109,7 +110,7 @@ func TestASuppliedAdminGuardServesAndGuardsTheRoute(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	attachRoutes(mux, []Route{adminRoute()}, GroupV1, testDeps(), g)
+	attachRoutes(mux, []Route{adminRoute()}, GroupV1, testDeps(), g, testLimiter())
 
 	probe := func(credential string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/admin/session-probe", nil)

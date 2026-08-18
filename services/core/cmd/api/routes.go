@@ -88,6 +88,7 @@ func guardsFor(driverToken, admin Guard) guards {
 func newRouter(
 	deps Deps,
 	idempotencyStore httpx.IdempotencyStore,
+	limiter httpx.RateLimiter,
 	authenticate httpx.Authenticator,
 	driverToken Guard,
 	admin Guard,
@@ -102,7 +103,7 @@ func newRouter(
 	// resolution, so nothing here can require a credential. Passing no guards makes that a
 	// startup panic rather than a route that 401s forever, and TestOperationalRoutesArePublic
 	// makes it a test failure before anyone gets that far.
-	attach(root, GroupOperational, deps, nil)
+	attach(root, GroupOperational, deps, nil, limiter)
 
 	// StripPrefix means every pattern inside the group is written without /v1, so a
 	// route moves between versions by being registered in a different group rather than
@@ -118,7 +119,7 @@ func newRouter(
 	// ServeMux writes as plain text. Normalising after storing would replay the raw form
 	// instead.
 	v1 := http.NewServeMux()
-	attach(v1, GroupV1, deps, protected)
+	attach(v1, GroupV1, deps, protected, limiter)
 
 	// ResolveSubject sits **outside** Idempotent, and that is the ordering SHIP-44 exists for.
 	//
@@ -165,6 +166,11 @@ func init() {
 			Pattern: "/health",
 			Group:   GroupOperational,
 			Auth:    Public,
+			// The only unlimited route on the manifest, and the reason is that the
+			// caller is the infrastructure: a load balancer and a container
+			// orchestrator poll this, so throttling it takes a *healthy* instance out
+			// of rotation — a limiter converted into an outage (Docs/12 §3).
+			Limit:   LimitUnlimited,
 			Handler: func(d Deps) http.Handler { return healthHandler(d) },
 		},
 		Route{
@@ -172,6 +178,7 @@ func init() {
 			Pattern: "/{$}",
 			Group:   GroupV1,
 			Auth:    Public,
+			Limit:   LimitPublicRead,
 			Handler: func(Deps) http.Handler { return apiRootHandler() },
 		},
 	)

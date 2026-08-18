@@ -1,86 +1,86 @@
-GET    /health                                  public       operational
-POST   /v1/account/deletion                     user         v1
-POST   /v1/admin/administrators                 admin        v1
-GET    /v1/admin/audit                          admin        v1
-GET    /v1/admin/disputes                       admin        v1
-GET    /v1/admin/disputes/{id}                  admin        v1
-POST   /v1/admin/disputes/{id}/resolution       admin        v1
-GET    /v1/admin/jobs                           admin        v1
-GET    /v1/admin/jobs/{id}                      admin        v1
-POST   /v1/admin/jobs/{id}/unpublish            admin        v1
-GET    /v1/admin/me                             admin        v1
-GET    /v1/admin/moderation/cancellations       admin        v1
-GET    /v1/admin/moderation/exceptions          admin        v1
-GET    /v1/admin/moderation/expiring-documents  admin        v1
-GET    /v1/admin/notes                          admin        v1
-POST   /v1/admin/notes                          admin        v1
-POST   /v1/admin/sessions                       public       v1
-DELETE /v1/admin/sessions/current               admin        v1
-GET    /v1/admin/suspensions                    admin        v1
-POST   /v1/admin/suspensions/{id}/approval      admin        v1
-GET    /v1/admin/users                          admin        v1
-POST   /v1/admin/users/{id}/standing            admin        v1
-POST   /v1/admin/users/{id}/suspension          admin        v1
-GET    /v1/admin/verifications                  admin        v1
-POST   /v1/admin/verifications/{id}/decision    admin        v1
-GET    /v1/admin/verifications/{id}/documents   admin        v1
-GET    /v1/app/minimum-version                  public       v1
-GET    /v1/app/policy                           public       v1
-POST   /v1/auth/login                           public       v1
-POST   /v1/auth/logout                          user         v1
-POST   /v1/auth/refresh                         public       v1
-POST   /v1/auth/register                        public       v1
-POST   /v1/auth/request-otp                     public       v1
-POST   /v1/auth/resend-verify                   public       v1
-GET    /v1/auth/sessions                        user         v1
-DELETE /v1/auth/sessions/{id}                   user         v1
-POST   /v1/auth/verify-email                    public       v1
-POST   /v1/auth/verify-phone                    public       v1
-GET    /v1/driver/jobs/{id}                     driver-token v1
-GET    /v1/driver/jobs/{id}/milestones          driver-token v1
-POST   /v1/driver/jobs/{id}/milestones          driver-token v1
-POST   /v1/driver/jobs/{id}/proof-uploads       driver-token v1
-GET    /v1/fleet/bids                           user         v1
-GET    /v1/fleet/jobs                           user         v1
-GET    /v1/fleet/jobs/{id}                      user         v1
-GET    /v1/fleet/profile                        user         v1
-PATCH  /v1/fleet/profile                        user         v1
-GET    /v1/fleet/vehicles                       user         v1
-POST   /v1/fleet/vehicles                       user         v1
-GET    /v1/fleet/vehicles/{id}                  user         v1
-PATCH  /v1/fleet/vehicles/{id}                  user         v1
-POST   /v1/fleet/vehicles/{id}/deactivate       user         v1
-POST   /v1/fleet/vehicles/{id}/reactivate       user         v1
-GET    /v1/jobs                                 user         v1
-POST   /v1/jobs                                 user         v1
-GET    /v1/jobs/{id}                            user         v1
-PATCH  /v1/jobs/{id}                            user         v1
-POST   /v1/jobs/{id}/award                      user         v1
-POST   /v1/jobs/{id}/bids                       user         v1
-GET    /v1/jobs/{id}/bids/received              user         v1
-PATCH  /v1/jobs/{id}/bids/{bid_id}              user         v1
-POST   /v1/jobs/{id}/bids/{bid_id}/counter      user         v1
-GET    /v1/jobs/{id}/bids/{bid_id}/history      user         v1
-GET    /v1/jobs/{id}/bids/{bid_id}/messages     user         v1
-POST   /v1/jobs/{id}/bids/{bid_id}/messages     user         v1
-POST   /v1/jobs/{id}/bids/{bid_id}/withdraw     user         v1
-POST   /v1/jobs/{id}/cancel                     user         v1
-GET    /v1/jobs/{id}/delivery/detail            user         v1
-GET    /v1/jobs/{id}/delivery/milestones        user         v1
-GET    /v1/jobs/{id}/delivery/proof             user         v1
-POST   /v1/jobs/{id}/disputes                   user         v1
-POST   /v1/jobs/{id}/driver                     user         v1
-POST   /v1/jobs/{id}/driver/link                user         v1
-POST   /v1/jobs/{id}/extend                     user         v1
-GET    /v1/jobs/{id}/history                    user         v1
-POST   /v1/jobs/{id}/milestones                 user         v1
-POST   /v1/jobs/{id}/proof-uploads              user         v1
-POST   /v1/notifications/device-tokens          user         v1
-DELETE /v1/notifications/device-tokens/current  user         v1
-GET    /v1/notifications/preferences            user         v1
-PUT    /v1/notifications/preferences            user         v1
-GET    /v1/provider/verification                user         v1
-GET    /v1/provider/verification/documents      user         v1
-POST   /v1/provider/verification/documents      user         v1
-POST   /v1/provider/verification/documents/uploads user         v1
-GET    /v1/{$}                                  public       v1
+GET    /health                                  public       unlimited    operational
+POST   /v1/account/deletion                     user         write        v1
+POST   /v1/admin/administrators                 admin        write        v1
+GET    /v1/admin/audit                          admin        read         v1
+GET    /v1/admin/disputes                       admin        read         v1
+GET    /v1/admin/disputes/{id}                  admin        read         v1
+POST   /v1/admin/disputes/{id}/resolution       admin        write        v1
+GET    /v1/admin/jobs                           admin        read         v1
+GET    /v1/admin/jobs/{id}                      admin        read         v1
+POST   /v1/admin/jobs/{id}/unpublish            admin        write        v1
+GET    /v1/admin/me                             admin        read         v1
+GET    /v1/admin/moderation/cancellations       admin        read         v1
+GET    /v1/admin/moderation/exceptions          admin        read         v1
+GET    /v1/admin/moderation/expiring-documents  admin        read         v1
+GET    /v1/admin/notes                          admin        read         v1
+POST   /v1/admin/notes                          admin        write        v1
+POST   /v1/admin/sessions                       public       credential   v1
+DELETE /v1/admin/sessions/current               admin        write        v1
+GET    /v1/admin/suspensions                    admin        read         v1
+POST   /v1/admin/suspensions/{id}/approval      admin        write        v1
+GET    /v1/admin/users                          admin        read         v1
+POST   /v1/admin/users/{id}/standing            admin        write        v1
+POST   /v1/admin/users/{id}/suspension          admin        write        v1
+GET    /v1/admin/verifications                  admin        read         v1
+POST   /v1/admin/verifications/{id}/decision    admin        write        v1
+GET    /v1/admin/verifications/{id}/documents   admin        read         v1
+GET    /v1/app/minimum-version                  public       public-read  v1
+GET    /v1/app/policy                           public       public-read  v1
+POST   /v1/auth/login                           public       credential   v1
+POST   /v1/auth/logout                          user         write        v1
+POST   /v1/auth/refresh                         public       credential   v1
+POST   /v1/auth/register                        public       message      v1
+POST   /v1/auth/request-otp                     public       message      v1
+POST   /v1/auth/resend-verify                   public       message      v1
+GET    /v1/auth/sessions                        user         read         v1
+DELETE /v1/auth/sessions/{id}                   user         write        v1
+POST   /v1/auth/verify-email                    public       credential   v1
+POST   /v1/auth/verify-phone                    public       credential   v1
+GET    /v1/driver/jobs/{id}                     driver-token read         v1
+GET    /v1/driver/jobs/{id}/milestones          driver-token read         v1
+POST   /v1/driver/jobs/{id}/milestones          driver-token write        v1
+POST   /v1/driver/jobs/{id}/proof-uploads       driver-token upload       v1
+GET    /v1/fleet/bids                           user         read         v1
+GET    /v1/fleet/jobs                           user         read         v1
+GET    /v1/fleet/jobs/{id}                      user         read         v1
+GET    /v1/fleet/profile                        user         read         v1
+PATCH  /v1/fleet/profile                        user         write        v1
+GET    /v1/fleet/vehicles                       user         read         v1
+POST   /v1/fleet/vehicles                       user         write        v1
+GET    /v1/fleet/vehicles/{id}                  user         read         v1
+PATCH  /v1/fleet/vehicles/{id}                  user         write        v1
+POST   /v1/fleet/vehicles/{id}/deactivate       user         write        v1
+POST   /v1/fleet/vehicles/{id}/reactivate       user         write        v1
+GET    /v1/jobs                                 user         read         v1
+POST   /v1/jobs                                 user         write        v1
+GET    /v1/jobs/{id}                            user         read         v1
+PATCH  /v1/jobs/{id}                            user         write        v1
+POST   /v1/jobs/{id}/award                      user         write        v1
+POST   /v1/jobs/{id}/bids                       user         write        v1
+GET    /v1/jobs/{id}/bids/received              user         read         v1
+PATCH  /v1/jobs/{id}/bids/{bid_id}              user         write        v1
+POST   /v1/jobs/{id}/bids/{bid_id}/counter      user         write        v1
+GET    /v1/jobs/{id}/bids/{bid_id}/history      user         read         v1
+GET    /v1/jobs/{id}/bids/{bid_id}/messages     user         read         v1
+POST   /v1/jobs/{id}/bids/{bid_id}/messages     user         write        v1
+POST   /v1/jobs/{id}/bids/{bid_id}/withdraw     user         write        v1
+POST   /v1/jobs/{id}/cancel                     user         write        v1
+GET    /v1/jobs/{id}/delivery/detail            user         read         v1
+GET    /v1/jobs/{id}/delivery/milestones        user         read         v1
+GET    /v1/jobs/{id}/delivery/proof             user         read         v1
+POST   /v1/jobs/{id}/disputes                   user         write        v1
+POST   /v1/jobs/{id}/driver                     user         write        v1
+POST   /v1/jobs/{id}/driver/link                user         write        v1
+POST   /v1/jobs/{id}/extend                     user         write        v1
+GET    /v1/jobs/{id}/history                    user         read         v1
+POST   /v1/jobs/{id}/milestones                 user         write        v1
+POST   /v1/jobs/{id}/proof-uploads              user         upload       v1
+POST   /v1/notifications/device-tokens          user         write        v1
+DELETE /v1/notifications/device-tokens/current  user         write        v1
+GET    /v1/notifications/preferences            user         read         v1
+PUT    /v1/notifications/preferences            user         write        v1
+GET    /v1/provider/verification                user         read         v1
+GET    /v1/provider/verification/documents      user         read         v1
+POST   /v1/provider/verification/documents      user         write        v1
+POST   /v1/provider/verification/documents/uploads user         upload       v1
+GET    /v1/{$}                                  public       public-read  v1

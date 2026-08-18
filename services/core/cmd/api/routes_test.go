@@ -18,6 +18,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 )
 
 // testSigningKey is a throwaway, thirty-two bytes so the keyset's own length rule is satisfied.
@@ -197,8 +198,23 @@ func testAccessToken(t *testing.T, role identity.Role) (raw string, userID, sess
 	return token.Value, userID, sessionID
 }
 
+// testLimiter builds a fresh in-memory token bucket for one router (SHIP-183a).
+//
+// Fresh per call rather than shared, deliberately. Every route in a class spends from one bucket
+// per caller, so a package-level limiter would carry one test's spending into the next and produce
+// a 429 whose cause is in a different function — the flakiest possible failure. A router is the
+// unit a limiter belongs to here, exactly as an idempotency store is.
+//
+// It is the memory implementation rather than a stub because the arithmetic is what the wiring
+// tests are about: that the 74 subject-keyed routes charge the right bucket, that the refusal
+// carries an honest wait. A stub that always allowed would leave all of that unexercised, and one
+// that always refused would test nothing but the error path.
+func testLimiter() *ratelimit.MemoryLimiter {
+	return ratelimit.NewMemory(clock.System{})
+}
+
 func testRouter() http.Handler {
-	return newRouter(testDeps(), idempotency.NewMemoryStore(), testAuthenticator(), testDriverGuard(), testAdminGuard())
+	return newRouter(testDeps(), idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(), testDriverGuard(), testAdminGuard())
 }
 
 // SHIP-6's acceptance criterion: GET /health returns 200 with version and commit.

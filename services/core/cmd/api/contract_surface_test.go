@@ -141,7 +141,7 @@ func newContractWorld(t *testing.T) *contractWorld {
 
 	w := &contractWorld{
 		pool: pool,
-		router: newRouter(deps, idempotency.NewMemoryStore(), testAuthenticator(),
+		router: newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(),
 			testDriverGuard(), adminGuard),
 	}
 

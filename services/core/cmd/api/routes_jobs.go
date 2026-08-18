@@ -39,6 +39,7 @@ func init() {
 			Pattern: "/jobs",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).List() },
 		},
 		Route{
@@ -46,6 +47,7 @@ func init() {
 			Pattern: "/jobs",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).Create() },
 		},
 		Route{
@@ -53,6 +55,7 @@ func init() {
 			Pattern: "/jobs/{id}",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).Detail() },
 		},
 		Route{
@@ -60,6 +63,7 @@ func init() {
 			Pattern: "/jobs/{id}",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).Update() },
 		},
 		Route{
@@ -70,6 +74,7 @@ func init() {
 			Pattern: "/jobs/{id}/cancel",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).Cancel() },
 		},
 		Route{
@@ -102,6 +107,7 @@ func init() {
 			Pattern: "/jobs/{id}/history",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitRead,
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).History() },
 		},
 		Route{
@@ -113,6 +119,7 @@ func init() {
 			Pattern: "/jobs/{id}/extend",
 			Group:   GroupV1,
 			Auth:    RequireUser,
+			Limit:   LimitWrite,
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).Extend() },
 		},
 	)
