@@ -2129,15 +2129,30 @@ ok "the account's name and both contact channels are the pseudonym, derived from
 # **Not a valid address and not a valid number**, which is what makes the pseudonymised account
 # unreachable through the front door by construction rather than by a check somebody remembered.
 # The account no longer exists to sign-in under either the old address or the new one.
+# The address that was replaced: 400 with SHIP-41's one code for both halves, which is exactly what
+# an address that never had an account gets. That is the point — the account is gone in the only
+# sense a client can observe.
 status="$(post_json "verify-pseudonym-old-signin-$$" /v1/auth/login \
   "{\"email\":\"$pseudo_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Gone\"}" \
   "$WORKDIR/pseudonym-old-signin.json")"
-[[ "$status" == "401" ]] || { cat "$WORKDIR/pseudonym-old-signin.json"; fail "signing in with the deleted address returned $status, want 401"; }
+[[ "$status" == "400" ]] || { cat "$WORKDIR/pseudonym-old-signin.json"; fail "signing in with the deleted address returned $status, want 400"; }
+[[ "$(json "$WORKDIR/pseudonym-old-signin.json" '["error"]["code"]')" == "identity_credentials_invalid" ]] \
+  || fail "the deleted address is refused with something other than SHIP-41's one code for both halves"
+
+# **The pseudonym that replaced it is refused a whole layer earlier — 422, at validation, naming the
+# email field.** That is the assertion, not the refusal: the store is never reached, because
+# `deleted:<id>` does not parse as an address. A `identity_credentials_invalid` here would mean it
+# had been looked up and merely not matched, which is a much weaker property and one a later change
+# to the hasher could undo.
 status="$(post_json "verify-pseudonym-new-signin-$$" /v1/auth/login \
   "{\"email\":\"$pseudo_token\",\"password\":\"$login_password\",\"device_label\":\"Verify Gone\"}" \
   "$WORKDIR/pseudonym-new-signin.json")"
-[[ "$status" == "400" ]] || { cat "$WORKDIR/pseudonym-new-signin.json"; fail "signing in with the pseudonym returned $status, want 400 — it must not parse as an address"; }
-ok "neither the address that was replaced nor the pseudonym that replaced it can sign the account in"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/pseudonym-new-signin.json"; fail "signing in with the pseudonym returned $status, want 422 — it must be refused at validation, before the store"; }
+[[ "$(python3 -c 'import json,sys
+print(" ".join(sorted(d["field"] for d in json.load(open(sys.argv[1]))["error"]["details"])))' \
+  "$WORKDIR/pseudonym-new-signin.json")" == "email" ]] \
+  || { cat "$WORKDIR/pseudonym-new-signin.json"; fail "the pseudonym was not refused as an unusable email address"; }
+ok "the address that was replaced is refused like an address with no account, and the pseudonym never reaches the store"
 
 # **The two refusals above are the only failed sign-ins in this file, and SHIP-47 charges the
 # per-address bucket on a refused credential.** Every request in a `make verify` run arrives from
