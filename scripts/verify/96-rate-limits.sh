@@ -26,6 +26,10 @@
 # sign-in buckets at both ends. **Nothing here is keyed on the address.** The 74 routes SHIP-183a
 # enforces key on the authenticated subject, and this section mints a subject of its own from a
 # fresh UUID, so its buckets cannot be reached by another section or another tree.
+#
+# 97-trusted-proxy.sh is where the address-keyed classes are demonstrated, and it solves the same
+# problem the other way round: it configures a trusted proxy and mints a *client address* of its
+# own, so its buckets are unreachable by anything else on the machine.
 
 ticket "SHIP-183a  every authenticated route is served under a rate-limit class"
 
@@ -108,16 +112,13 @@ status="$(read_status /v1/auth/sessions "$other_token")"
 [[ "$status" != "429" ]] || fail "a second subject was refused from the first subject's bucket"
 ok "a second caller is unaffected, so the bucket is keyed on the subject rather than shared"
 
-# The eleven address-keyed routes carry their class and are deliberately not enforced until
-# SHIP-183b reads a forwarded header from a configured trusted proxy. At this scale an enforced
-# PublicRead would hold 12, so twenty requests without a refusal is the demonstration.
-for _ in $(seq 1 20); do
-  status="$(curl -s -o /dev/null -w '%{http_code}' \
-    "http://localhost:$VERIFY_PORT/v1/app/policy")"
-  [[ "$status" != "429" ]] || fail \
-    "GET /v1/app/policy was throttled. It keys on the client address, which is the load balancer's until SHIP-183b — enforcing it now throttles every caller as one"
-done
-ok "the address-keyed routes carry their class and are not yet enforced (SHIP-183b)"
+# The eleven address-keyed routes were unenforced here until SHIP-183b, and this is where the
+# check that they stayed that way used to sit. **It moved rather than being deleted**: 97 owns
+# them now, and it has to, because a check on an address-keyed bucket cannot run in this section.
+# Everything here reaches the service from 127.0.0.1, and so does every other section and every
+# other worktree — so the bucket under test would be one this section does not own. 97 restarts
+# with a trusted-proxy hop count and mints an address of its own, which is the only fence that
+# works on a key shared by every caller on the machine.
 
 # /health is the one unlimited route, because the caller is the infrastructure and throttling it
 # takes a healthy instance out of rotation.

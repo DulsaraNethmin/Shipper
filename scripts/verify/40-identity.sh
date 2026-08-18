@@ -951,7 +951,7 @@ ticket "SHIP-41  POST /v1/auth/login returns an access and refresh token pair"
 # leave it empty and the *next* run would fail here, with a 429 that looks like a broken endpoint.
 #
 # **Do not compose that bucket's key from a literal.** `localhost` resolves to `::1` rather than to
-# `127.0.0.1` on this machine, so a key built as `rl:v1:signin:address:127.0.0.1` names nothing and
+# `127.0.0.1` on this machine, so a key built as `rl:v1:credential:address:127.0.0.1` names nothing and
 # a comparison against it passes by matching two empty strings. Scan for the pattern, as below.
 #
 # Cleared once, at the point sign-ins begin, so the run starts from a known state — and the state is
@@ -964,10 +964,21 @@ ticket "SHIP-41  POST /v1/auth/login returns an access and refresh token pair"
 # when it was written, and nothing checks it.** The assertion below checks the thing the sentence
 # was standing in for, so the next section that signs in early breaks nothing and corrects no
 # comment. It is a precondition rather than an acceptance criterion, so it counts no check.
-redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
-  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+# credential_bucket_keys — every key Docs/12's Credential class leaves behind.
+#
+# **Two namespaces rather than one, since SHIP-183b.** The account half is `signin:account:`; the
+# address half is `credential:address:`, and it was renamed when it stopped being sign-in's alone —
+# refresh and both verification endpoints now spend the same bucket, because Docs/12 §9 puts one
+# bucket on a class and never one on a route. A clear that kept scanning `rl:v1:signin:*` would
+# empty the account keys, leave the address bucket exactly as full as it was, and report success.
+credential_bucket_keys() {
+  redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*'
+  redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:credential:*'
+}
 
-[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' | wc -l | tr -d ' ')" == "0" ]] \
+credential_bucket_keys | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+
+[[ "$(credential_bucket_keys | wc -l | tr -d ' ')" == "0" ]] \
   || fail "the sign-in rate-limit buckets are not empty after the clear, so this section's sign-ins start throttled"
 
 # The account registered above, whose password is the literal this file already knows. Signing in
@@ -1402,9 +1413,11 @@ ticket "SHIP-47  repeated sign-in failures are throttled per account and per IP"
 # reasoned about: an expected figure derived from counting other sections' refusals is arithmetic
 # somebody has to redo whenever one of them changes, and it would be wrong quietly.
 #
-# The per-account buckets go with it, so both halves below start from capacity.
-redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
-  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+# The per-account buckets go with it, so both halves below start from capacity. Both namespaces
+# are cleared — see credential_bucket_keys — because since SHIP-183b the address half is spent by
+# refresh and by both verification endpoints as well, and the arithmetic at the end of this block
+# subtracts only what this block itself spent.
+credential_bucket_keys | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
 
 throttle_email="throttle-$$@example.com"
 status="$(post_json "verify-throttle-register-$$" /v1/auth/register \
@@ -1507,9 +1520,9 @@ ok "an account with a full bucket of its own is still refused from an exhausted 
 #
 # Deliberately at the end and deliberately narrow: it deletes the per-address buckets and nothing
 # else, so the per-account state above it is untouched and the checks that made it stay meaningful.
-cleared="$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' \
+cleared="$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:credential:address:*' \
   | xargs -r redis-cli -u "$REDIS_URL" del 2>/dev/null || true)"
-remaining="$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' | wc -l | tr -d ' ')"
+remaining="$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:credential:address:*' | wc -l | tr -d ' ')"
 [[ "$remaining" == "0" ]] || fail "$remaining per-address buckets survived the clean-up"
 status="$(post_json "verify-throttle-cleared-$$" /v1/auth/login \
   "{\"email\":\"$devices_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Cleared\"}" \
@@ -1522,7 +1535,7 @@ ticket "SHIP-169  a signed-in person can request deletion and is told when it co
 
 # Deliberately after SHIP-47, and deliberately doing no *failed* sign-ins.
 #
-# The section above ends by emptying `rl:v1:signin:address:*`, because every request in this run
+# The section above ends by emptying `rl:v1:credential:address:*`, because every request in this run
 # arrives from 127.0.0.1 and a later track that got a 429 would look like a broken endpoint rather
 # than like this file's leftovers. That clean-up has to stay the last thing the file does to those
 # keys. Nothing here spends from them — SHIP-47 charges the bucket on a *refused* credential only
@@ -1897,7 +1910,7 @@ ok "one row across the whole lifecycle, and the row holds the state the person w
 # Nothing here charged a sign-in bucket, so SHIP-47's clean-up above is still the last word on
 # them. Asserted rather than assumed: the whole file's rate-limit hygiene depends on it, and a
 # later track's 429 would read as its own endpoint being broken.
-[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' | wc -l | tr -d ' ')" == "0" ]] \
+[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:credential:address:*' | wc -l | tr -d ' ')" == "0" ]] \
   || fail "this section left per-address sign-in buckets behind, which a later track would be throttled by"
 ok "no per-address sign-in bucket was spent here, so SHIP-47's clean-up still holds at the end of the file"
 
@@ -2175,7 +2188,7 @@ ok "the address that was replaced is refused like an address with no account, an
 # section's leftovers — which is the SHIP-47 section's own argument, applied to the one place after
 # it that spends from the bucket. Cleared here rather than at the end, so the last check of the file
 # is still the assertion and not the tidy-up.
-redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' \
+redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:credential:address:*' \
   | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
 
 # Every session the account still held. A handset holding a refresh token issued last week keeps
@@ -2330,7 +2343,7 @@ ok "and this file leaves no deletion request due, so the five later worker start
 # those keys. This section is the only one after SHIP-47's that spends from them — two refused
 # sign-ins against a deleted account — and it clears them where it spends them. Asserted here rather
 # than assumed, because a later track's 429 would read as its own endpoint being broken.
-[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' | wc -l | tr -d ' ')" == "0" ]] \
+[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:credential:address:*' | wc -l | tr -d ' ')" == "0" ]] \
   || fail "this section left per-address sign-in buckets behind, which a later track would be throttled by"
 [[ "$(post_json "verify-pseudonym-throttle-$$" /v1/auth/login \
   "{\"email\":\"$pseudo_customer_email\",\"password\":\"$login_password\",\"device_label\":\"Verify Cleared\"}" \

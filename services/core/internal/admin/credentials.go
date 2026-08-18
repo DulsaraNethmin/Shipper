@@ -699,9 +699,19 @@ type signInLimits struct {
 // "addresses somebody believes are administrators". Hashing costs nothing — the key is only ever
 // compared with itself.
 //
-// The prefix is `admin-signin:` rather than `signin:` so that an administrator's attempts and a
-// user's attempts against the same address are separate allowances. They are separate systems, and
-// a shared bucket would let failures against one throttle the other.
+// The prefix is `admin-` rather than bare, so that an administrator's attempts and a user's
+// attempts from the same network address are separate allowances. They are separate systems by an
+// invariant CLAUDE.md names, and a shared bucket would let failures against one throttle sign-in to
+// the other.
+//
+// The address half was renamed `admin-credential:address:` at SHIP-183b to match the class it
+// belongs to, because internal/identity's equivalent stopped being sign-in's alone: refresh, email
+// verification and phone verification now spend from one `credential:address:` bucket there
+// (Docs/12 §9's one-bucket-per-class rule). This domain has a single Credential route, so the
+// rename is legibility rather than a change in what is counted — but the pair now reads as two
+// instances of one class instead of two unrelated keys. The cost of them being two, stated rather
+// than buried: an attacker probing both surfaces from one address gets thirty on each rather than
+// thirty in total. Docs/12 §11 records it.
 func (c *Credentials) signInBuckets(cmd SignInCommand) (signInLimits, error) {
 	ip := strings.TrimSpace(cmd.ClientIP)
 	if ip == "" {
@@ -716,7 +726,7 @@ func (c *Credentials) signInBuckets(cmd SignInCommand) (signInLimits, error) {
 	account := sha256.Sum256([]byte(cmd.Email))
 	return signInLimits{
 		accountKey: "admin-signin:account:" + hex.EncodeToString(account[:]),
-		addressKey: "admin-signin:address:" + ip,
+		addressKey: "admin-credential:address:" + ip,
 	}, nil
 }
 

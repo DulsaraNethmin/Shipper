@@ -425,9 +425,11 @@ ok "neither refusal touched the job or the table"
 #
 # `make verify` runs every request from 127.0.0.1, so the per-address bucket administrator sign-in
 # uses is shared with every other section and with every concurrent worktree. The keys are
-# `rl:v1:admin-signin:*` — a different namespace from identity's `rl:v1:signin:*`, because an
-# administrator's failed attempts and a user's are separate allowances — and they are deleted before
-# the first sign-in and after the last, exactly as 40-identity.sh does with its own.
+# `rl:v1:admin-signin:account:*` and `rl:v1:admin-credential:address:*` — a different namespace from
+# identity's, because an administrator's failed attempts and a user's are separate allowances — and
+# they are deleted before the first sign-in and after the last, exactly as 40-identity.sh does with
+# its own. The address half carries the class's name rather than sign-in's since SHIP-183b, which is
+# where identity's stopped being sign-in's alone.
 #
 # # The bootstrap administrator is inserted with SQL, and there is no endpoint that would do it
 #
@@ -448,9 +450,16 @@ ok "neither refusal touched the job or the table"
 
 ticket "SHIP-147  administrator sign-in is a separate system, and a user token cannot reach it"
 
+# Two patterns, since SHIP-183b renamed the address half to `admin-credential:address:` to match
+# the class it belongs to. The account half is still `admin-signin:account:`. Clearing only the
+# first would report a clean namespace and leave the address bucket full for the next section.
+admin_limit_keys() {
+  redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:admin-signin:*'
+  redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:admin-credential:*'
+}
+
 admin_clear_limits() {
-  redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:admin-signin:*' \
-    | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+  admin_limit_keys | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
 }
 admin_clear_limits
 
@@ -630,7 +639,7 @@ ok "administrator sign-in is state-changing and is refused without an idempotenc
 # worktree, so they are emptied rather than left to refill on a timer. Deliberately at the end and
 # deliberately narrow: it removes this endpoint's keys and nothing else.
 admin_clear_limits
-[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:admin-signin:*' | wc -l | tr -d ' ')" == "0" ]] \
+[[ "$(admin_limit_keys | wc -l | tr -d ' ')" == "0" ]] \
   || fail "administrator sign-in buckets survived the clean-up"
 ok "the administrator sign-in buckets are cleared, so a later section is not throttled by this one"
 
@@ -2324,11 +2333,15 @@ admin_clear_limits
 # otherwise leave the bucket full and the *next* run would fail with a 429 that looks like a broken
 # endpoint.
 #
-# `admin_clear_limits` above clears `rl:v1:admin-signin:*`, which is a separate keyspace — an
+# `admin_clear_limits` above clears the administrator keyspace, which is a separate one — an
 # administrator's failures and a user's against one address are separate allowances (see
-# credentials.go). This clears the user one.
-redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
-  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+# credentials.go). This clears the user one, in both of its namespaces: the account half is
+# `signin:account:` and the address half is `credential:address:`, which is shared by sign-in,
+# refresh and both verification endpoints since SHIP-183b.
+for pattern in 'rl:v1:signin:*' 'rl:v1:credential:*'; do
+  redis-cli -u "$REDIS_URL" --scan --pattern "$pattern" \
+    | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+done
 
 # standing <token> <key> <user-id> <body> <name> — one attempt, answering with its status.
 standing() {

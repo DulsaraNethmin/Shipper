@@ -412,12 +412,34 @@ go build -o "$WORKDIR/shipper-api" \
 popd >/dev/null
 ok "service built"
 
+# The global rate-limit lever is opened all the way for the harness, and the reason is a property
+# of the harness rather than a convenience (SHIP-183b).
+#
+# Six of the routes SHIP-183b enforces key on the **client address**, and every request this script
+# makes arrives from 127.0.0.1 — so the whole harness is one caller, and so is every other worktree
+# on the machine. The Message class holds ten per address with a token back every five minutes,
+# against roughly seventy registrations, OTP requests and resend-verify calls across the sections
+# below. At the documented figures the harness throttles itself somewhere in section 40 and every
+# section after it fails for a reason that has nothing to do with what it was testing.
+#
+# Raising the lever is the answer rather than clearing buckets between sections, because a bucket
+# keyed on 127.0.0.1 is one no section owns: another tree's run spends it too, and a check that
+# cleared it would be clearing that run's as well.
+#
+# **This does not weaken what the harness demonstrates about the limits**, because the two sections
+# that assert on them set their own scale and restart the service to do it: 96-rate-limits.sh at
+# 0.02 for the subject-keyed classes, 97-trusted-proxy.sh at 0.02 for the address-keyed ones. It
+# also does not touch the Credential class at all — those five routes are enforced inside
+# internal/identity and internal/admin against constants this lever does not reach (Docs/12 §11),
+# which is what leaves 40-identity.sh's sign-in throttle checks measuring the documented figures.
 SHIPPER_ENV=development \
 HTTP_PORT="$VERIFY_PORT" \
 LOG_FORMAT=json \
 LOG_LEVEL=debug \
 DATABASE_URL="$DATABASE_URL" \
 REDIS_URL="$REDIS_URL" \
+RATE_LIMIT_BURST_SCALE=100 \
+RATE_LIMIT_RATE_SCALE=100 \
   "$WORKDIR/shipper-api" >"$WORKDIR/server.log" 2>&1 &
 SERVER_PID=$!
 

@@ -17,6 +17,7 @@ import (
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/redistest"
 )
 
 // The identity routes through the real router (SHIP-30 onwards).
@@ -255,9 +256,20 @@ func TestEveryIdentityRouteIsServedAndPublic(t *testing.T) {
 //
 // Reachable with no database because an empty token is refused before the pool is looked at,
 // which is also the property that stops a guessing loop costing a connection each.
+//
+// **A cache it does need, since SHIP-183b.** Refresh and both verification endpoints are Docs/12's
+// Credential class, and the class's per-address bucket is consulted before the credential is —
+// which Docs/12 §6 requires, because honouring a valid credential while throttled makes every
+// wrong guess a 429 and the right one a 200 and hands an attacker an oracle. The limit fails
+// closed with 503 when it cannot be established (§4), so a test that supplied no Redis would be
+// asserting the shape of an outage rather than the shape of a refusal. The property this test is
+// actually about — that the *pool* is untouched — is unchanged.
 func TestVerifyEmailRefusesAnEmptyToken(t *testing.T) {
+	client, _ := redistest.Client(t)
+
 	deps := testDeps()
 	deps.Pool = nil
+	deps.Redis = client
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/auth/verify-email", strings.NewReader(`{"token":""}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -634,8 +646,13 @@ func TestRefreshIsReachableAndPublic(t *testing.T) {
 // 400 rather than 401: SHIP-50's interceptor refreshes on a 401, and a 401 from this endpoint is
 // the one answer that can send it round the loop again.
 func TestRefreshRefusesAnUnusableTokenWithOneCode(t *testing.T) {
+	// A cache, for the reason TestVerifyEmailRefusesAnEmptyToken records: the Credential
+	// class's address bucket is consulted before the token is, and it fails closed.
+	client, _ := redistest.Client(t)
+
 	deps := testDeps()
 	deps.Pool = nil
+	deps.Redis = client
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/auth/refresh", strings.NewReader(`{"refresh_token":""}`))
 	req.Header.Set("Content-Type", "application/json")

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -66,6 +67,7 @@ type Config struct {
 	Geocoding    Geocoding
 	Pagination   Pagination
 	RateLimits   RateLimits
+	TrustedProxy TrustedProxy
 	Storage      Storage
 	Verification Verification
 	App          App
@@ -312,6 +314,76 @@ type RateLimits struct {
 	// RateScale multiplies every class's sustained rate, which means it divides the interval:
 	// at 2.0 a token comes back twice as fast.
 	RateScale float64
+}
+
+// TrustedProxy decides whether a forwarded header may be believed (SHIP-183b).
+//
+// # The problem it exists for
+//
+// Eleven of the 86 routes key their rate limit on the client's network address (Docs/12 §8), and
+// an address is the one thing about a request that the request itself does not carry. There are
+// two ways to be wrong about it and both are unacceptable in production:
+//
+//   - **Honour `X-Forwarded-For` unconditionally.** The header is whatever the client wrote unless
+//     a proxy overwrote it, so every caller picks their own bucket and the limit is evaded
+//     completely — which is worse than having none, because it looks like one.
+//   - **Never read it.** Behind a load balancer every request presents the balancer's address, so
+//     all eleven routes collapse into one bucket per class and the first caller throttles the
+//     world.
+//
+// The way out is not a better guess. It is a deployment fact — *how many proxies are in front of
+// this process, or which addresses they have* — that only whoever runs the deployment knows. This
+// is where they say it.
+//
+// # Trusting nothing is the default, and it is the safe end
+//
+// Both fields are empty unless a deployment sets one, and empty means [RemoteAddr] alone. That is
+// exactly the behaviour SHIP-47 shipped and Docs/11 §9 recorded, so a deployment that says nothing
+// gets no new exposure — it gets the shared-bucket problem, which is a throttling fault rather
+// than a bypass. **The unsafe direction is the one that needs configuration**, which is the right
+// way round for a value nobody may remember to set.
+//
+// # Why the two are mutually exclusive
+//
+// They answer the same question by different means and Docs/09's *Done when* offers them as
+// alternatives — "a configured trusted-proxy hop count **or** CIDR allow-list". Setting both would
+// need a composition rule that nobody has argued for, and the plausible readings disagree: does
+// the allow-list gate whether the header is read at all, or does it filter which hops the count
+// skips? A deployment that set both would get whichever one this file happened to prefer. Refusing
+// at startup is how that stays a decision rather than an accident.
+type TrustedProxy struct {
+	// Hops is how many proxies sit between the client and this process.
+	//
+	// It is positional and ignores the values entirely, which is what makes it unspoofable: the
+	// chain is read right to left, the rightmost entry is the peer this process actually
+	// accepted the connection from, and a client's invented entries can only ever be further
+	// left than the real ones. A caller who prepends ten addresses moves the true client
+	// address ten places left and the count still lands on it.
+	//
+	// Zero means no forwarded header is read.
+	Hops int
+
+	// Networks is the set of addresses a proxy may present from.
+	//
+	// The peer must be inside one or the header is ignored outright, which is what stops a
+	// caller reaching the service directly and choosing their own bucket. Trusted entries are
+	// then skipped from the right, and the first untrusted one is the client.
+	//
+	// **Keep these to the addresses the proxies actually have.** A range wide enough to contain
+	// addresses a client could also write into the header — `10.0.0.0/8` where the balancer is
+	// one host — reopens the bypass from inside, because a spoofed entry that looks trusted is
+	// skipped rather than believed. [TrustedProxy.Hops] has no equivalent weakness and is the
+	// better choice wherever the count is stable.
+	//
+	// Empty means no forwarded header is read.
+	Networks []netip.Prefix
+}
+
+// Configured reports whether a deployment has said anything about proxies.
+//
+// False is the default and means RemoteAddr alone.
+func (t TrustedProxy) Configured() bool {
+	return t.Hops > 0 || len(t.Networks) > 0
 }
 
 // Email configures the transactional email adapter (SHIP-32), first consumed by the
@@ -890,6 +962,18 @@ func Load() (*Config, error) {
 			BurstScale: l.boundedFloat("RATE_LIMIT_BURST_SCALE", 1.0, 0.01, 100.0),
 			RateScale:  l.boundedFloat("RATE_LIMIT_RATE_SCALE", 1.0, 0.01, 100.0),
 		},
+		TrustedProxy: TrustedProxy{
+			// Both default to trusting nothing, which is RemoteAddr alone and is the
+			// behaviour that shipped at SHIP-47. A deployment that says nothing is not
+			// exposed by saying nothing; it merely shares a bucket behind a balancer.
+			//
+			// Eight is well past any real chain — a CDN, a WAF, a load balancer and a
+			// service mesh is four — and its job is to make a misplaced digit a startup
+			// failure rather than a count that walks off the end of every header and
+			// silently falls back.
+			Hops:     l.boundedInt("TRUSTED_PROXY_HOPS", 0, 0, 8),
+			Networks: l.prefixes("TRUSTED_PROXY_NETWORKS", nil),
+		},
 		Storage: Storage{
 			// The published host port, not the compose-internal name — see [Storage.Endpoint].
 			// It matches the Makefile's STORAGE_ENDPOINT, which derives the port rather than
@@ -1051,6 +1135,54 @@ func (l *loader) csv(key string, def []string) []string {
 	}
 	if len(out) == 0 {
 		l.errf("%s: must list at least one value", key)
+		return def
+	}
+	return out
+}
+
+// prefixes reads a comma-separated list of CIDR networks, accepting a bare address as the network
+// containing only itself (SHIP-183b).
+//
+// A bare address is accepted because that is what a deployment with one fixed balancer will write,
+// and making them append /32 to it is a way to be refused for being right. It is normalised to a
+// prefix here so that the matching code has one shape to handle rather than two.
+//
+// Every prefix is stored masked, so `10.1.2.3/8` is read as `10.0.0.0/8` rather than as a prefix
+// whose host bits quietly make it match nothing. An unparseable entry is an error rather than a
+// skip: a typo in an allow-list is a proxy that stops being trusted, and the symptom of that is
+// every request behind it sharing one bucket — a throttling incident whose cause is one character
+// in an environment variable nobody would think to re-read.
+func (l *loader) prefixes(key string, def []netip.Prefix) []netip.Prefix {
+	v, ok := l.lookup(key)
+	if !ok {
+		return def
+	}
+
+	var out []netip.Prefix
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		if p, err := netip.ParsePrefix(part); err == nil {
+			out = append(out, p.Masked())
+			continue
+		}
+
+		addr, err := netip.ParseAddr(part)
+		if err != nil {
+			l.errf("%s: %q is neither a network nor an address", key, part)
+			continue
+		}
+		// Unmapped, so that ::ffff:10.0.0.1 and 10.0.0.1 are one network rather than two
+		// that never match the same request. The resolver unmaps before it compares.
+		addr = addr.Unmap()
+		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+
+	if len(out) == 0 {
+		l.errf("%s: must list at least one network", key)
 		return def
 	}
 	return out
@@ -1314,6 +1446,18 @@ func (l *loader) validate(cfg *Config) {
 
 	if cfg.Log.Format != "json" && cfg.Log.Format != "text" {
 		l.errf("LOG_FORMAT: %q is not a format (want json or text)", cfg.Log.Format)
+	}
+
+	// Docs/09's SHIP-183b offers these as alternatives — "a configured trusted-proxy hop count
+	// *or* CIDR allow-list" — and they answer the same question by different means. Composing
+	// them needs a rule nobody has argued for, and the readings disagree about what it would be,
+	// so a deployment setting both would get whichever this file happened to prefer. See
+	// [TrustedProxy].
+	if cfg.TrustedProxy.Hops > 0 && len(cfg.TrustedProxy.Networks) > 0 {
+		l.errf("TRUSTED_PROXY_HOPS (%d) and TRUSTED_PROXY_NETWORKS (%d network(s)) cannot both "+
+			"be set: they are two ways to answer the same question and there is no agreed rule "+
+			"for combining them. Set the hop count where it is stable, the networks otherwise",
+			cfg.TrustedProxy.Hops, len(cfg.TrustedProxy.Networks))
 	}
 
 	if cfg.Database.MaxIdleConns > cfg.Database.MaxOpenConns {

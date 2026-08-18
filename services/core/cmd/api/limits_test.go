@@ -12,21 +12,32 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 )
 
-// SHIP-183a's acceptance criteria, and the document they are transcribed from.
+// SHIP-183a's and SHIP-183b's acceptance criteria, and the document they are transcribed from.
 //
-// The *Done when* has three clauses and each has a test below:
+// SHIP-183a's *Done when* has three clauses:
 //
 //   - every subject-keyed route enforces its class and answers a typed error with an honest
 //     Retry-After — TestASubjectKeyedRouteRefusesAtCapacity, TestARefusalCarriesAnHonestRetryAfter;
 //   - a route registered without a limit fails a gate rather than defaulting to unlimited —
 //     TestARouteWithNoClassDoesNotRegister, TestARouteWithNoClassIsNotAttached;
-//   - the eleven address-keyed routes carry their class and are not yet enforced —
-//     TestAddressKeyedRoutesCarryTheirClassAndAreNotEnforced.
+//   - the eleven address-keyed routes carry their class and are not yet enforced — which
+//     SHIP-183b is what retired, so the test holding it is now
+//     TestTheElevenAddressKeyedRoutesEnforceTheirClass rather than its negation.
+//
+// SHIP-183b's has two, and the second is the one worth being careful about:
+//
+//   - the eleven routes Docs/12 §8 names enforce their class —
+//     TestTheElevenAddressKeyedRoutesEnforceTheirClass, TestAnAddressKeyedRouteRefusesAtCapacity;
+//   - no caller can choose their own bucket — TestACallerCannotChooseTheirOwnBucket here for the
+//     wiring, and internal/httpx/clientaddr_test.go for the resolution itself. The availability
+//     half is TestBehindATrustedProxyTwoCallersAreCountedApart: an implementation that ignored
+//     every header would satisfy the security half and throttle the world.
 
 // rateLimitDocPath is Docs/12, the authority for every class, relative to this package.
 const rateLimitDocPath = "../../../../Docs/12-rate-limits.md"
@@ -222,34 +233,202 @@ func TestARouteWithNoClassIsNotAttached(t *testing.T) {
 	}}, GroupV1, testDeps(), nil, testLimiter())
 }
 
-// TestAddressKeyedRoutesCarryTheirClassAndAreNotEnforced is SHIP-183a's third clause.
+// TestTheElevenAddressKeyedRoutesEnforceTheirClass is SHIP-183b's first clause.
 //
-// The eleven routes Docs/12 §8 names key on the network address, and internal/httpx does not read
-// X-Forwarded-For. Enforcing them behind a load balancer would put every caller in one bucket per
-// class and refuse the world at the first request. They carry the class so that SHIP-183b is a
-// transcription rather than a second review, and they are not enforced until it lands.
-func TestAddressKeyedRoutesCarryTheirClassAndAreNotEnforced(t *testing.T) {
-	var addressKeyed []Route
+// It replaces SHIP-183a's TestAddressKeyedRoutesCarryTheirClassAndAreNotEnforced, which asserted
+// the opposite and was right to: internal/httpx read RemoteAddr alone, so enforcing these behind a
+// load balancer would have put every caller in one bucket per class and refused the world at the
+// first request. httpx.ResolveClientAddr is what changed the answer.
+//
+// **Enforced does not mean enforced here.** Six of the eleven take a bucket from the middleware in
+// this package; the five Credential routes are enforced inside internal/identity and
+// internal/admin, because that class charges failures only and this middleware runs before the
+// handler. Asserting the split rather than a total is what stops a Credential route quietly
+// losing its domain-side limit and still passing a count of eleven.
+func TestTheElevenAddressKeyedRoutesEnforceTheirClass(t *testing.T) {
+	var (
+		byMiddleware []string
+		byDomain     []string
+	)
 	for _, r := range routes() {
-		if r.Limit.keyedOnAddress() {
-			addressKeyed = append(addressKeyed, r)
+		if !r.Limit.keyedOnAddress() {
+			continue
 		}
+		name := r.Method + " " + r.fullPath()
+		if _, enforced := limitBucket(r.Limit, limitScale{}); enforced {
+			byMiddleware = append(byMiddleware, name)
+			continue
+		}
+		if r.Limit != LimitCredential {
+			t.Errorf("%s is %s, is keyed on the client address and no bucket enforces it. "+
+				"Only %s is enforced outside this package, and only because it charges "+
+				"failures only", name, r.Limit, LimitCredential)
+			continue
+		}
+		byDomain = append(byDomain, name)
 	}
 
 	// Docs/12 §8: "The five Credential, three Message and three PublicRead routes are the
 	// eleven."
-	if len(addressKeyed) != 11 {
-		t.Errorf("%d routes are keyed on the address, %s §8 says eleven",
-			len(addressKeyed), rateLimitDocPath)
+	if total := len(byMiddleware) + len(byDomain); total != 11 {
+		t.Errorf("%d routes are keyed on the address, %s §8 says eleven", total, rateLimitDocPath)
+	}
+	if len(byMiddleware) != 6 {
+		sort.Strings(byMiddleware)
+		t.Errorf("%d address-keyed routes take a middleware bucket, want the three %s and the "+
+			"three %s: %v", len(byMiddleware), LimitMessage, LimitPublicRead, byMiddleware)
+	}
+	if len(byDomain) != 5 {
+		sort.Strings(byDomain)
+		t.Errorf("%d routes are left to internal/identity and internal/admin, want the five %s: %v",
+			len(byDomain), LimitCredential, byDomain)
+	}
+}
+
+// TestEveryClassIsEitherEnforcedOrAccountedFor keeps the list of unenforced classes at two.
+//
+// It replaces a panic. limitBucket used to blow up on a subject-keyed class with no figures, which
+// covered exactly one of the ways this file can contradict itself; a class added to limits.go with
+// no entry in limitBuckets is a route served unlimited, and the two classes that legitimately have
+// no bucket each have a reason that belongs in a test rather than in a comment somebody may edit.
+func TestEveryClassIsEitherEnforcedOrAccountedFor(t *testing.T) {
+	// The reason each is absent, so that adding a third means writing one down.
+	accounted := map[LimitClass]string{
+		LimitUnlimited: "has no bucket by definition; GET /health is the caller being infrastructure",
+		LimitCredential: "is enforced inside internal/identity and internal/admin, where the " +
+			"outcome of the credential check is known — it charges failures only",
 	}
 
-	for _, r := range addressKeyed {
-		if _, enforced := limitBucket(r.Limit, limitScale{}); enforced {
-			t.Errorf("%s %s is %s and is enforced. It keys on the client address, which is the "+
-				"load balancer's until SHIP-183b reads a forwarded header from a configured "+
-				"trusted proxy — enforcing it now throttles every caller as one",
-				r.Method, r.fullPath(), r.Limit)
+	for class := LimitUnlimited; class <= LimitPublicRead; class++ {
+		_, enforced := limitBucket(class, limitScale{})
+		reason, excused := accounted[class]
+
+		switch {
+		case enforced && excused:
+			t.Errorf("%s is enforced by this middleware and is also excused on the grounds "+
+				"that it %s. One of the two is wrong", class, reason)
+		case !enforced && !excused:
+			t.Errorf("%s has no bucket and no reason to have none, so every route in it is "+
+				"served unlimited. Give it figures in limitBuckets or a reason here", class)
 		}
+	}
+}
+
+// publicReadRequest builds a request to the one address-keyed route with no dependencies.
+//
+// GET /v1/ is LimitPublicRead, needs neither a credential nor a database, and is not a mutation —
+// so nothing between the edge and the limiter can refuse it first. That matters: the idempotency
+// middleware runs *outside* the route limiter, and a state-changing route with no Idempotency-Key
+// would be answered 400 without the bucket ever being consulted.
+func publicReadRequest(remote, forwarded string) *http.Request {
+	r := httptest.NewRequest(http.MethodGet, "/v1/", nil)
+	r.RemoteAddr = remote
+	if forwarded != "" {
+		r.Header.Set(httpxForwardedFor, forwarded)
+	}
+	return r
+}
+
+// httpxForwardedFor is spelled out rather than imported, as httpxAuthorization is.
+const httpxForwardedFor = "X-Forwarded-For"
+
+// limitedRouterBehindProxy is limitedRouter with a trusted-proxy hop count configured.
+func limitedRouterBehindProxy(limiter *ratelimit.MemoryLimiter, hops int) http.Handler {
+	deps := testDeps()
+	deps.Config.TrustedProxy = config.TrustedProxy{Hops: hops}
+	return newRouter(deps, idempotency.NewMemoryStore(), limiter,
+		testAuthenticator(), testDriverGuard(), testAdminGuard())
+}
+
+// drain spends the whole of one caller's bucket and reports the last status.
+func drain(t *testing.T, router http.Handler, capacity int, remote, forwarded string) {
+	t.Helper()
+
+	for i := range capacity {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, publicReadRequest(remote, forwarded))
+		if rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("request %d of %d was refused; the bucket holds %d", i+1, capacity, capacity)
+		}
+	}
+}
+
+// TestAnAddressKeyedRouteRefusesAtCapacity is SHIP-183b's first clause at the wire.
+//
+// The class counts above prove the manifest agrees with Docs/12. This proves a request is actually
+// charged, which is the part a declaration cannot demonstrate.
+func TestAnAddressKeyedRouteRefusesAtCapacity(t *testing.T) {
+	router := limitedRouter(testLimiter())
+	public, enforced := limitBucket(LimitPublicRead, limitScale{})
+	if !enforced {
+		t.Fatalf("%s is not enforced, so SHIP-183b's first clause is unmet", LimitPublicRead)
+	}
+
+	drain(t, router, public.Capacity, "203.0.113.7:41000", "")
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, publicReadRequest("203.0.113.7:41000", ""))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("request %d answered %d, want 429 — the %s bucket holds %d",
+			public.Capacity+1, rec.Code, LimitPublicRead, public.Capacity)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("the refusal carries no Retry-After, so a throttled caller polls")
+	}
+}
+
+// TestACallerCannotChooseTheirOwnBucket is SHIP-183b's second clause, at the wiring rather than at
+// the resolver.
+//
+// internal/httpx/clientaddr_test.go holds the resolution itself against every forged shape. What
+// this adds is that the router asks it — a limitKey that read r.RemoteAddr, or the header, would
+// pass every test in that file and fail here.
+func TestACallerCannotChooseTheirOwnBucket(t *testing.T) {
+	router := limitedRouter(testLimiter())
+	public, _ := limitBucket(LimitPublicRead, limitScale{})
+
+	const attacker = "203.0.113.7:41000"
+	drain(t, router, public.Capacity, attacker, "")
+
+	for _, forged := range []string{
+		"198.51.100.9",
+		"198.51.100.9, 192.0.2.5",
+		"2001:db8::1",
+		"unknown",
+	} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, publicReadRequest(attacker, forged))
+		if rec.Code != http.StatusTooManyRequests {
+			t.Errorf("X-Forwarded-For: %q answered %d rather than 429, so the caller moved "+
+				"themselves to a fresh bucket and the limit is evaded", forged, rec.Code)
+		}
+	}
+}
+
+// TestBehindATrustedProxyTwoCallersAreCountedApart is the availability half of the same clause.
+//
+// Without it the eleven routes are worse than unlimited behind a balancer: every caller shares one
+// bucket and the first to empty it refuses everybody. An implementation that ignored every header
+// would satisfy TestACallerCannotChooseTheirOwnBucket and fail this.
+func TestBehindATrustedProxyTwoCallersAreCountedApart(t *testing.T) {
+	router := limitedRouterBehindProxy(testLimiter(), 1)
+	public, _ := limitBucket(LimitPublicRead, limitScale{})
+
+	const balancer = "203.0.113.7:41000"
+	drain(t, router, public.Capacity, balancer, "198.51.100.9")
+
+	spent := httptest.NewRecorder()
+	router.ServeHTTP(spent, publicReadRequest(balancer, "198.51.100.9"))
+	if spent.Code != http.StatusTooManyRequests {
+		t.Fatalf("the first caller answered %d after spending %d, want 429 — the header the "+
+			"balancer appends is not being counted at all", spent.Code, public.Capacity)
+	}
+
+	fresh := httptest.NewRecorder()
+	router.ServeHTTP(fresh, publicReadRequest(balancer, "198.51.100.10"))
+	if fresh.Code == http.StatusTooManyRequests {
+		t.Fatal("a second caller behind the same balancer was refused on the first request, " +
+			"so every caller behind it shares one bucket and the first throttles the world")
 	}
 }
 

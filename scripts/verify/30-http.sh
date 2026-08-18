@@ -180,8 +180,23 @@ ticket "SHIP-15  a refusal that says *not yet* releases the key rather than stor
 # with every section below and with every previous run. It is cleared at both ends of this block
 # for the reason 40-identity.sh clears it at both ends of SHIP-47's: a later section that got a
 # 429 would look like a broken endpoint rather than like this one's leftovers.
-redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
-  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+# signin_bucket_keys — every key the Credential class leaves behind, in both namespaces.
+#
+# **Two patterns rather than one, since SHIP-183b.** The account half is still `signin:account:`;
+# the address half was renamed to `credential:address:` when it stopped being sign-in's alone —
+# refresh and both verification endpoints now spend the same bucket, because Docs/12 §9 puts one
+# bucket on a class and never one on a route. A check that kept scanning `rl:v1:signin:*` would
+# find the account keys, report a clean namespace and leave the address bucket full for whatever
+# ran next.
+signin_bucket_keys() {
+  redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*'
+  redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:credential:*'
+}
+
+for pattern in 'rl:v1:signin:*' 'rl:v1:credential:*'; do
+  redis-cli -u "$REDIS_URL" --scan --pattern "$pattern" \
+    | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+done
 
 # idem429_login <key> <email> <password> <label> <name> — one sign-in, keeping the headers.
 #
@@ -225,7 +240,16 @@ ok "the per-address sign-in allowance is spent, which is the only 429 this API c
 # untouched and the 429 below is the address limit rather than its own.
 idem429_email="idem429-$$@example.com"
 idem429_password="correct-horse-battery-staple"
-idem429_phone="04$(printf '%08d' "$(( $$ % 100000000 ))")"
+# **The 0411 block, and a width that does not depend on the PID.** This line used to read
+# `04$(printf '%08d' …)`, which for a *four-digit* PID renders `04` + `00001949` — byte for byte
+# what SHIP-28's raw insert below builds as `+6140000$$`. Two sections then registered the same
+# number in one run and the second failed on uq_users_phone, so `make verify` was red for every
+# harness whose shell PID happened to fall in 1000..9999 and green for every other. Nothing about
+# the failure named a phone number, and it surfaced three sections later.
+#
+# 0411 is used by no other section, so the collision is impossible rather than unlikely, and the
+# six-digit pad keeps the number ten digits at any PID width.
+idem429_phone="0411$(printf '%06d' "$(( $$ % 1000000 ))")"
 status="$(post_json "verify-i429-register-$$" /v1/auth/register \
   "{\"name\":\"Verify Harness\",\"email\":\"$idem429_email\",\"phone\":\"$idem429_phone\",\"password\":\"$idem429_password\",\"role\":\"customer\"}" \
   "$WORKDIR/i429-register.json")"
@@ -311,8 +335,10 @@ ok "and the sign-in it did issue is replayed byte for byte, still one device —
 # it would turn one rejected bid into ten. The contrast is run against the same endpoint, under
 # the same middleware, with the buckets refilled so that both attempts would be admitted and the
 # only thing that can stop the second is the store.
-redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
-  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+for pattern in 'rl:v1:signin:*' 'rl:v1:credential:*'; do
+  redis-cli -u "$REDIS_URL" --scan --pattern "$pattern" \
+    | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+done
 
 idem429_wrong_key="verify-i429-wrong-$$"
 status="$(idem429_login "$idem429_wrong_key" "$idem429_email" "not-the-registered-password" "Verify 429 Wrong" wrong1)"
@@ -328,7 +354,7 @@ status="$(idem429_login "$idem429_wrong_key" "$idem429_email" "not-the-registere
 # the address the transport reports, and `localhost` resolves to `127.0.0.1` or to `::1` depending
 # on the machine — so a literal key name is a check that silently reads nothing and then compares
 # two empty strings. It did exactly that on the first run of this section.
-idem429_bucket="$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:address:*' | head -1)"
+idem429_bucket="$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:credential:address:*' | head -1)"
 [[ -n "$idem429_bucket" ]] \
   || fail "the refused credential charged no per-address bucket, so nothing here can tell a replay from a re-run"
 idem429_tokens_before="$(redis-cli -u "$REDIS_URL" hget "$idem429_bucket" tokens)"
@@ -350,9 +376,11 @@ ok "a 400 under the same key is still answered from the store, byte for byte, wi
 
 # The bucket is shared with every section below. Cleared where it was spent, and asserted rather
 # than assumed, because a later track's 429 would read as its own endpoint being broken.
-redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' \
-  | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
-[[ "$(redis-cli -u "$REDIS_URL" --scan --pattern 'rl:v1:signin:*' | wc -l | tr -d ' ')" == "0" ]] \
+for pattern in 'rl:v1:signin:*' 'rl:v1:credential:*'; do
+  redis-cli -u "$REDIS_URL" --scan --pattern "$pattern" \
+    | xargs -r redis-cli -u "$REDIS_URL" del >/dev/null 2>&1 || true
+done
+[[ "$(signin_bucket_keys | wc -l | tr -d ' ')" == "0" ]] \
   || fail "this section left sign-in buckets behind, which a later track would be throttled by"
 status="$(idem429_login "verify-i429-cleared-$$" "$idem429_email" "$idem429_password" "Verify 429 Cleared" cleared)"
 [[ "$status" == "200" ]] || { cat "$WORKDIR/i429-cleared.json"; fail "sign-in is still refused after the buckets were cleared ($status)"; }

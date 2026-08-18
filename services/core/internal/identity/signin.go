@@ -297,15 +297,19 @@ const (
 	signInAccountCapacity = 5
 	signInAccountInterval = 2 * time.Minute
 
-	// signInAddressCapacity and signInAddressInterval bound one network address across *all*
-	// accounts, which is the limit that matters against somebody working through a list of
-	// addresses rather than through one password.
+	// credentialAddressCapacity and credentialAddressInterval bound one network address across
+	// *all* accounts, which is the limit that matters against somebody working through a list
+	// of addresses rather than through one password.
 	//
 	// Deliberately much larger than the per-account figure. A household, an office and a
 	// carrier's NAT all present one address, so this has to sit above what a group of people
 	// getting their passwords wrong looks like.
-	signInAddressCapacity = 30
-	signInAddressInterval = 20 * time.Second
+	//
+	// **Named for the class rather than for sign-in since SHIP-183b**, because that is what it
+	// now bounds: refresh, email verification and phone verification spend from the same bucket
+	// this does. See credentiallimit.go for why they share one.
+	credentialAddressCapacity = 30
+	credentialAddressInterval = 20 * time.Second
 )
 
 // signInLimits is the pair of buckets one attempt is counted against.
@@ -356,7 +360,7 @@ func (s *Service) signInBuckets(cmd SignInCommand) (signInLimits, error) {
 	account := sha256.Sum256([]byte(cmd.Email))
 	return signInLimits{
 		accountKey: "signin:account:" + hex.EncodeToString(account[:]),
-		addressKey: "signin:address:" + ip,
+		addressKey: credentialAddressKey(ip),
 	}, nil
 }
 
@@ -372,7 +376,7 @@ func (s *Service) admitSignIn(ctx context.Context, buckets signInLimits) error {
 		bucket ratelimit.Bucket
 	}{
 		{buckets.accountKey, ratelimit.Bucket{Capacity: signInAccountCapacity, Interval: signInAccountInterval}},
-		{buckets.addressKey, ratelimit.Bucket{Capacity: signInAddressCapacity, Interval: signInAddressInterval}},
+		{buckets.addressKey, credentialAddressBucket()},
 	} {
 		decision, err := s.limiter.Allow(ctx, limit.key, limit.bucket)
 		if err != nil {
@@ -403,7 +407,7 @@ func (s *Service) chargeSignInFailure(ctx context.Context, buckets signInLimits)
 		bucket ratelimit.Bucket
 	}{
 		{buckets.accountKey, ratelimit.Bucket{Capacity: signInAccountCapacity, Interval: signInAccountInterval}},
-		{buckets.addressKey, ratelimit.Bucket{Capacity: signInAddressCapacity, Interval: signInAddressInterval}},
+		{buckets.addressKey, credentialAddressBucket()},
 	} {
 		if _, err := s.limiter.Spend(ctx, limit.key, limit.bucket); err != nil {
 			httpx.LoggerFrom(ctx).LogAttrs(ctx, slog.LevelWarn,
