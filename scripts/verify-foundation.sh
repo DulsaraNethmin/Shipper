@@ -155,9 +155,42 @@ TRACKER="Docs/11-delivery-status.md"
 WORKDIR="$(mktemp -d)"
 SERVER_PID=""
 
+# Set to 1 by the final line of this file, and read by cleanup() below.
+#
+# # Why a sentinel rather than the exit status
+#
+# `set -euo pipefail` and `trap cleanup EXIT` together have a failure mode on bash 3.2.57 — what
+# `/usr/bin/env bash` resolves to on macOS, and what CI's runner and every developer machine here
+# use. **An unbound-variable abort leaves no pending status**, so cleanup()'s successful `rm -rf`
+# became the script's own and `make verify` reported **exit 0 having run no checks and printed no
+# count line.** A harness that reports success without running is worse than one that fails.
+#
+# Two things measured about it, both of which cost somebody an hour if they are not written down:
+#
+#   - **`set -e` is required.** With `set -uo pipefail` and no `-e`, the same abort exits 1
+#     correctly. Anybody "fixing" this by reaching for `-u` would change nothing.
+#   - **`local status=$?; …; return $status` is inert, and a reviewer would approve it.** `$?` is
+#     already 0 at trap entry — probed directly, the trap prints `$?=0` on a script that then exits
+#     0. An ERR trap does not fire either. The status is destroyed before any handler runs, so
+#     there is nothing to read and the only thing left is to record, positively, that the end was
+#     reached.
+#
+# Verified on all five exit paths: `set -u` abort → 1, `set -e` abort → 1, fail()'s `exit 1` → 1,
+# the stale-count `exit 1` → 1, a clean run → 0.
+#
+# **This closes the false pass and not the false failure.** Two harnesses across two worktrees still
+# break each other deterministically (CLAUDE.md, "Working in more than one branch at once"), and no
+# sentinel can help with that. The exit status is not a verdict in either direction — read the
+# "N checks passed across M sections" line.
+VERIFY_FINISHED=0
+
 cleanup() {
   [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null || true
   rm -rf "$WORKDIR"
+
+  # Last, and after the cleaning rather than before it: an abort still gets its server killed and
+  # its working directory removed, and only then is the status forced. See VERIFY_FINISHED above.
+  [[ "$VERIFY_FINISHED" == 1 ]] || exit 1
 }
 trap cleanup EXIT
 
@@ -497,3 +530,7 @@ elif [[ "$stated_checks" != "$pass" || "$stated_sections" != "$section_count" ]]
 else
   printf '\033[32m%s §3 states the figure this run measured.\033[0m\n\n' "$TRACKER"
 fi
+
+# The end was reached. Nothing below this line, and nothing that can fail above it without
+# cleanup() turning the exit status into 1. See VERIFY_FINISHED at the head of the file.
+VERIFY_FINISHED=1
