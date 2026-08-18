@@ -893,6 +893,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-171** | M7 | The clock runs out and the person stops being a person. `Docs/05` §3.1's *delete the person, retain the transaction*, executed from **cmd/worker's sixth registered task** because nobody presses a button to be erased on the thirtieth day. **`'completed'` joins the CHECK and must not join the open-request index** — `000105` said why before either state existed and `000106` named this ticket doing it — and the mutation adding it to `openDeletionStatesSQL` is killed **behaviourally** as well as by the pairing guard: PostgreSQL stops being able to infer the partial index from the `ON CONFLICT` predicate, and sixteen tests fail on the running query. The pseudonym is a **pure function of `users.id`**, which `Docs/05` §3.1 already calls the pseudonym, and it is deliberately **not a valid address or number**, so the account is unreachable at sign-in by construction rather than by a check. Five tables across four domains, one transaction; the two outside `internal/identity` are reached through a port it declares. **`notifications.address` is the finding** — a stored copy of the contact channel keyed to the account, which no list of tables would have caught and a **whole-schema sweep** did. `users.password_hash` is declared out of scope with its reason — *see below* |
 | **SHIP-171a** | M7 | `internal/platform/storage` can remove an object, and the three places saying it could not now say what changed. **It is the second application of SHIP-115's narrowing rather than an exception to it**: the rule that was always doing the work is *no transfer through this service*, and a DELETE carries no body in either direction exactly as a HEAD does not. **The one API decision was argued from a measurement rather than from the specification** — the running store answers **204 to a DELETE of a key that has never existed**, so idempotence is the store's behaviour and not a translation this package performs, and the only thing that answers **404 is a missing bucket**. That inverts `S3.Stored`'s treatment of 404 and the inversion is the point: folding it in would make a service pointed at the wrong bucket report every deletion as done. `internal/profiles`' statement turned out to be about something else and was **clarified rather than reversed** — a delete moves no byte, so *nothing here moves a byte* never explained its absence. **Nothing belonging to anybody is deleted by this row**: no domain declares a port for it, no composition root calls it, and every object the tests remove was created to be removed — *see below* |
 | **SHIP-171b** | M7 | The account is erased and the notifications stop. SHIP-171's own entry named this under *what this does not build* and gave it no ticket; **the finding reproduces, measured on this branch before anything was written** — one `Consume` wrote a `pending` row addressed to `deleted:<uuid>`, and one dispatch pass took it to `failed` with `attempts` at 1, from which `failed` is not terminal. `notifications.address` is a **resolved copy**, so pseudonymising `users` defeats nothing in either direction. **Not suppressed by the pseudonym's spelling**, and both directions are asserted: a deleted account with an ordinary address is suppressed, and a live account whose address reads exactly like a pseudonym is notified. The authority is a `completed` deletion request, reached through a port `notifications` declares and `cmd/notifier` supplies — the **fifth** instance of that arrangement — and it is **required rather than an `Option`** because neither default is safe, which is the rule `consume.go` already states. `undeliverable` rather than a fifth status, and **`attempts` is deliberately not incremented**: no attempt is made, and the row's own words are that the counter stops climbing. **No migration and no constraint.** A defect found and not fixed: `bid.rejected` and `bid.expired` notify nobody, ever — *see below* |
+| **SHIP-183** | M7 | Every one of the 86 routes on the manifest has a limit class chosen with its reason, in the new `Docs/12`. **Seven classes rather than 86 numbers**, because a class is what a reviewer checks on a new route in one word and it is the only shape in which SHIP-183a's *registered without a limit fails a gate* is achievable — a field with no usable zero value. **The premise was measured and found wrong**: `Docs/11` §6 recorded *84 of the 86 need a number nobody has decided*, which counted only `internal/ratelimit` and missed two further mechanisms — the silent database issue limits on `request-otp` and `resend-verify`, and the attempt counter on `verify-phone`. **Five routes are limited today through three mechanisms, not two through one**, and the mechanisms are not interchangeable: a bucket bounds a caller and may answer 429, a destination limit must stay silent or it discloses that an address has an account, and an attempt limit retires one artefact. **`POST /v1/auth/register` has no limit of any kind** — it inserts a `users` row and sends an email, unauthenticated and unbounded, which is the worst gap found and is now `Message`. The §9 lockout question is **answered rather than parked**: clear-on-success now, which drops the worst-case lockout from capacity times interval to interval alone — ten minutes to two — and the distinct-address set held behind a named trigger, on cost rather than merit, because its size is chosen by the attacker. Honouring a correct password while throttled was **rejected with the reason**, since it turns the 429-versus-200 split into an oracle and destroys the limit. Configuration: **numbers stay in code, one global lever, never per-route**, because a per-route override is a number that drifts from the reason beside it. And **eleven routes key on a network address and none is enforceable behind a load balancer** until the trusted-proxy work lands, which split SHIP-183a and created SHIP-183b |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -18549,7 +18550,18 @@ throttles everybody at thirty failures. Neither is acceptable in production and 
 deployment yet to be wrong about. **Decide with the deployment work** — a trusted-proxy hop count
 or a CIDR allow-list in `internal/config`, read by `identity.clientIP`.
 
-**A per-account limit is a lockout somebody else can trigger, and the trade is deliberate.** The
+**SHIP-183 turned this from a note into a countable dependency, and gave it a ticket.** Eleven of
+the 86 routes key on a network address — five `Credential`, three `Message`, three `PublicRead`
+(`Docs/12` §8) — so applying their chosen limits before a trusted-proxy configuration exists takes
+the blast radius of this gap **from the two routes that have it today to eleven**, and the first
+deployment behind a balancer then throttles the entire world at the first caller. **The other 75
+are keyed on the authenticated subject and are unaffected**, because a user id, an administrator id
+and a driver token's job all survive a proxy untouched. That is why SHIP-183a was split: it now
+applies the 75, and **SHIP-183b** enforces the eleven behind the trusted-proxy work. The entry
+stays open because the configuration still does not exist.
+
+**~~A per-account limit is a lockout somebody else can trigger.~~ Decided at SHIP-183 — see §3 and
+`Docs/12` §6. Clear-on-success now; the distinct-address set behind a named trigger.** The
 bucket keys on the submitted address whether or not it has an account — it must, or never being
 throttled would itself disclose that an address is unknown. So a caller can spend somebody else's
 allowance by getting their password wrong for them. The per-address limit is what bounds it: an
@@ -18557,6 +18569,23 @@ attacker burns their own thirty to fill six accounts' buckets, and the sustained
 hold about one account at a time. That is the standard shape and it is worth revisiting rather than
 inheriting: a per-account limit counting *distinct* addresses, or one a successful sign-in clears,
 both remove it. **Decide at SHIP-183**, with the rest of the surface.
+
+**What SHIP-183 decided, and the trap it found on the way.** Clear-on-success is taken, and its
+worth is exactly one quantity: the worst-case lockout falls from capacity times interval to
+interval alone — **ten minutes to two** — because the victim needs one token rather than a full
+refill. It does not solve the problem and `Docs/12` §6 says so; under sustained attack the victim
+gets a two-minute window every two minutes. The distinct-address set **does** solve it and is
+declined on cost rather than merit: it needs a per-account set in Redis whose size the attacker
+chooses, so the control against a distributed lockout is itself a memory-pressure surface wanting
+a bound, an eviction policy and its own reasoning. **The trigger to build it is named** — the first
+credible report of an account locked out by a third party, or telemetry showing buckets emptied
+from more than three distinct addresses.
+
+**The trap is worth more than the decision.** The tempting third option — honour a correct password
+even while throttled, so a victim is never locked out — **destroys the limit entirely**: every wrong
+guess answers 429 and the right one answers 200, so the split is an oracle and the attacker guesses
+indefinitely. The bucket must stay in front of the password check, which is what bounds what
+clear-on-success can be worth. Anybody reopening this will reach for that option first.
 
 **The device list is bounded but not pageable, and the package it was waiting for now exists.**
 `GET /v1/auth/sessions` returns the collection envelope with `next_cursor` always null and a

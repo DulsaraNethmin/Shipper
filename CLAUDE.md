@@ -27,6 +27,7 @@ Read the relevant document before implementing. These are decisions, not suggest
 | `Docs/09` | The ticket backlog |
 | `Docs/10` | Engineering conventions — the implementation decisions two people would otherwise answer differently |
 | `Docs/11` | **Delivery status — read this first.** What is done, what is half done, what is blocked, what to start next |
+| `Docs/12` | Rate limits — the class every endpoint belongs to, the numbers, and why |
 
 If something contradicts a document, the document wins — or the document needs updating first. Do not resolve a contradiction silently in code.
 
