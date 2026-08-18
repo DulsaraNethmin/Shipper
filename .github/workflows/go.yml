@@ -219,11 +219,23 @@ jobs:
       - name: reverse every migration
         run: make migrate-down n=all
 
+      # Two bookkeeping tables are excluded rather than one, and the second is the reason this
+      # step spent twelve consecutive runs red on a tree where every down migration was correct.
+      #
+      # `schema_migrations` is golang-migrate's own and was excluded from the start. SHIP-15g then
+      # added `schema_migrations_applied` — the out-of-order guard's ledger, created by
+      # cmd/migrate/ledger.go with CREATE TABLE IF NOT EXISTS rather than by any migration, so no
+      # down migration reverses it and none should. This step counted it as a survivor and reported
+      # "a down migration does not reverse its up", which was false in both halves: nothing
+      # survived that a migration created, and no down migration is broken.
+      #
+      # The check means "no *schema* table survives". Both bookkeeping tables are outside that.
       - name: the database is empty again
         run: |
           remaining=$(psql "postgres://shipper:shipper@localhost:5432/shipper?sslmode=disable" \
             -tAc "SELECT count(*) FROM information_schema.tables
-                  WHERE table_schema = 'public' AND table_name <> 'schema_migrations'")
+                  WHERE table_schema = 'public'
+                    AND table_name NOT IN ('schema_migrations', 'schema_migrations_applied')")
           if [ "$remaining" != "0" ]; then
             echo "::error::$remaining table(s) survived 'migrate down all'; a down migration does not reverse its up."
             psql "postgres://shipper:shipper@localhost:5432/shipper?sslmode=disable" \
