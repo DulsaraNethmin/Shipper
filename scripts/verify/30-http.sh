@@ -225,7 +225,16 @@ ok "the per-address sign-in allowance is spent, which is the only 429 this API c
 # untouched and the 429 below is the address limit rather than its own.
 idem429_email="idem429-$$@example.com"
 idem429_password="correct-horse-battery-staple"
-idem429_phone="04$(printf '%08d' "$(( $$ % 100000000 ))")"
+# **The 0411 block, and a width that does not depend on the PID.** This line used to read
+# `04$(printf '%08d' …)`, which for a *four-digit* PID renders `04` + `00001949` — byte for byte
+# what SHIP-28's raw insert below builds as `+6140000$$`. Two sections then registered the same
+# number in one run and the second failed on uq_users_phone, so `make verify` was red for every
+# harness whose shell PID happened to fall in 1000..9999 and green for every other. Nothing about
+# the failure named a phone number, and it surfaced three sections later.
+#
+# 0411 is used by no other section, so the collision is impossible rather than unlikely, and the
+# six-digit pad keeps the number ten digits at any PID width.
+idem429_phone="0411$(printf '%06d' "$(( $$ % 1000000 ))")"
 status="$(post_json "verify-i429-register-$$" /v1/auth/register \
   "{\"name\":\"Verify Harness\",\"email\":\"$idem429_email\",\"phone\":\"$idem429_phone\",\"password\":\"$idem429_password\",\"role\":\"customer\"}" \
   "$WORKDIR/i429-register.json")"
