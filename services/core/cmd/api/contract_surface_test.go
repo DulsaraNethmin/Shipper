@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,10 +20,12 @@ import (
 
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/admin"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/clock"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/delivery"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/idempotency"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/identity"
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/passwords"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/ratelimit"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/testsupport/pgtest"
@@ -115,6 +120,8 @@ type contractWorld struct {
 	deviceSessionID uuid.UUID
 	// verificationObjectKey is a key the platform signed for this provider.
 	verificationObjectKey string
+	// disputeID is set by raiseDispute, for the two administrator routes that address one.
+	disputeID uuid.UUID
 }
 
 // newContractWorld seeds the smallest world every route can be addressed in.
@@ -372,6 +379,270 @@ func (w *contractWorld) seedJob(t *testing.T) {
 	}
 }
 
+// # The job-state builder (SHIP-17c)
+//
+// SHIP-17b named 23 routes it could not drive and grouped most of them under one sentence: every
+// one lifts by seeding the job at the status the operation requires, which is "a job-state builder
+// rather than a line each". This is that builder.
+//
+// ## Why it is not an UPDATE
+//
+// The obvious fixture — `UPDATE jobs SET status = 'Open'` — does not work, and its failing is the
+// point rather than an inconvenience. 000402 refuses any status change unless a job_status_history
+// row written in the *same transaction* already describes it, so a direct write does not quietly
+// bypass CLAUDE.md's invariant; it raises. The fixture therefore has to do what the platform does:
+// call jobs.Service.Transition inside a transaction.
+//
+// That makes the builder worth more than the routes it unlocks. A fixture that seeded status by
+// UPDATE would still compile the day somebody weakened the trigger; this one stops working.
+//
+// ## Why the ladder is written out rather than searched
+//
+// Docs/02 §2's table is a graph, and a shortest path through it is not the path a job takes. From
+// `Awarded` the table permits both `Driver assigned` and `En route to pickup`, so a search asked
+// for a delivery under way would skip the assignment — and the four driver routes need exactly
+// that row to exist. The ladder below is the happy path from Docs/02 §2, named once, and a case
+// asks for the rung it needs.
+var contractJobLadder = []jobs.Status{
+	jobs.StatusDraft,
+	jobs.StatusOpen,
+	jobs.StatusAwarded,
+	jobs.StatusDriverAssigned,
+	jobs.StatusEnRouteToPickup,
+	jobs.StatusPickedUp,
+	jobs.StatusInTransit,
+	jobs.StatusDelivered,
+}
+
+// contractServiceState is the state the job's pickup sits in and the provider covers. One constant
+// because the two have to agree — fleet's predicate matches `a.area = j.pickup_state` exactly, and
+// two literals that drifted apart would make the provider ineligible for a reason no failure names.
+const contractServiceState = "NSW"
+
+// makeProviderEligible satisfies fleet's four-part bidding predicate for the seeded provider.
+//
+// **The job reaching Open is necessary and is not sufficient**, which is what the first version of
+// this fixture got wrong: `POST /v1/jobs/{id}/bids` answered 404 on an Open job, because eligibility
+// is `fleet`'s answer rather than `bidding`'s and it asks for four things (internal/fleet's
+// `eligible`). Clause 1 is the status, which advanceJobTo supplies. The other three are here:
+//
+//   - **2a/2b — verified, in both places.** A `provider_verifications` row at `Verified` *and* an
+//     account that is active with both contacts confirmed. The seeded user has an email timestamp
+//     and no phone one, so the account half fails on its own.
+//   - **3 — service area.** The provider must cover the job's pickup, and the seeded job has no
+//     address at all. Both sides are set here rather than in seedJob, so the 63 routes that were
+//     already driven keep the world they were measured against.
+//   - **4 — vehicle capability.** Already true: seedVehicle leaves one vehicle in service, and a
+//     vehicle with no stated dimensions clears a job with none.
+//
+// Written as SQL rather than driven through the API because two of the three are not the caller's
+// to set. A provider cannot verify themselves — that is an administrator's decision (SHIP-81a) —
+// and the job's address belongs to the customer. A fixture that asked the API for these would be
+// asking it to permit what it correctly refuses.
+func (w *contractWorld) makeProviderEligible(t *testing.T) {
+	t.Helper()
+
+	exec := func(what, q string, args ...any) {
+		if _, err := w.pool.Exec(t.Context(), q, args...); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+
+	exec("confirming the provider's phone",
+		`UPDATE users SET phone_verified_at = now() WHERE id = $1`, w.providerID)
+	// Through the guarded function, not an INSERT or an UPDATE, and for the reason advanceJobTo
+	// goes through jobs.Service.Transition: 000200 guards this state exactly as 000402 guards a
+	// job's. The record already exists — a trigger writes it when a provider account is created —
+	// so what is needed is the move, and provider_verification_decide is the only thing that can
+	// make it. It records the decision with its actor and reason in the same transaction.
+	exec("verifying the provider",
+		`SELECT provider_verification_decide($1, 'Verified', 'admin', $2, $3)`,
+		w.providerID, w.adminID, "SHIP-17c contract fixture")
+
+	// A non-status column, so 000402's guard passes it straight through — its own comment says so.
+	exec("giving the job a pickup address",
+		`UPDATE jobs SET pickup_state = $2 WHERE id = $1`, w.jobID, contractServiceState)
+	exec("giving the provider a service area",
+		`INSERT INTO provider_service_areas (id, provider_id, scope, area) VALUES ($1, $2, 'state', $3)`,
+		uuid.New(), w.providerID, contractServiceState)
+}
+
+// openToBidding is the pair every bidding route needs: the job published, and the provider allowed
+// to see it. Named once because no caller wants one without the other.
+func (w *contractWorld) openToBidding(t *testing.T) {
+	t.Helper()
+	w.advanceJobTo(t, jobs.StatusOpen)
+	w.makeProviderEligible(t)
+}
+
+// submitBid places a real offer and rebinds bidID to it.
+//
+// The seeded bid is a Draft this file INSERTs, and three routes act only on an offer a provider
+// actually submitted. Placing one through POST /v1/jobs/{id}/bids is both shorter than reproducing
+// the domain's own writes and the version that stays true when they change — the same argument
+// seedVehicle makes.
+func (w *contractWorld) submitBid(t *testing.T) {
+	t.Helper()
+
+	status, body := w.drive(t, http.MethodPost, "/v1/jobs/"+w.jobID.String()+"/bids", asProvider,
+		contractOffer(45000))
+	if status != http.StatusCreated {
+		t.Fatalf("placing an offer: status %d, body %v", status, body)
+	}
+	id, _ := body["id"].(string)
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		t.Fatalf("the placed offer has no id: %v", body)
+	}
+	w.bidID = parsed
+}
+
+// awardBid takes the job to Awarded the way a customer does — by accepting a live offer.
+//
+// Not advanceJobTo(StatusAwarded), and the difference is the point. The ladder moves the status and
+// nothing else; an award also writes the accepted bid that the one-accepted-bid index holds, and
+// every route past this rung reads that row rather than the status. A job moved to Awarded with no
+// accepted bid is a state the platform cannot produce.
+func (w *contractWorld) awardBid(t *testing.T) {
+	t.Helper()
+
+	w.openToBidding(t)
+	w.submitBid(t)
+
+	status, body := w.drive(t, http.MethodPost, "/v1/jobs/"+w.jobID.String()+"/award", asCustomer,
+		`{"bid_id":"`+w.bidID.String()+`"}`)
+	if status != http.StatusOK {
+		t.Fatalf("awarding the offer: status %d, body %v", status, body)
+	}
+}
+
+// assignDriver carries the job to Driver assigned, which is the rung the whole driver surface needs.
+//
+// The four /v1/driver routes answer 404 on the seeded world with a *valid* token — the token is
+// scoped to the job and there is no assignment behind it. One row lifts all four, and asking the
+// endpoint for it is what keeps the fixture honest about how a driver comes to exist.
+func (w *contractWorld) assignDriver(t *testing.T) {
+	t.Helper()
+
+	w.awardBid(t)
+
+	status, body := w.drive(t, http.MethodPost, "/v1/jobs/"+w.jobID.String()+"/driver", asProvider,
+		`{"driver_name":"Sam Patel","driver_mobile":"0412 345 678"}`)
+	if status != http.StatusCreated && status != http.StatusOK {
+		t.Fatalf("assigning a driver: status %d, body %v", status, body)
+	}
+
+	// The seeded token is replaced by the assignment's own, and this is the whole reason the four
+	// driver routes were unreachable rather than merely unwritten. seedDriverToken mints a token
+	// over `uuid.New()` — a signature the verifier accepts, naming an assignment that does not
+	// exist. So the world had a *valid* credential for nothing, which is exactly the 404 SHIP-17b
+	// recorded against all four. The response carries the real one; taking it from there rather
+	// than re-signing keeps the fixture on the path a driver actually receives.
+	if token, _ := body["driver_token"].(string); token != "" {
+		w.driverToken = token
+	} else {
+		t.Fatalf("the assignment carries no driver_token: %v", body)
+	}
+}
+
+// deliveryUnderWay carries the job to In transit, which is the rung proof can attach to.
+//
+// Proof is what a driver captures on the way, so an upload URL for a job nobody has set off on has
+// nothing to be proof *of*. The milestones are driven rather than laddered because each one is a
+// recording the delivery domain makes — the job's status moves as a consequence, which is the
+// direction the platform works in.
+func (w *contractWorld) deliveryUnderWay(t *testing.T) {
+	t.Helper()
+
+	w.assignDriver(t)
+	for _, m := range []string{"en_route_to_pickup", "picked_up", "in_transit"} {
+		status, body := w.drive(t, http.MethodPost, "/v1/jobs/"+w.jobID.String()+"/milestones", asProvider,
+			`{"milestone":"`+m+`"}`)
+		if status != http.StatusCreated {
+			t.Fatalf("recording %s: status %d, body %v", m, status, body)
+		}
+	}
+}
+
+// raiseDispute takes the job far enough along to be disputed and then disputes it.
+//
+// The two administrator dispute routes were named unreached for want of "a dispute, which needs a
+// delivery to dispute" — both halves of which the ladder now supplies. It is the cascade worth
+// noticing about a job-state builder: the routes it unlocks directly are the job's, and the ones
+// it unlocks by consequence belong to other domains entirely.
+func (w *contractWorld) raiseDispute(t *testing.T) {
+	t.Helper()
+
+	w.deliveryUnderWay(t)
+
+	status, body := w.drive(t, http.MethodPost, "/v1/jobs/"+w.jobID.String()+"/disputes", asCustomer,
+		`{"category":"goods_damaged_or_missing",`+
+			`"description":"Two of the four crates arrived with the sides staved in.",`+
+			`"desired_outcome":"A record of the damage, and the provider contacted about it.",`+
+			`"occurred_at":"`+time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)+`"}`)
+	if status != http.StatusCreated {
+		t.Fatalf("raising a dispute: status %d, body %v", status, body)
+	}
+	id, _ := body["id"].(string)
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		t.Fatalf("the raised dispute has no id: %v", body)
+	}
+	w.disputeID = parsed
+}
+
+// contractOffer is the body a provider posts to place or revise an offer.
+//
+// The two instants are computed rather than literal because both are validated as future — a fixed
+// date-time in a test file is a fixture with an expiry date, and this one would start failing on a
+// day nobody was looking at this file.
+func contractOffer(cents int) string {
+	pickup := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	deliver := time.Now().Add(48 * time.Hour).UTC().Format(time.RFC3339)
+	return `{"amount_cents":` + strconv.Itoa(cents) + `,"pickup_at":"` + pickup + `","deliver_by":"` + deliver + `"}`
+}
+
+// advanceJobTo walks the seeded job up the ladder to the named status, through the guarded
+// transition and one transaction per rung.
+//
+// One transaction per rung rather than one for the walk, because that is how the platform moves a
+// job: each transition is its own committed act with its own history row. A single transaction
+// spanning four rungs would test a shape nothing in production produces.
+func (w *contractWorld) advanceJobTo(t *testing.T, to jobs.Status) {
+	t.Helper()
+
+	from := -1
+	target := -1
+	for i, s := range contractJobLadder {
+		if s == jobs.StatusDraft {
+			from = i
+		}
+		if s == to {
+			target = i
+		}
+	}
+	if target < 0 {
+		t.Fatalf("advanceJobTo: %s is not on the contract ladder; add it or drive the route that reaches it", to)
+	}
+
+	svc := newJobService(testDeps())
+	for i := from + 1; i <= target; i++ {
+		rung := contractJobLadder[i]
+		err := db.InTx(t.Context(), w.pool, func(ctx context.Context, tx db.Runner) error {
+			_, err := svc.Transition(ctx, tx, jobs.Move{
+				JobID:  w.jobID,
+				To:     rung,
+				Actor:  jobs.User(jobs.ActorCustomer, w.customerID),
+				Reason: "SHIP-17c contract fixture",
+			})
+			return err
+		})
+		if err != nil {
+			t.Fatalf("advancing the job to %s: %v", rung, err)
+		}
+	}
+}
+
 func (w *contractWorld) seedDriverToken(t *testing.T, deps Deps) {
 	t.Helper()
 
@@ -440,6 +711,15 @@ type contractCase struct {
 
 	// path overrides concretePath for the routes whose id is not the seeded job's.
 	path func(w *contractWorld) string
+
+	// setup advances the world past what newContractWorld seeds — a job further up the ladder, an
+	// offer actually submitted, a driver assigned. Nil leaves the seeded world alone.
+	//
+	// It runs against a world of this case's own, which is what makes it safe for it to mutate:
+	// TestResponsesMatchTheContract builds one per subtest for the fixture-bleed reason
+	// newContractWorld's comment gives, and a setup that moves a job would otherwise be the
+	// loudest possible example of it.
+	setup func(t *testing.T, w *contractWorld)
 }
 
 // contractCases drives one route each, keyed "<METHOD> <full path>".
@@ -453,6 +733,101 @@ var contractCases = map[string]contractCase{
 	"GET /v1/{$}":                 {auth: asAnonymous, want: 200},
 	"GET /v1/app/minimum-version": {auth: asAnonymous, want: 200},
 	"GET /v1/app/policy":          {auth: asAnonymous, want: 200},
+
+	// Bidding — every one of these needs the job past Draft (SHIP-17c).
+	"POST /v1/jobs/{id}/bids": {auth: asProvider, want: 201,
+		setup: func(t *testing.T, w *contractWorld) { w.openToBidding(t) },
+		body:  func(w *contractWorld) string { return contractOffer(45000) }},
+
+	"POST /v1/jobs/{id}/extend": {auth: asCustomer, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.advanceJobTo(t, jobs.StatusOpen) },
+		body:  func(*contractWorld) string { return `{}` }},
+
+	"POST /v1/jobs/{id}/award": {auth: asCustomer, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.openToBidding(t); w.submitBid(t) },
+		body:  func(w *contractWorld) string { return `{"bid_id":"` + w.bidID.String() + `"}` }},
+
+	"PATCH /v1/jobs/{id}/bids/{bid_id}": {auth: asProvider, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.openToBidding(t); w.submitBid(t) },
+		body:  func(*contractWorld) string { return `{"amount_cents":39900}` }},
+
+	"POST /v1/jobs/{id}/bids/{bid_id}/counter": {auth: asCustomer, want: 201,
+		setup: func(t *testing.T, w *contractWorld) { w.openToBidding(t); w.submitBid(t) },
+		body:  func(*contractWorld) string { return `{"amount_cents":39900}` }},
+
+	"POST /v1/jobs/{id}/bids/{bid_id}/withdraw": {auth: asProvider, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.openToBidding(t); w.submitBid(t) },
+		body:  func(*contractWorld) string { return `{}` }},
+
+	// Delivery — the rungs past an award.
+	"POST /v1/jobs/{id}/driver": {auth: asProvider, want: 201,
+		setup: func(t *testing.T, w *contractWorld) { w.awardBid(t) },
+		body: func(*contractWorld) string {
+			return `{"driver_name":"Sam Patel","driver_mobile":"0412 345 678"}`
+		}},
+
+	"POST /v1/jobs/{id}/driver/link": {auth: asProvider, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.assignDriver(t) },
+		body:  func(*contractWorld) string { return `{}` }},
+
+	"POST /v1/jobs/{id}/milestones": {auth: asProvider, want: 201,
+		setup: func(t *testing.T, w *contractWorld) { w.assignDriver(t) },
+		body:  func(*contractWorld) string { return `{"milestone":"en_route_to_pickup"}` }},
+
+	"POST /v1/jobs/{id}/proof-uploads": {auth: asProvider, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.deliveryUnderWay(t) },
+		body:  func(*contractWorld) string { return `{"content_type":"image/jpeg","content_length":1048576}` }},
+
+	// The driver surface. All four need the assignment the token names to exist (SHIP-17c).
+	"GET /v1/driver/jobs/{id}": {auth: asDriver, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.assignDriver(t) }},
+
+	"GET /v1/driver/jobs/{id}/milestones": {auth: asDriver, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.assignDriver(t) }},
+
+	"POST /v1/driver/jobs/{id}/milestones": {auth: asDriver, want: 201,
+		setup: func(t *testing.T, w *contractWorld) { w.assignDriver(t) },
+		body:  func(*contractWorld) string { return `{"milestone":"en_route_to_pickup"}` }},
+
+	"POST /v1/driver/jobs/{id}/proof-uploads": {auth: asDriver, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.deliveryUnderWay(t) },
+		body:  func(*contractWorld) string { return `{"content_type":"image/jpeg","content_length":1048576}` }},
+
+	"POST /v1/jobs/{id}/disputes": {auth: asCustomer, want: 201,
+		setup: func(t *testing.T, w *contractWorld) { w.deliveryUnderWay(t) },
+		body: func(*contractWorld) string {
+			return `{"category":"goods_damaged_or_missing",` +
+				`"description":"Two of the four crates arrived with the sides staved in.",` +
+				`"desired_outcome":"A record of the damage, and the provider contacted about it.",` +
+				`"occurred_at":"` + time.Now().Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`
+		}},
+
+	"GET /v1/admin/disputes/{id}": {auth: asAdmin, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.raiseDispute(t) },
+		path:  func(w *contractWorld) string { return "/v1/admin/disputes/" + w.disputeID.String() }},
+
+	"POST /v1/admin/disputes/{id}/resolution": {auth: asAdmin, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.raiseDispute(t) },
+		path: func(w *contractWorld) string {
+			return "/v1/admin/disputes/" + w.disputeID.String() + "/resolution"
+		},
+		body: func(*contractWorld) string {
+			return `{"outcome":"delivery_issue_acknowledged","job_outcome":"completed",` +
+				`"reason":"Damage recorded and the provider contacted about it."}`
+		}},
+
+	// The verification record exists from registration, at Pending — a trigger writes it when a
+	// provider account is created. So this route needs no seeding beyond the provider the world
+	// already has, and the {id} it addresses is the provider's: provider_verifications is keyed by
+	// provider_id. What it must *not* have is makeProviderEligible, which decides the same record
+	// to Verified — and `from_state <> to_state` refuses a decision that moves nothing.
+	"POST /v1/admin/verifications/{id}/decision": {auth: asAdmin, want: 200,
+		path: func(w *contractWorld) string {
+			return "/v1/admin/verifications/" + w.providerID.String() + "/decision"
+		},
+		body: func(*contractWorld) string {
+			return `{"state":"Verified","reason":"Licence, registration and insurance all current."}`
+		}},
 
 	// Identity.
 	"POST /v1/auth/login": {auth: asAnonymous, want: 200, body: func(w *contractWorld) string {
@@ -599,41 +974,21 @@ var contractCases = map[string]contractCase{
 // named in the output rather than counted, and an exemption that has to be written by hand is the
 // only form of that which cannot rot silently.
 var contractUnreached = map[string]string{
-	// # The seeded job is a Draft, and these need it further along
+	// # What used to be here, and why it is worth recording that it is not
 	//
-	// Every one of these lifts the same way: seed the job at the status the operation requires and
-	// write the fixture. That is a job-state builder rather than a line each, which is why it is
-	// one decision recorded here rather than nine.
-	"POST /v1/jobs/{id}/bids":          "needs the job Open to providers; the seeded job is a Draft",
-	"POST /v1/jobs/{id}/award":         "needs an Open job carrying a Submitted bid to award",
-	"POST /v1/jobs/{id}/extend":        "needs an Open job with an expiry; a Draft has no offer window",
-	"POST /v1/jobs/{id}/driver":        "needs the job Awarded, which needs an accepted bid",
-	"POST /v1/jobs/{id}/driver/link":   "needs a driver already assigned to the job",
-	"POST /v1/jobs/{id}/milestones":    "needs a delivery under way and a driver on it",
-	"POST /v1/jobs/{id}/proof-uploads": "needs a delivery under way; proof has nothing to attach to",
-	"POST /v1/jobs/{id}/disputes":      "needs a delivery far enough along to be disputed",
-
-	// The seeded bid is a Draft the fixture inserts. These three act on an offer a provider has
-	// actually submitted, which is a different row and a different set of guards.
-	"PATCH /v1/jobs/{id}/bids/{bid_id}":         "needs a Submitted bid; the seeded bid is a Draft",
-	"POST /v1/jobs/{id}/bids/{bid_id}/counter":  "needs a Submitted bid to counter",
-	"POST /v1/jobs/{id}/bids/{bid_id}/withdraw": "needs a Submitted bid to withdraw",
-
-	// # The driver surface needs an assignment
+	// SHIP-17b named 23 routes and grouped 18 of them under one prediction: that they lift together
+	// once the job can be seeded past Draft. SHIP-17c built that builder and the prediction held —
+	// the job ladder, an eligible provider, an award, an assignment and three milestones took the
+	// gate from 63 to 81 of 86. **Two of those 18 were not in the group at all**: the administrator
+	// dispute routes came free, because a dispute needs a delivery and the ladder now reaches one.
 	//
-	// The world mints a driver token for the seeded job, which is why these answer 404 rather than
-	// 401: the token is accepted and there is no delivery behind it. One assignment row lifts all
-	// four together.
-	"GET /v1/driver/jobs/{id}":                "the driver token is valid; no delivery exists for the job",
-	"GET /v1/driver/jobs/{id}/milestones":     "same assignment as above",
-	"POST /v1/driver/jobs/{id}/milestones":    "same assignment as above",
-	"POST /v1/driver/jobs/{id}/proof-uploads": "same assignment as above",
+	// **What is left is not a smaller version of that problem.** Each of the five below needs
+	// something the lifecycle cannot produce — a second administrator, bytes in a bucket, or a
+	// secret the platform deliberately sends out of band. None is lifted by seeding a status, which
+	// is why they are five separate reasons rather than one group.
 
 	// # Administration acting on a subject that has to exist first
-	"GET /v1/admin/disputes/{id}":                "needs a dispute, which needs a delivery to dispute",
-	"POST /v1/admin/disputes/{id}/resolution":    "needs a dispute in an open state",
 	"POST /v1/admin/suspensions/{id}/approval":   "needs a suspension requested by a *different* administrator — the two-person rule refuses the requester's own approval, so the world needs a second signed-in owner",
-	"POST /v1/admin/verifications/{id}/decision": "needs the provider's verification id, which no response the world already drives returns",
 	"GET /v1/admin/verifications/{id}/documents": "needs a verification carrying a stored document — see the object-store note below",
 
 	// # One-time secrets the platform sends out of band
@@ -731,6 +1086,9 @@ func TestResponsesMatchTheContract(t *testing.T) {
 
 		t.Run(key, func(t *testing.T) {
 			w := newContractWorld(t)
+			if c.setup != nil {
+				c.setup(t, w)
+			}
 
 			path := w.concretePath(r)
 			if c.path != nil {

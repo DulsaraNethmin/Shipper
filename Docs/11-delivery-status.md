@@ -16523,6 +16523,7 @@ exemption list is the work item.
 | Surface | What |
 |---|---|
 | SHIP-17b | `cmd/api/contract_surface_test.go` — the fixture world (customer, provider, administrator and driver credentials; job, bid, two vehicles, a signed-in device and a signed upload key, seeded through the API wherever the API can do it), `contractCases` at 63 routes, `contractUnreached` at 23 with a reason each, `TestEveryRouteIsDrivenOrNamed`, `TestResponsesMatchTheContract` rewritten to drive the registry, and `TestRequestBodiesAreClosed` in its two-assertion form. `exercisable()` deleted from `contract_test.go`, and that file's history paragraph corrected to describe what replaced it |
+| SHIP-17c | `cmd/api/contract_surface_test.go` — a job-state builder (`contractJobLadder` walked through `jobs.Service.Transition`, one transaction per rung, because 000402 refuses a status set any other way), `makeProviderEligible` for fleet's four-part bidding predicate, `submitBid`, `awardBid`, `assignDriver` (which rebinds the driver token to the assignment the response carries), `deliveryUnderWay` and `raiseDispute`; a `setup` hook on `contractCase`. `contractCases` 63 → 81 routes, `contractUnreached` 23 → 5, each remaining one named with a reason that is not a job status |
 
 ## 4. Partly done — do not treat these as finished
 
