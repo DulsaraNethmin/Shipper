@@ -20368,7 +20368,32 @@ rewrote all of them by guess would be worse than one that rewrote none.
 unchanged: cite the wave number instead of the letter, or give each wave a stable anchor that never
 moves. **The second costs one reconciliation and ends this permanently.**
 
-### The contract gate reaches 4 of 86 routes, and it says so on every run
+### ~~The contract gate reaches 4 of 86 routes, and it says so on every run~~
+
+**~~Open.~~ Closed by SHIP-17b, SHIP-17c and SHIP-17d — see §3.** The gate drives **86 of 86 routes
+with `contractUnreached` empty**, re-measured on this branch by reading the tests rather than by
+carrying wave 17's figure: `exercisable()` is gone, `contractCases` covers every route on the
+manifest, and `cmd/api/contract_surface_test.go`'s `contractUnreached` map is empty with a comment
+saying emptiness is the finding. **The three tickets closed it in the order this entry predicted.**
+SHIP-17b replaced the filter and named 23 routes it could not yet drive; SHIP-17c built the job-state
+builder and lifted 18 of them in one move, 63 → 81, with two of the 18 coming free because a dispute
+needs a delivery and the ladder now reaches one; SHIP-17d drove the last five, 81 → 86, each of which
+needed something the lifecycle could not produce — a second administrator, an object in a bucket, or
+a one-time secret the platform keeps no readable copy of.
+
+**The second half of the complaint is closed too, and separately.** *"There is no request-body check
+at any coverage"* was true when written; `TestRequestBodiesAreClosed` now validates request bodies
+through `openapi3filter.ValidateRequest`, and it fails rather than passes vacuously — it aborts with
+*"no operation declares a JSON request body; this test is asserting nothing"* if the contract stops
+declaring any. **Three gates stand where there was one**: `TestEveryRouteIsDrivenOrNamed` refuses a
+route that is in neither map, `TestResponsesMatchTheContract` checks the responses, and
+`TestRequestBodiesAreClosed` checks the requests.
+
+**The recommendation below was right about the shape of the fix and is kept as written**, along with
+the drift that prompted it — a fixture per route in `cmd/api` is what was taken, and the unexported
+request structs are still why the request half is driven through fixtures rather than by reflecting
+over domain types. **The entry stays because the failure it records is the reason the gate exists**:
+a named gap in CI output is not a failing gate, and nobody reads a passing test's log.
 
 **A published contract is checked against the service by `TestResponsesMatchTheContract`, and that
 test is not the problem — its coverage is.** `exercisable()` skips every non-GET, every authenticated
