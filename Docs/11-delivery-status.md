@@ -16533,6 +16533,7 @@ exemption list is the work item.
 | ~~**SHIP-149**~~ | ~~`audit_log` table, append-only triggers, tests~~ | **Closed.** SHIP-150 built the write helper — see §3. On `7d7caf0` the only `INSERT INTO audit_log` in the repository was four statements in `migrations/schema_test.go`, and no Go code wrote an entry; `internal/admin/audit.go` and `postgres_audit.go` now do, and `migrations/audit_log_test.go` adds the `Docs/10` §3.4 pairing that could not be written while there was no Go vocabulary to pair |
 | **SHIP-158** | `GET /v1/admin/moderation/cancellations`, both outcomes, with the provider's cancellation and completion counts | **The provider on a `returned_to_market` entry, once that path is built.** `Docs/02` §6.2 closes every bid when a provider cancels after award, so no `Accepted` bid survives and the join that names the provider finds nothing — on precisely the outcome that most needs one. `bids` has no column recording which offer *was* accepted; adding one is a migration in `internal/bidding`'s block. Not yet reachable — neither transition has an endpoint — so nothing is wrong today and it will be the day one arrives |
 | **SHIP-77** | The job detail screen, the derived timeline, the available actions | The transition history its *Done when* implies. "Full job detail with **status timeline**" — and no endpoint serves one, so the timeline is derived from the current status and refuses to date what it cannot date. See §9 |
+| **SHIP-120** | The token landing at `/j/<job-id>#<token>` — the credential in the **fragment**, which no server receives, moved to `sessionStorage` and stripped from the address bar, with the job identifier carried independently of it. The six fields `GET /v1/driver/jobs/{id}` serves, and SHIP-121's controls over them | **The delivery detail its *Done when* names.** "Opening the link shows only that job's delivery detail" — the *only that job's* half is demonstrated, and the *delivery detail* half is not: the endpoint serves **no pickup, no drop-off, no goods and no contact**, so a driver cannot see where to go. `Docs/03` §3's Prepare stage puts all four on this screen — *"views pickup/delivery, goods notes, contact guidance"* — which makes this a product gap rather than only a bookkeeping one. **Recorded in place on both sides and owned by nobody**: `internal/delivery/http.go:1168` says the fields are SHIP-120's to add and that the lane could touch no Go, and `apps/driver-portal/lib/delivery.ts:55` calls the same absence *"a gap rather than a decision"*. The shape is small and additive, so no route moves — `driverJobResponse` gains the two locations, the goods description and a contact, from a port into `jobs` that `delivery` does not yet declare. **This is the seventh instance of the shape `Docs/09` names at SHIP-121a** — a client ticket whose real precondition is a route on the served surface, which no dependency column records — and the only one of the seven with no `<n>a` row. See below |
 | ~~**SHIP-118**~~ | ~~`Delivered` recordable and refused without evidence~~ | **Closed by SHIP-123 — see §3.** `000607` adds `recipient_name` and `delivery_note`, required on `Delivered` and refused on every other milestone, in the domain and in `ck_milestones_delivery_details`. `Docs/01` §4.4's field set is closed end to end |
 | ~~**SHIP-151**~~ | ~~`GET /v1/admin/users` — search by **email**, **phone** and **status**~~ | **Closed by SHIP-30a — see §3.** `000006` adds `users.name`, registration requires it, and the search matches it, so all four of the *Done when*'s terms answer on the wire. An account created before the migration has no name and is found by its address; a name cannot be backfilled, which is why the closing ticket sits in M1 |
 | **SHIP-102** | The comparison screen over `GET /v1/jobs/{id}/bids/received`: **price**, **timing** and **vehicle** served in full, laid out side by side, with a geometry assertion holding the layout | **The gap moved from data to presentation at wave 11 and did not close.** Its named owner SHIP-79a landed, so `display_name` and `operates_as` are now on the wire — `internal/bidding/http.go:1350` and `:1351`. **No client reads them**: `git grep -n 'display_name\|displayName\|operates_as\|operatesAs' -- apps/mobile` returns **nothing at all** on `5a3b8d7`, so the comparison screen still renders `verified` and `member_since` and the *Done when*'s profile clause is still met in reduced form. **This is two fields on one Flutter screen and it is owned by nobody.** See below |
@@ -16546,14 +16547,19 @@ but for the budget for two waves, and SHIP-67 closed it with the column and the 
 §10's note that a ticket can be both done and partly done still stands. **SHIP-118 left this table at
 wave 9**, closed by SHIP-123 exactly as SHIP-65 was closed by SHIP-67.
 
-**The live rows are now six — SHIP-158, SHIP-77, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a — and
-the sentence that counted them was wrong when this pass arrived**, which is the third time and is
-becoming the point of the sentence rather than an aside. It read *"the live rows are now three —
-SHIP-77, SHIP-151 and SHIP-102"*. Wave 11 struck SHIP-151 and added SHIP-158, so the **count** stayed
-right by coincidence while the **names** went wrong, which is worse than an obviously stale number
-because it survives a glance. §10's parallel sentence was wrong in the same way and is corrected in
-the same pass. **A table read by a human and a sentence counting its rows are a semantic pair no
-merge tool and no gate checks** — §7c's second merge finding, now demonstrated a third time.
+**The live rows are now seven — SHIP-158, SHIP-77, SHIP-120, SHIP-102, SHIP-139, SHIP-143 and
+SHIP-79a — and for the first time in four passes the sentence counting them was *right* when the
+pass arrived.** It read *"the live rows are now six — SHIP-158, SHIP-77, SHIP-102, SHIP-139,
+SHIP-143 and SHIP-79a"*, and that measured correctly against the table. **Adding SHIP-120 is what
+made it wrong, and it is corrected in the same commit that adds the row** — which is the only
+discipline that has ever held this pair together, and it is cheap exactly once: at the moment the
+row goes in. The three earlier failures are why it is worth a sentence at all. Two passes ago it
+read *"the live rows are now three — SHIP-77, SHIP-151 and SHIP-102"*; wave 11 struck SHIP-151 and
+added SHIP-158, so the **count** stayed right by coincidence while the **names** went wrong, which
+is worse than an obviously stale number because it survives a glance. §10's parallel sentence was
+wrong in the same way, and it is updated in this commit too, both re-read against the table rather
+than restated. **A table read by a human and a sentence counting its rows are a semantic pair no
+merge tool and no gate checks** — §7c's second merge finding, now with four passes behind it.
 
 **Four rows were added at this pass and three of them are the same shape as SHIP-118's.** SHIP-139
 and SHIP-143 owe their missing half to **X-10**, written into `Docs/09` here; SHIP-102's owner
@@ -16671,6 +16677,43 @@ name the owner's clause, not just the owner.**
 **What is left is small and has no owner at all**: two fields already on the wire, rendered on one
 comparison screen. It is a Flutter row nobody has written, and it is the shape §9 keeps calling a
 finding that goes quiet.
+
+**SHIP-120 is the SHIP-77 shape, and this row is three passes later than it should have been.** The
+lane that built the screen wrote the gap down in its own §3 entry — *"`Docs/11` §4 wants a SHIP-120
+row"* — and no reconciliation since has written one. That is not a small clerical miss: §4 is the
+table a reader consults to find out what is *not* finished, and for three passes it has answered
+this question wrongly by staying silent.
+
+**What exists is the whole of the screen and none of the detail.** `GET /v1/driver/jobs/{id}`
+returns six fields — the job and assignment identifiers, the driver's name, when they were assigned,
+when the link expires, and, since SHIP-123, whether a delivery has been recorded. **Not one of them
+tells a driver where to drive.** `Docs/03` §3's Prepare stage asks for the pickup and drop-off, the
+goods notes and contact guidance, and the endpoint serves none of the four — so the portal renders a
+card saying the details are not carried by the link yet, rather than a blank one. That is the honest
+presentation of an unmet clause; it is not the clause being met.
+
+**Both sides recorded it and neither could close it**, which is the part worth reading.
+`internal/delivery/http.go:1168` says the fields are SHIP-120's to add and that a middleware ticket
+has no business declaring a port into `jobs`; `apps/driver-portal/lib/delivery.ts:55` separates its
+three deliberate omissions — the driver's own mobile number, the job's status, and anything about
+money — from this one, which it calls *"a gap rather than a decision"*. Two files, two lanes, one
+gap, and no ticket between them.
+
+**It is the seventh instance of a shape this file has already named six times.** SHIP-101a,
+SHIP-115a, SHIP-120a, SHIP-96a, SHIP-102a and SHIP-121a were each written because a client ticket's
+real precondition was a route on the served surface that no dependency column recorded; all six are
+rows in `Docs/09` today, counted there. **Six of the seven got an `<n>a` row and this one did not**,
+and the ordering explains it rather than excusing it: the other six were found while their client
+ticket was still open, and this one was found by the lane that *closed* its client ticket — at the
+moment the row stopped being something anybody was reading.
+
+**The fix is additive and small**, which is the only reason this has been survivable.
+`driverJobResponse` gains the two locations, the goods description and a contact, from a port
+`delivery` declares and `cmd/api` supplies. No route moves, no existing field changes, and `Docs/07`
+§6 calls an added field a compatible change. **What it needs is a `Docs/09` row, and writing one
+moves the header arithmetic** — so this pass records the gap and does not invent the ticket. §9
+carries the recommendation.
+
 
 ## 5. Blocked — and only by work outside this repository
 
@@ -20325,7 +20368,32 @@ rewrote all of them by guess would be worse than one that rewrote none.
 unchanged: cite the wave number instead of the letter, or give each wave a stable anchor that never
 moves. **The second costs one reconciliation and ends this permanently.**
 
-### The contract gate reaches 4 of 86 routes, and it says so on every run
+### ~~The contract gate reaches 4 of 86 routes, and it says so on every run~~
+
+**~~Open.~~ Closed by SHIP-17b, SHIP-17c and SHIP-17d — see §3.** The gate drives **86 of 86 routes
+with `contractUnreached` empty**, re-measured on this branch by reading the tests rather than by
+carrying wave 17's figure: `exercisable()` is gone, `contractCases` covers every route on the
+manifest, and `cmd/api/contract_surface_test.go`'s `contractUnreached` map is empty with a comment
+saying emptiness is the finding. **The three tickets closed it in the order this entry predicted.**
+SHIP-17b replaced the filter and named 23 routes it could not yet drive; SHIP-17c built the job-state
+builder and lifted 18 of them in one move, 63 → 81, with two of the 18 coming free because a dispute
+needs a delivery and the ladder now reaches one; SHIP-17d drove the last five, 81 → 86, each of which
+needed something the lifecycle could not produce — a second administrator, an object in a bucket, or
+a one-time secret the platform keeps no readable copy of.
+
+**The second half of the complaint is closed too, and separately.** *"There is no request-body check
+at any coverage"* was true when written; `TestRequestBodiesAreClosed` now validates request bodies
+through `openapi3filter.ValidateRequest`, and it fails rather than passes vacuously — it aborts with
+*"no operation declares a JSON request body; this test is asserting nothing"* if the contract stops
+declaring any. **Three gates stand where there was one**: `TestEveryRouteIsDrivenOrNamed` refuses a
+route that is in neither map, `TestResponsesMatchTheContract` checks the responses, and
+`TestRequestBodiesAreClosed` checks the requests.
+
+**The recommendation below was right about the shape of the fix and is kept as written**, along with
+the drift that prompted it — a fixture per route in `cmd/api` is what was taken, and the unexported
+request structs are still why the request half is driven through fixtures rather than by reflecting
+over domain types. **The entry stays because the failure it records is the reason the gate exists**:
+a named gap in CI output is not a failing gate, and nobody reads a passing test's log.
 
 **A published contract is checked against the service by `TestResponsesMatchTheContract`, and that
 test is not the problem — its coverage is.** `exercisable()` skips every non-GET, every authenticated
@@ -20579,6 +20647,38 @@ silently in code. The repair itself is on `ship-15al-flutter-codegen-staleness` 
 regenerated lines; **the gate is what is open.**
 
 
+### The driver's job view serves no address, and no `Docs/09` row would fix it
+
+**§4 now carries the gap; this is the decision it leaves open.** `GET /v1/driver/jobs/{id}` serves
+six fields and not one of them is a place. `Docs/03` §3's Prepare stage asks for the pickup and
+drop-off, the goods notes and contact guidance, and SHIP-120's *Done when* — *"opening the link
+shows only that job's delivery detail"* — cannot be met until the endpoint serves them. **Both the
+Go and the TypeScript record it in place and neither could act on it**, because the fields come from
+a port `delivery` does not declare and each lane that found the gap was on the wrong side of it.
+
+**The recommendation is to write the row, and the reason is that six identical findings were all
+resolved that way.** SHIP-101a, SHIP-115a, SHIP-120a, SHIP-96a, SHIP-102a and SHIP-121a each exist
+because a client ticket's real precondition was a route on the served surface that no dependency
+column recorded; all six are rows in `Docs/09` today rather than clauses folded into their client
+ticket, and `Docs/09` names the shape in prose at SHIP-121a. **This is the seventh instance and the
+only one without a row.** A `SHIP-120b` — the two locations, the goods description and a contact on
+`driverJobResponse`, from a port into `jobs` — would make it seven of seven. **Three points looks
+right** against SHIP-121a's two: no new route and no migration, but it crosses a domain boundary
+that SHIP-121a did not.
+
+**What the decision costs is the header arithmetic, and that is why a lane cannot take it.** A new
+row moves `Docs/09`'s ticket and point totals, `scripts/delivery-status.sh` reads them, and §1's
+snapshot restates them — surfaces a domain branch must not touch, which is why this pass records the
+gap and leaves the row to the owner.
+
+**The alternative is worth naming so it is rejected deliberately rather than by omission**: fold the
+fields into SHIP-121a or another open driver row. **That is exactly how the gap was made** — a
+clause landing inside a ticket whose *Done when* did not name it — and §4's closing line on the
+SHIP-118 → SHIP-123 ending gives the rule that catches it: *a §4 row should name the owner's clause,
+not just the owner.* A row whose *Done when* does not mention the addresses will close with the
+addresses still missing, and this entry will be written again.
+
+
 ## 10. The done list, in a form a script can read
 
 **The list is `Docs/11-done.txt`**, one ticket per line. It is still authoritative and it is
@@ -20586,10 +20686,10 @@ still updated in the same change that finishes a ticket — it has simply moved 
 document. `make status` reads it, counts it against the backlog, and cross-checks it against
 what commit subjects claim.
 
-A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is in the list**, and its six live rows — **SHIP-158, SHIP-77, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a** — are all in it, which is
+A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is in the list**, and its seven live rows — **SHIP-158, SHIP-77, SHIP-120, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a** — are all in it, which is
 not a contradiction to be tidied away. **This sentence was wrong at three consecutive
 reconciliations and it is right at this one, because it was re-read rather than restated**: §4's
-non-struck first cells were listed off the tree and each of the six checked against
+non-struck first cells were listed off the tree and each of the seven checked against
 `Docs/11-done.txt` by name. It named SHIP-149, SHIP-77 and SHIP-118 three passes ago and SHIP-77 and
 SHIP-151 two passes ago, each time correctly at the moment of writing and wrongly by the next merge.
 **The reason the pattern is worth keeping rather than the sentence**: neither this nor §4's parallel

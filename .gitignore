@@ -32,6 +32,18 @@ dist/
 *.out
 coverage.*
 
+# A bare `go build ./cmd/<name>` run from services/core drops the binary beside the
+# module, rather than into bin/ where `make build` and every mk/ target put it. One
+# line per cmd package instead of a glob: a glob here would also swallow a directory
+# somebody meant to commit, and `api` is exactly the name that would be.
+/services/core/api
+/services/core/lintboundaries
+/services/core/migrate
+/services/core/notifier
+/services/core/statusgen
+/services/core/topics
+/services/core/worker
+
 # === Flutter / Dart ===
 apps/mobile/.dart_tool/
 apps/mobile/.flutter-plugins
