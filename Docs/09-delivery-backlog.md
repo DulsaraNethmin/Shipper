@@ -6,7 +6,10 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**237 tickets, 738 points.**
+**239 tickets, 744 points.** Counted from the rows on 2026-08-19, at `7739691`. The previous
+figure — 237 and 738 — predated wave 16's Phase 0, which split three rows without the header
+being recounted. `make status` reads the rows, so it had been disagreeing with this line rather
+than with the plan.
 
 ## How to read this
 
