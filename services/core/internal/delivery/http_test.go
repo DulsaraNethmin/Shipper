@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -164,9 +165,28 @@ func TestAssignEndpointAnswersWithTheAssignmentItCreated(t *testing.T) {
 	if !strings.HasSuffix(body.DriverTokenExpiresAt, "Z") {
 		t.Errorf("driver_token_expires_at = %q, want UTC", body.DriverTokenExpiresAt)
 	}
-	if body.DriverTokenExpiresAt <= body.AssignedAt {
-		t.Errorf("the link expires at %q, which is not after the assignment at %q",
-			body.DriverTokenExpiresAt, body.AssignedAt)
+	// Against the clock that issued the token, not against assigned_at (SHIP-15an).
+	//
+	// **These were two different clocks, and only one of them is injectable.** `assigned_at` is
+	// `driver_assignments.created_at`, which is `DEFAULT now()` — the database's own clock, running
+	// in real time. The expiry is [testInstant] plus the token TTL, on the [clock.Fixed] this
+	// package's tests are built on. So the comparison was frozen-against-real, and it did not
+	// merely risk going wrong: testInstant is 2026-08-12T03:30:00Z and the test TTL is seven days,
+	// so the expiry is 2026-08-19T03:30:00Z, and at that instant real time overtook it. The test
+	// began failing then, permanently, with a gap that widens by a day every day.
+	//
+	// It read as a date-sensitive test and it is not one — a fixed clock is deliberate here, for
+	// the reason [testInstant] gives. What was wrong was the comparison, so that is what changed.
+	// What this assertion is *for* is that a link outlives the moment it was issued; issuance
+	// happens on the injected clock, so the injected clock is what it is held against.
+	expires, err := time.Parse(time.RFC3339, body.DriverTokenExpiresAt)
+	if err != nil {
+		t.Fatalf("driver_token_expires_at = %q, which is not RFC 3339: %v",
+			body.DriverTokenExpiresAt, err)
+	}
+	if !expires.After(testInstant) {
+		t.Errorf("the link expires at %q, which is not after the instant it was issued at, %q",
+			body.DriverTokenExpiresAt, testInstant.Format(time.RFC3339))
 	}
 }
 
