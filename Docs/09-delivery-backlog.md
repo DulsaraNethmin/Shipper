@@ -6,10 +6,15 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**239 tickets, 744 points.** Counted from the rows on 2026-08-19, at `7739691`. The previous
-figure — 237 and 738 — predated wave 16's Phase 0, which split three rows without the header
-being recounted. `make status` reads the rows, so it had been disagreeing with this line rather
-than with the plan.
+**240 tickets, 747 points.** Counted from the rows on 2026-08-19, at `c710ed4`, plus the one row
+this branch adds. The previous figure — 239 and 744 — was correct for the tree it was written on
+and this pass adds `SHIP-17d`, three points.
+
+**The line before that read 237 and 738, and it was wrong for two waves.** It predated wave 16's
+Phase 0, which split three rows without the header being recounted, and `SHIP-15ao` exists only to
+have corrected it. **`make status` reads the rows rather than this line**, so a header left behind
+does not fail a gate — it disagrees with the plan quietly, which is why the count is restated here
+whenever a row is added rather than left for a later pass to reconcile.
 
 ## How to read this
 
@@ -116,6 +121,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | SHIP-17a | Published API contract | 3 | contracts/openapi.yaml exists and a Go test validates real handler responses against it | SHIP-13 |
 | SHIP-17b | Contract validation that reaches the authenticated surface | 5 | The response check covers the routes its exercisable() filter skips today — every non-GET, every authenticated and every parameterised route, which is 82 of the 86 on the manifest — by driving them with fixtures rather than naming them as skipped; a request body carrying a field the contract does not declare fails a gate, which is the half that has no check at all; and whatever is still unreached is named in the output rather than counted | SHIP-17a |
 | SHIP-17c | A job-state builder, so the contract check reaches the lifecycle | 3 | The 18 routes SHIP-17b named unreached for want of a job past Draft are driven against fixtures that reach them — the job seeded up Docs/02 §2's ladder through the guarded transition rather than by UPDATE, an eligible provider, a real award, a driver assignment and a delivery under way; coverage is reported as a measured count; and whatever is still unreached is named with a reason that is not "the job is a Draft" | SHIP-17b |
+| SHIP-17d | The last five contract routes, and an object store to reach one of them | 3 | Every route on the manifest is driven by a fixture and `contractUnreached` is empty — the two-person suspension approval driven by a *second* signed-in administrator, the provider's verification evidence read back as a page that carries a document rather than as an empty one, and the email token and phone code minted and stored the way the platform stores them rather than read back from a message the platform keeps no copy of; the document-recording route reaches a store that answers a real HEAD, wired before the router rather than in a fixture hook; and a route whose success status does not by itself prove the handler found anything says so with a check that fails when it does not | SHIP-17c |
 | SHIP-18 | Flutter API client with environment-based base URL | 3 | Client targets local, staging, and production by build flavour | SHIP-17 |
 | SHIP-19 | Flutter health round trip proving connectivity | 1 | App displays the API version fetched from /health | SHIP-18, SHIP-6 |
 | SHIP-20 | CI: Go build, vet, and test | 2 | Workflow runs on every push and fails on a broken build or test | SHIP-5 |
