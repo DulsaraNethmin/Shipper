@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -93,6 +96,31 @@ func (a contractAuth) String() string {
 // contractPassword is the password both seeded credentials use.
 const contractPassword = "correct-horse-battery-staple"
 
+// contractCustomerPhone is the customer's number, named because two fixtures have to agree on it
+// (SHIP-17d).
+//
+// `Service.VerifyPhone` reads the account by number and then refuses a code whose row names a
+// different one, so the value in `users.phone` and the value in `phone_otps.phone` are the same
+// fact twice. As two literals they were one careless edit from disagreeing, and the endpoint folds
+// every such failure into one `identity_otp_invalid`.
+const contractCustomerPhone = "+61400900001"
+
+// The two out-of-band secrets, chosen by the fixture rather than read back from the platform
+// (SHIP-17d).
+//
+// Both endpoints are reached by *being* the person who received the message, and the platform keeps
+// nothing either could be recovered from — `email_verification_tokens.token_hash` is a digest and
+// `phone_otps.code_hash` is argon2id. So the fixture picks the secret, stores it the way the
+// platform would have, and sends it back. Named here because the seed writes one half and the
+// request body sends the other, and the endpoint folds every mismatch into a single opaque error.
+const (
+	contractEmailToken = "contract-email-verification-token"
+
+	// Numeric: Service.VerifyPhone refuses anything else before it hashes, so that an endpoint
+	// needing no account cannot be made to allocate 64 MiB a call.
+	contractPhoneCode = "314159"
+)
+
 // contractWorld is one router over one database, with a credential of every kind and the rows the
 // parameterised paths address.
 type contractWorld struct {
@@ -122,6 +150,106 @@ type contractWorld struct {
 	verificationObjectKey string
 	// disputeID is set by raiseDispute, for the two administrator routes that address one.
 	disputeID uuid.UUID
+	// suspensionReviewID is set by suspensionAwaitingApproval, which also leaves a *second*
+	// administrator holding adminToken.
+	suspensionReviewID uuid.UUID
+
+	// store is the object store both storage adapters talk to, and it starts empty.
+	store *contractStore
+
+	// hasher is the world's own argon2id, kept because one fixture has to write a credential the
+	// platform will later verify — see seedPhoneCode.
+	hasher *passwords.Hasher
+}
+
+// contractStore is an object store with nothing in it, which is what the world needs and is also
+// the one fixture that could not be written as a setup hook (SHIP-17d).
+//
+// # Why a fake store exists at all, when four of the five other adapters are real
+//
+// `POST /v1/provider/verification/documents` is the request that turns an object in a bucket into
+// one of Docs/04 §3's four documents, and Docs/06 §5.2 keeps the platform out of the upload path —
+// so the only moment it can learn what was actually stored is when it asks. `profiles.Documents`
+// asks, through `DocumentObjects.Stored`, and that is a real HEAD over the network. Every other
+// storage call on the served surface signs a URL and returns it: an HMAC over a string, which needs
+// no store to be reachable and is why the other verification routes were driven long before this
+// one.
+//
+// So this is not "the store is slow, stub it". It is the one place where a route's success depends
+// on a fact about the world that only the store holds.
+//
+// # It must be wired before newRouter, and that is what made this route structural
+//
+// `cmd/api` builds its signers inside attach, from `Deps.Config` — `profileDocuments(d)` reads
+// `d.Config.Storage.Endpoint` and hands it to `storage.NewS3`. A `setup:` hook runs against a
+// router that has already been constructed, so an endpoint rewritten there is a value the signer
+// read a moment ago and will never read again. Hence the constructor rather than a hook, and hence
+// the one route out of five that could not simply be added to contractCases.
+//
+// # Three headers, and every one of them is load-bearing
+//
+// `profiles.stored` refuses an object whose media type is not in STORAGE_ACCEPTED_CONTENT_TYPES,
+// whose length is not positive, or whose entity tag is blank — and `storage.S3.Stored` refuses a
+// response with no length at all before profiles ever sees it, because Go reports an absent
+// Content-Length as -1 and a negative number passes every "under the limit" comparison there is.
+// Omitting any of the three produces the same opaque 500, which is exactly the answer this route
+// gave before it was driven.
+type contractStore struct {
+	// bucket is the path-style first segment, stripped before a key is looked up.
+	bucket string
+
+	mu      sync.Mutex
+	objects map[string]contractObject
+}
+
+// contractObject is one object as a store would report it on a HEAD.
+type contractObject struct {
+	contentType   string
+	contentLength int64
+	etag          string
+}
+
+func newContractStore(bucket string) *contractStore {
+	return &contractStore{bucket: bucket, objects: map[string]contractObject{}}
+}
+
+// put makes key exist. Safe to call from a setup hook, which runs after the server is serving.
+func (s *contractStore) put(key string, object contractObject) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects[key] = object
+}
+
+// ServeHTTP answers HEAD the way an S3-compatible store does, and 404 for everything it does not
+// hold.
+//
+// **404 rather than a connection error, and the difference is not cosmetic.** `S3.Stored` reads 404
+// as "no object" — an answer — and anything else as a fault, so a store that refuses the connection
+// makes every unseeded key a 500. That is what `http://localhost:9000` did here, and it is why the
+// note this fixture replaces recorded a 500 where the domain has ErrDocumentNotUploaded for exactly
+// the case.
+//
+// The signature is not checked. What is under test is the contract the platform publishes, and
+// SigV4 has `TestTheAWSExampleSignsToThePublishedSignature` in the adapter's own package.
+func (s *contractStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimPrefix(r.URL.Path, "/"+s.bucket+"/")
+
+	s.mu.Lock()
+	object, found := s.objects[key]
+	s.mu.Unlock()
+
+	if !found {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// Set explicitly, all three. Go sends no Content-Length of its own for a HEAD — there is no
+	// body to measure — so this header is the only reason the adapter sees a length rather than
+	// the -1 it refuses.
+	w.Header().Set("Content-Type", object.contentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(object.contentLength, 10))
+	w.Header().Set("ETag", `"`+object.etag+`"`)
+	w.WriteHeader(http.StatusOK)
 }
 
 // newContractWorld seeds the smallest world every route can be addressed in.
@@ -146,11 +274,17 @@ func newContractWorld(t *testing.T) *contractWorld {
 		t.Fatalf("building the administrator guard: %v", err)
 	}
 
-	w := &contractWorld{
-		pool: pool,
-		router: newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(),
-			testDriverGuard(), adminGuard),
-	}
+	w := &contractWorld{pool: pool, store: newContractStore(deps.Config.Storage.Bucket)}
+
+	// Before newRouter, not after: the signers are built during attach and read this value once.
+	// See contractStore's own note — this ordering is the whole reason the document-recording
+	// route needed a change here rather than a fixture of its own.
+	objects := httptest.NewServer(w.store)
+	t.Cleanup(objects.Close)
+	deps.Config.Storage.Endpoint = objects.URL
+
+	w.router = newRouter(deps, idempotency.NewMemoryStore(), testLimiter(), testAuthenticator(),
+		testDriverGuard(), adminGuard)
 
 	hasher, err := passwords.NewHasher(passwords.Argon2Profile{
 		MemoryKiB:   deps.Config.Passwords.Argon2.MemoryKiB,
@@ -160,6 +294,7 @@ func newContractWorld(t *testing.T) *contractWorld {
 	if err != nil {
 		t.Fatalf("building the hasher: %v", err)
 	}
+	w.hasher = hasher
 
 	// Two mobile users. The token is minted rather than signed in for, because what is under
 	// test is the shape of every response and not the sign-in path — which has tests of its own.
@@ -179,7 +314,7 @@ func newContractWorld(t *testing.T) *contractWorld {
 		t.Fatalf("hashing: %v", err)
 	}
 	w.customerEmail = "contract-customer@example.com"
-	insertContractUser(t, pool, customerID, w.customerEmail, "+61400900001", "customer", hashed)
+	insertContractUser(t, pool, customerID, w.customerEmail, contractCustomerPhone, "customer", hashed)
 	insertContractUser(t, pool, providerID, "contract-provider@example.com", "+61400900002", "provider", hashed)
 
 	w.seedAdministrator(t, deps, pool, client, prefix, hasher)
@@ -259,6 +394,155 @@ func (w *contractWorld) seedVerificationUpload(t *testing.T) {
 	w.verificationObjectKey, _ = body["object_key"].(string)
 	if w.verificationObjectKey == "" {
 		t.Fatalf("the upload response carries no object_key: %v", body)
+	}
+}
+
+// storeVerificationObject makes the key the platform signed actually hold something (SHIP-17d).
+//
+// The type and the length are the ones seedVerificationUpload asked permission for, which is not
+// tidiness: `profiles.stored` judges STORAGE_ACCEPTED_CONTENT_TYPES and STORAGE_MAX_UPLOAD_BYTES
+// against **what the store reports**, deliberately, so that the limits bind the object that exists
+// rather than only the request that asked to create one. A fixture reporting something else would
+// be testing the refusal path while claiming to test the success one.
+func (w *contractWorld) storeVerificationObject() {
+	w.store.put(w.verificationObjectKey, contractObject{
+		contentType:   "image/jpeg",
+		contentLength: 1048576,
+		etag:          "d41d8cd98f00b204e9800998ecf8427e",
+	})
+}
+
+// submitVerificationDocument records that object as one of Docs/04 §3's four documents.
+//
+// Driven through the endpoint rather than INSERTed, for the reason `drive` gives: a hand-written
+// INSERT names columns, and `provider_verification_documents` is append-only with a no-update
+// trigger, so a fixture that wrote it directly would be the only writer in the repository that
+// bypasses the one check the platform makes about the bytes.
+func (w *contractWorld) submitVerificationDocument(t *testing.T) {
+	t.Helper()
+
+	w.storeVerificationObject()
+
+	status, body := w.drive(t, http.MethodPost, "/v1/provider/verification/documents", asProvider,
+		`{"kind":"licence","object_key":"`+w.verificationObjectKey+`"}`)
+	if status != http.StatusCreated {
+		t.Fatalf("recording the verification document: status %d, body %v", status, body)
+	}
+}
+
+// suspensionAwaitingApproval files a permanent suspension and leaves a **different** administrator
+// signed in to approve it (SHIP-17d).
+//
+// # The second administrator is the control, not a detail of the fixture
+//
+// Docs/04 §9 asks for two-person review, and SHIP-166 enforces it in two places: the service refuses
+// `approved_by = requested_by`, and `ck_suspension_reviews_two_people` refuses it again in the
+// database. So a fixture that filed and approved on one token would answer `admin_same_administrator`
+// — a real response, and the wrong one to be checking the success schema against.
+//
+// # Moderator rather than support, and the difference is one permission
+//
+// The approval takes `users.restrict`, which [RoleModerator] and [RoleOwner] hold and `support` does
+// not. The neighbouring `POST /v1/admin/administrators` case creates a `support` administrator, and
+// reusing that shape here answers 403 — which looks enough like a near miss to tempt somebody into
+// moving `want` rather than fixing the role.
+//
+// {id} is the review's identifier and not the user's, which is the other thing worth stating: the
+// request answers with the review, and the approval addresses it.
+func (w *contractWorld) suspensionAwaitingApproval(t *testing.T) {
+	t.Helper()
+
+	status, body := w.drive(t, http.MethodPost,
+		"/v1/admin/users/"+w.customerID.String()+"/suspension", asAdmin,
+		`{"reason":"Three unresolved safety reports in a fortnight; see the exception queue."}`)
+	if status != http.StatusAccepted {
+		t.Fatalf("requesting the suspension: status %d, body %v", status, body)
+	}
+	reviewID, _ := body["id"].(string)
+	parsed, err := uuid.Parse(reviewID)
+	if err != nil {
+		t.Fatalf("the review response carries no id: %v", body)
+	}
+	w.suspensionReviewID = parsed
+
+	const approver = "contract-approver@example.com"
+	if status, body = w.drive(t, http.MethodPost, "/v1/admin/administrators", asAdmin,
+		`{"email":"`+approver+`","name":"A Second Person",`+
+			`"password":"`+contractPassword+`","role":"moderator"}`); status != http.StatusCreated {
+		t.Fatalf("creating the second administrator: status %d, body %v", status, body)
+	}
+
+	if status, body = w.drive(t, http.MethodPost, "/v1/admin/sessions", asAnonymous,
+		`{"email":"`+approver+`","password":"`+contractPassword+`"}`); status != http.StatusOK {
+		t.Fatalf("signing the second administrator in: status %d, body %v", status, body)
+	}
+	token, _ := body["token"].(string)
+	if token == "" {
+		t.Fatalf("the second administrator's session carries no token: %v", body)
+	}
+
+	// Every later asAdmin request in this world is the approver. Reassigned rather than carried
+	// beside the first, because the case that follows drives one request and it is that one.
+	w.adminToken = token
+}
+
+// seedEmailVerificationToken writes a live token for the customer and returns the secret half
+// (SHIP-17d).
+//
+// # The fixture chooses the token, because the platform keeps nothing it could be read back from
+//
+// `email_verification_tokens.token_hash` is the SHA-256 of the token, hex encoded — plain and
+// unkeyed, by `000101`'s argument that 256 bits from crypto/rand has nothing for a work factor to
+// protect. The token itself "exists only in the email". So there is no table to inspect and no
+// message to intercept: what a fixture can do is pick a token, store its digest, and let the
+// endpoint do the same arithmetic in the other direction.
+//
+// **The row's email is citext and must equal `users.email`.** `Service.VerifyEmail` compares them —
+// a token proves control of the address it was sent to, not of whatever address the account holds
+// now — and every failure in this endpoint folds into one `identity_verification_token_invalid`, so
+// a mismatch here gives no clue which half is wrong.
+func (w *contractWorld) seedEmailVerificationToken(t *testing.T) {
+	t.Helper()
+
+	digest := sha256.Sum256([]byte(contractEmailToken))
+
+	if _, err := w.pool.Exec(t.Context(),
+		`INSERT INTO email_verification_tokens (id, user_id, email, token_hash, expires_at)
+		 VALUES ($1, $2, $3, $4, now() + interval '1 hour')`,
+		uuid.New(), w.customerID, w.customerEmail, hex.EncodeToString(digest[:])); err != nil {
+		t.Fatalf("seeding an email verification token: %v", err)
+	}
+}
+
+// seedPhoneCode writes a live one-time code for the customer and returns it (SHIP-17d).
+//
+// # This one cannot be read back even in principle, which is why the world keeps its hasher
+//
+// `phone_otps.code_hash` is an argon2id PHC string, exactly as `users.password_hash` is — `000102`
+// makes the opposite choice from the email token and gives the reason: six digits is 10^6, which a
+// laptop inverts in under a second if it is only SHA-256. A fixture written on the assumption that
+// the code is recoverable is rewritten from scratch, so it is stated here.
+//
+// The code is hashed with the world's own hasher at the world's own profile, and the row is written
+// beside the number it was "sent" to — `Service.VerifyPhone` refuses a code whose row names a
+// different one.
+//
+// **Nothing here drives POST /v1/auth/request-otp first, and it must not.** `uq_phone_otps_live`
+// allows one live code per account and a request supersedes the outstanding one, so asking for a
+// code after seeding this row retires it — and the endpoint then answers the same undiagnosable
+// `identity_otp_invalid` it answers for a wrong guess.
+func (w *contractWorld) seedPhoneCode(t *testing.T) {
+	t.Helper()
+
+	hashed, err := w.hasher.Hash(contractPhoneCode)
+	if err != nil {
+		t.Fatalf("hashing a one-time code: %v", err)
+	}
+	if _, err := w.pool.Exec(t.Context(),
+		`INSERT INTO phone_otps (id, user_id, phone, code_hash, expires_at)
+		 VALUES ($1, $2, $3, $4, now() + interval '10 minutes')`,
+		uuid.New(), w.customerID, contractCustomerPhone, hashed); err != nil {
+		t.Fatalf("seeding a one-time code: %v", err)
 	}
 }
 
@@ -712,6 +996,19 @@ type contractCase struct {
 	// path overrides concretePath for the routes whose id is not the seeded job's.
 	path func(w *contractWorld) string
 
+	// assert is an extra check on the decoded response, for a route whose status does not by
+	// itself prove the handler found anything (SHIP-17d).
+	//
+	// **Nearly every route here needs none, and that is the point of having it on so few.** A 200
+	// from `POST /v1/auth/verify-phone` means a code was matched and consumed — anything else is
+	// `identity_otp_invalid` — so the status *is* the assertion. A 200 from a collection is not:
+	// an empty page is a valid response against the contract, so a fixture that seeded nothing
+	// validates the envelope and none of the fields inside it, and passes. That is the vacuous
+	// pass this file's header is written about, one level down.
+	//
+	// Runs after the schema check, so a body that fails both reports the contract violation first.
+	assert func(t *testing.T, body map[string]any)
+
 	// setup advances the world past what newContractWorld seeds — a job further up the ladder, an
 	// offer actually submitted, a driver assigned. Nil leaves the seeded world alone.
 	//
@@ -839,8 +1136,8 @@ var contractCases = map[string]contractCase{
 		return `{"name":"A Person","email":"contract-new@example.com","phone":"+61400900009",` +
 			`"password":"` + contractPassword + `","role":"customer"}`
 	}},
-	"POST /v1/auth/request-otp": {auth: asAnonymous, want: 202, body: func(w *contractWorld) string {
-		return `{"phone":"+61400900001"}`
+	"POST /v1/auth/request-otp": {auth: asAnonymous, want: 202, body: func(*contractWorld) string {
+		return `{"phone":"` + contractCustomerPhone + `"}`
 	}},
 	"POST /v1/auth/resend-verify": {auth: asAnonymous, want: 202, body: func(w *contractWorld) string {
 		return `{"email":"` + w.customerEmail + `"}`
@@ -965,6 +1262,59 @@ var contractCases = map[string]contractCase{
 	"POST /v1/admin/users/{id}/suspension": {auth: asAdmin, want: 202,
 		path: func(w *contractWorld) string { return "/v1/admin/users/" + w.customerID.String() + "/suspension" },
 		body: func(*contractWorld) string { return `{"reason":"Under review"}` }},
+
+	// The last five (SHIP-17d). Each needed something the job ladder cannot produce — a second
+	// administrator, bytes in a bucket, or a secret the platform deliberately sends out of band —
+	// which is why they outlived the eighteen SHIP-17c lifted in one move.
+
+	// {id} is the review, and asAdmin here is the *second* administrator: the setup reassigns the
+	// token, because the two-person rule is what this route is.
+	"POST /v1/admin/suspensions/{id}/approval": {auth: asAdmin, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.suspensionAwaitingApproval(t) },
+		path: func(w *contractWorld) string {
+			return "/v1/admin/suspensions/" + w.suspensionReviewID.String() + "/approval"
+		}},
+
+	// A document has to have been submitted, or this answers 200 with an empty page — a pass that
+	// validates none of the eight fields the contract declares for one. {id} is the provider's
+	// account id: provider_verifications is keyed by provider_id.
+	"GET /v1/admin/verifications/{id}/documents": {auth: asAdmin, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.submitVerificationDocument(t) },
+		path: func(w *contractWorld) string {
+			return "/v1/admin/verifications/" + w.providerID.String() + "/documents"
+		},
+		assert: func(t *testing.T, body map[string]any) {
+			// The reason this route needed the assert hook. It answered 200 with an empty page
+			// for as long as it went undriven, and an empty page validates against the contract
+			// perfectly well — so without this the case would prove the envelope and none of the
+			// eight fields a document carries.
+			data, _ := body["data"].([]any)
+			if len(data) == 0 {
+				t.Fatalf("the evidence page is empty, so this case validated an envelope and "+
+					"no document.\n  body: %v\n"+
+					"  The setup submits one against the provider this path addresses; an empty "+
+					"page means it is being read back under a different id.", body)
+			}
+		}},
+
+	"POST /v1/auth/verify-email": {auth: asAnonymous, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.seedEmailVerificationToken(t) },
+		body: func(*contractWorld) string {
+			return `{"token":"` + contractEmailToken + `"}`
+		}},
+
+	"POST /v1/auth/verify-phone": {auth: asAnonymous, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.seedPhoneCode(t) },
+		body: func(*contractWorld) string {
+			return `{"phone":"` + contractCustomerPhone + `","code":"` + contractPhoneCode + `"}`
+		}},
+
+	// The one that needed the store wired before the router. See contractStore.
+	"POST /v1/provider/verification/documents": {auth: asProvider, want: 201,
+		setup: func(_ *testing.T, w *contractWorld) { w.storeVerificationObject() },
+		body: func(w *contractWorld) string {
+			return `{"kind":"licence","object_key":"` + w.verificationObjectKey + `"}`
+		}},
 }
 
 // contractUnreached names every route no fixture drives, with the reason.
@@ -974,7 +1324,7 @@ var contractCases = map[string]contractCase{
 // named in the output rather than counted, and an exemption that has to be written by hand is the
 // only form of that which cannot rot silently.
 var contractUnreached = map[string]string{
-	// # What used to be here, and why it is worth recording that it is not
+	// # Empty, as of SHIP-17d — and the map stays because emptiness is the finding
 	//
 	// SHIP-17b named 23 routes and grouped 18 of them under one prediction: that they lift together
 	// once the job can be seeded past Draft. SHIP-17c built that builder and the prediction held —
@@ -982,35 +1332,24 @@ var contractUnreached = map[string]string{
 	// gate from 63 to 81 of 86. **Two of those 18 were not in the group at all**: the administrator
 	// dispute routes came free, because a dispute needs a delivery and the ladder now reaches one.
 	//
-	// **What is left is not a smaller version of that problem.** Each of the five below needs
-	// something the lifecycle cannot produce — a second administrator, bytes in a bucket, or a
-	// secret the platform deliberately sends out of band. None is lifted by seeding a status, which
-	// is why they are five separate reasons rather than one group.
-
-	// # Administration acting on a subject that has to exist first
-	"POST /v1/admin/suspensions/{id}/approval":   "needs a suspension requested by a *different* administrator — the two-person rule refuses the requester's own approval, so the world needs a second signed-in owner",
-	"GET /v1/admin/verifications/{id}/documents": "needs a verification carrying a stored document — see the object-store note below",
-
-	// # One-time secrets the platform sends out of band
+	// The five that were left were not a smaller version of that problem, and each needed something
+	// the lifecycle could not produce: a second administrator, an object in a bucket, or a secret
+	// the platform sends out of band and keeps no readable copy of. They are driven now — the two
+	// one-time secrets by minting the credential and storing what the platform would have stored,
+	// the document pair by giving the world an object store, and the approval by signing a second
+	// administrator in.
 	//
-	// Both are reachable, and reaching them means reading back what the platform generated rather
-	// than sending a plausible value. Neither is hard; both are a fixture that inspects a table the
-	// endpoint is supposed to be the only reader of.
-	"POST /v1/auth/verify-email": "needs the token the verification email carried",
-	"POST /v1/auth/verify-phone": "needs the OTP the SMS carried",
-
-	// # The one that needs bytes in the object store
+	// **Leaving the map here rather than deleting it is deliberate.** It is the half of
+	// [TestEveryRouteIsDrivenOrNamed] that makes a gap cost a sentence somebody has to write: a new
+	// route with no fixture fails the build until it is either driven or entered here with a
+	// reason. Deleting it would make the next unreached route a silent one, which is the state
+	// SHIP-17a's log line was replaced for.
 	//
-	// The world asks for a signed upload URL and gets one, so the key is real. Recording the
-	// document then inspects the *stored object* — Docs/06 §5.2 keeps the platform out of the
-	// upload path, so the only moment it can learn the size and media type is when it asks the
-	// store. Nothing has been uploaded and the bucket testStorageConfig names does not exist, so
-	// the lookup fails and the handler answers 500.
-	//
-	// **That 500 is worth a second look and is not this ticket's to take.** A key that is well
-	// formed and names no object is a client mistake rather than a platform fault, and
-	// internal/profiles has ErrDocumentRejected for exactly the neighbouring case.
-	"POST /v1/provider/verification/documents": "needs an object actually in the store; the fixture uploads no bytes and the bucket is not created",
+	// One thing an entry must not become is a place to park a route that is merely awkward. Each of
+	// the five above was named with a reason that was true when written, and one of them was wrong
+	// about the mechanics in a way that would have cost somebody an afternoon: the verification
+	// documents route was recorded as needing the object store, and it does not — `PresignDownload`
+	// is an HMAC over a string and touches no I/O. What it needed was a document to list.
 }
 
 // TestEveryRouteIsDrivenOrNamed is the gate SHIP-17b adds: no route may be silently skipped.
@@ -1114,6 +1453,14 @@ func TestResponsesMatchTheContract(t *testing.T) {
 			}
 
 			validateAgainstContract(t, router, req, rec)
+
+			if c.assert != nil {
+				var decoded map[string]any
+				if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil {
+					t.Fatalf("decoding the response to assert on it: %v\n  body: %s", err, rec.Body)
+				}
+				c.assert(t, decoded)
+			}
 		})
 	}
 }
