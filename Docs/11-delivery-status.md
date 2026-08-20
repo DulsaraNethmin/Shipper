@@ -17351,6 +17351,8 @@ it as SHIP-164's blocker.
 
 ## 7. Wave 16 — what landed
 
+> **§7 is not a complete record of the waves, and this note is here so the gap is not read as one.** The letters run 16, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 — **there is no section for wave 14, wave 15 or wave 17.** Each of the three has a summary paragraph in §1 instead, written by the pass that measured it, and each states its own ref. **A missing section reads as a wave that did not happen**, which is the same silence §4 carried for SHIP-120 across three passes; naming it costs a sentence and finding it out the hard way costs a reader's afternoon.
+
 **A repair-and-unblock wave, and the first one this file has recorded that shipped no feature it set
 out to ship.** Wave 15 handed forward three startable code rows; **all three were mis-sized or
 unbuildable when measured**, and two live defects were sitting on `develop`, one of them wave 15's
