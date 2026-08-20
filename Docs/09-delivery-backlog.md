@@ -505,9 +505,11 @@ Worth stating plainly rather than discovering in month four.
 
 | Working pattern | Points per week | Elapsed |
 |---|---|---|
-| Full-time, focused | 20–25 | **23–29 weeks** (roughly 5–7 months) |
-| Full-time, with interruptions | 15 | **~39 weeks** |
-| Evenings and weekends | 6–8 | **74–99 weeks** (over a year) |
+| Full-time, focused | 20–25 | **29–37 weeks** (roughly 7–9 months) |
+| Full-time, with interruptions | 15 | **~49 weeks** |
+| Evenings and weekends | 6–8 | **93–124 weeks** (around two years) |
+
+**The three rows are `floor(747 / rate)` and nothing else, and the total they divide is the one the rows carry.** They read 23, 29, 39, 74 and 99 until this pass, which is `floor(599 / rate)` exactly — so the table was not merely stale, it was arithmetic over a total the plan stopped having long ago, and the 599 was still printed under *If you need to cut scope* where it was easiest to read as current. Recompute all five figures whenever the point total moves — 29, 37, 49, 93 and 124 — together with the 747 under *If you need to cut scope*, which is the same total wearing prose. They are derived, not estimated.
 
 These assume the point scale above and one experienced developer who already knows Flutter. They do **not** assume time spent learning Go, AWS, or Kafka — if any of those are new, add to M0 and M5 specifically.
 
@@ -515,7 +517,7 @@ Two things move this number more than working faster does: cutting scope (below)
 
 ## If you need to cut scope
 
-599 points is a substantial solo build. These are the honest levers, in the order I would pull them:
+747 points is a substantial solo build. These are the honest levers, in the order I would pull them:
 
 | Cut | Saves | What you lose |
 |---|---|---|
