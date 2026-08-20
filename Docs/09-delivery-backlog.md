@@ -49,15 +49,15 @@ whenever a row is added rather than left for a later pass to reconcile.
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 10 | 29 |
-| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 39 | 111 |
+| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 41 | 117 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 29 | 83 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 28 | 84 |
 | **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 39 | 133 |
 | **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 33 | 112 |
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 14 | 48 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 22 | 69 |
-| **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 23 | 69 |
-| | | **237** | **738** |
+| **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 24 | 72 |
+| | | **240** | **747** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -88,7 +88,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M0 — Foundation
 
 **Goal:** The stack runs locally, CI is green, and a signed build reaches a real device.  
-**Size:** 38 tickets, 106 points
+**Size:** 41 tickets, 117 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -234,7 +234,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M3 — Bidding and award
 
 **Goal:** Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one.  
-**Size:** 38 tickets, 128 points
+**Size:** 39 tickets, 133 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -444,7 +444,7 @@ Five segments or more are safe, because the literal route has only three after `
 ## M7 — Hardening and pilot readiness
 
 **Goal:** The store prerequisites are met, the system is observable, and the release gate can be run.  
-**Size:** 20 tickets, 58 points
+**Size:** 24 tickets, 72 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
