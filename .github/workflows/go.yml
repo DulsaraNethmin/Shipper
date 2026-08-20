@@ -178,6 +178,81 @@ jobs:
       - name: Australian English
         run: ./scripts/check-spelling.sh
 
+  images:
+    name: container images
+    runs-on: ubuntu-latest
+
+    # SHIP-187. `make check` compiles every binary and would not notice a Dockerfile that stopped
+    # building, so this is the only job that fails on one. It is deliberately the cheap half of
+    # scripts/images-verify.sh: the checks below need no PostgreSQL, no Redis, no Kafka and no
+    # object store, because a configuration refusal happens before the first connection is opened.
+    #
+    # The half that is missing is the half that needs the stack — migrate applying the embedded
+    # schema, topics applying the catalogue, the API answering /health. `make images-verify` runs
+    # all sixteen against the compose stack, and it is what to run when the Dockerfile changes.
+    # Reproducing it here would mean four service containers to prove something a developer
+    # already proved locally, and no job at all would mean a broken Dockerfile reaching the
+    # demonstration environment.
+    #
+    # ubuntu-latest, like every other job in this repository. .github/workflows/README.md's rule
+    # is about macOS minutes and nothing here needs a macOS runner.
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image build is the whole point of the job, so it is not cached: a cache hit would
+      # report success for a Dockerfile nobody built. Layer caching inside a single run is enough
+      # — all five targets share one build stage, which is compiled once.
+      - name: build every image
+        run: make images
+
+      # Nothing here writes to disk, so root would buy nothing but the blast radius of a
+      # container escape.
+      - name: every image runs unprivileged
+        run: |
+          for t in api worker notifier migrate topics; do
+            uid="$(docker run --rm --entrypoint sh "shipper-$t:dev" -c 'id -u')"
+            if [ "$uid" != "65532" ]; then
+              echo "::error::shipper-$t runs as uid $uid, want 65532"
+              exit 1
+            fi
+          done
+
+      # The build context is services/core, so deploy/.env is unreachable by construction. This
+      # checks the construction rather than trusting it: an edit that moved the context to the
+      # repository root would still build, still start, and quietly ship the signing keys.
+      - name: no build-context file reaches a runtime image
+        run: |
+          for t in api worker notifier migrate topics; do
+            leaked="$(docker run --rm --entrypoint sh "shipper-$t:dev" -c \
+              'find / -xdev \( -name ".env" -o -name ".env.*" -o -name "*.go" -o -name "go.mod" -o -name "*.sql" \) 2>/dev/null | head -3')"
+            if [ -n "$leaked" ]; then
+              echo "::error::shipper-$t carries build-context files: $leaked"
+              exit 1
+            fi
+          done
+
+      # SHIP-187's criterion in its strongest form: "no file baked in that a deployment would
+      # need to change". If any deployment-shaped default were baked into a layer, this would
+      # start. It must not — and it must refuse for the *credential-default* reason, per
+      # variable. A mutation established that matching the variable name alone is worthless:
+      # baking ENV DATABASE_URL=...?sslmode=disable left the name in the refusal under a
+      # different rule, and a name-only check passed on the defect it exists to catch.
+      - name: the image carries no environment of its own
+        run: |
+          refusal="$(docker run --rm -e SHIPPER_ENV=production shipper-api:dev 2>&1 || true)"
+          for v in DATABASE_URL REDIS_URL IDENTITY_ACCESS_TOKEN_KEYS \
+                   DELIVERY_DRIVER_TOKEN_KEYS STORAGE_ACCESS_KEY_ID STORAGE_SECRET_ACCESS_KEY; do
+            case "$refusal" in
+              *"$v: must be set explicitly"*) ;;
+              *)
+                echo "::error::the refusal did not report $v as an unset credential-bearing default, so something is baked into a layer"
+                echo "$refusal"
+                exit 1
+                ;;
+            esac
+          done
+          echo "a production start with no environment is refused, naming all six variables"
+
   migrations:
     name: up, down, up
     runs-on: ubuntu-latest
