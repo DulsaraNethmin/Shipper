@@ -10,7 +10,37 @@
 
 `make status` prints the machine-checkable half — which tickets have a commit claiming them. It cannot see nuance, so **this file is authoritative** for anything a commit subject does not capture: partly finished tickets, external blockers, and what is safe to start next.
 
-**Last updated:** 2026-08-20, on **`ship-15aq-header-and-snapshot-counts`** — a counts-only pass, not a reconciliation. It rewrites §1's snapshot to the tree at **`36b0c3b`**, gives wave 1 back the section letter it shared with wave 2, and records in §11 why a `SHIP-15aq:` commit subject is invisible to `make status` where a `SHIP-15y:` one would hard-fail. **It closes no ticket, adds no `Docs/09` row, and touches §2, §3, §4, §5, §6, §7 and §9 not at all** — so every figure in those sections still carries the ref its own pass measured it on, and §6's startable set is `abb3d04`'s. That set was re-derived on `36b0c3b` before this pass began and is unchanged at ten rows and 31 points, which is why it was left alone rather than restated.
+**Last updated:** 2026-08-20, on **`ship-15ar-demo-rescope`** — a scope pass, and the first in this
+file's history that changes where the work is *going* rather than reporting where it is. `Docs/01`
+§8 now carries **two gates**: a demonstration a prospective buyer can drive unaided, in front of the
+pilot release that was always the target. `Docs/09` gains **M8** — six rows, nineteen points — and
+no existing row is touched, re-marked or removed. §1's totals, §5, §6 and §9 are rewritten against
+that decision; **§3 is not touched at all**, and neither is `Docs/11-done.txt`.
+
+**It closes no ticket.** The re-scope defers 70 of the 110 points that were open at `01eb04c` and
+completes none of them, so the done column is unchanged and `make status` moved only because the
+denominator did.
+
+**The finding that produced it is the part worth carrying forward, and it was not in anybody's
+plan.** With store distribution as the destination, §6 had reported for one pass that no code ticket
+was startable and every open row began outside this repository — which was true. Re-reading the same
+board against a demonstration turned up something the old framing could not surface: **`POST /v1/jobs`
+creates a draft, `PATCH /v1/jobs/{id}` edits it, and nothing anywhere transitions a job to `Open`.**
+There is no publish route among the 86 in `routes_golden.txt`. The transition guard already supports
+the move — `"a customer publishing": {To: StatusOpen, …}` is a live case in
+`internal/jobs/model_test.go:218` — so the domain can publish and no endpoint exposes it. **Every one
+of the 205 finished tickets sits downstream of a journey that cannot be started through the product**,
+and the marketplace has only ever been driven by writing rows into PostgreSQL by hand. That is
+SHIP-63, it is 5 points, and it has been blocked behind a legal brief for the whole project.
+
+**Nothing in this repository could have reported that**, which is the same shape as X-10 and SHIP-153
+before it and is worth stating as a test rather than as a story: **`make status` counts rows,
+`make verify` exercises endpoints one at a time, and neither asks whether the endpoints compose into
+a journey a person can walk.** A gap between two finished tickets is invisible to every instrument
+here. The demo gate in `Docs/01` §8 is the first check in the project that asks the composed
+question.
+
+**The pass beneath it:** 2026-08-20, on **`ship-15aq-header-and-snapshot-counts`** — a counts-only pass, not a reconciliation. It rewrites §1's snapshot to the tree at **`36b0c3b`**, gives wave 1 back the section letter it shared with wave 2, and records in §11 why a `SHIP-15aq:` commit subject is invisible to `make status` where a `SHIP-15y:` one would hard-fail. **It closes no ticket, adds no `Docs/09` row, and touches §2, §3, §4, §5, §6, §7 and §9 not at all** — so every figure in those sections still carries the ref its own pass measured it on, and §6's startable set is `abb3d04`'s. That set was re-derived on `36b0c3b` before this pass began and is unchanged at ten rows and 31 points, which is why it was left alone rather than restated.
 
 **The last full reconciliation:** 2026-08-17, on **`ship-15y-wave-14-prep`**, the wave-13 reconciliation, running concurrently with wave 14's code lanes rather than ahead of them — the fifth consecutive pass cut alongside the lanes and the sixth in a row that is **not** a backlog ticket. There is no `SHIP-15y` row in `Docs/09` and there must not be one in a commit subject: `scripts/delivery-status.sh` hard-fails on a claim the done list does not carry, so this branch's subjects name the surface they touch — `Docs/11:` — exactly as `ship-15q` through `ship-15x` did. It rewrites §1's arithmetic, §2's branch state and §6's startable set against `develop` at **`54ea9af`**, writes wave 13 up as the new §7 with the twelve earlier waves renumbered behind it, re-reads §5 and every remaining strike against today's tree, and adds nine entries to §9 — of which **two are corrections to entries the last pass wrote correctly and the merge made stale**, and **two close questions that had been recorded as blocked and were in fact ownerless.** **Every scalar below was measured on `54ea9af` and says which command produced it**, by a parser written for this pass that reproduced `make status`'s done counts exactly — 188 / 231 tickets, 576 / 714 points, and all nine milestone rows cell for cell — before a single row was written.
 
@@ -59,8 +89,23 @@
 | | Tickets | Points |
 |---|---|---|
 | **Done** | 205 | 637 |
-| Remaining | 35 | 110 |
-| **Total** | 240 | 747 |
+| Remaining | 41 | 129 |
+| **Total** | 246 | 766 |
+
+**Measured on `develop` at `01eb04c`, plus the six rows this branch adds.** `make status` on this
+branch prints **205 / 246 and 637 / 766** with both guards green, and the header of `Docs/09` was
+recounted in the same change so the two agree rather than drifting apart again. **Nothing was
+completed by this pass** — the done column is `01eb04c`'s unchanged, and the whole of the movement
+is `Docs/09` gaining **M8**, the demonstration track, at six rows and nineteen points.
+
+**The remaining figure grew and that is the honest direction.** A re-scope that defers 70 points of
+store and hardening work while adding 19 points of demonstration work does not make the number
+smaller, because **deferred is not done and this table has no column for it.** Resisting the urge to
+give it one is deliberate: the moment "remaining" stops meaning "rows without a commit", every
+figure in this file starts depending on which pass last decided what counted. §5 and §6 carry the
+order; this table carries the rows.
+
+### What this table read before the re-scope, and why the ref moved
 
 **Measured on `develop` at `36b0c3b`**, which is `develop`'s tip as this is written and is also
 where `origin/develop` points, so it is a ref that stays true. `make status` prints 205 / 240 and
@@ -16729,6 +16774,55 @@ carries the recommendation.
 
 ## 5. Blocked — and only by work outside this repository
 
+### The re-scope changed what "blocked" means, and five of these rows stop binding
+
+**`Docs/01` §8 now carries a demonstration gate in front of the pilot gate**, and this section was
+written entirely against the pilot. The table below is unchanged and still correct *for the pilot*;
+what changed is how much of it is in the way of anything anybody is building next.
+
+| Row | Gated | Under the demonstration gate |
+|---|---|---|
+| **X-1** D-U-N-S → **X-2** Apple | SHIP-24, 25, and X-10's iOS leg | **Stops binding.** Nothing is being submitted to a store. The iOS *push* leg goes with it, which is why the demonstration runs on Android |
+| **X-3** Play Console | SHIP-26, 27 | **Stops binding**, same reason |
+| **X-7** Privacy policy URL | SHIP-180, 181 | **Stops binding.** Both dependants are store declarations |
+| **X-8** Terms and provider agreement | Pilot users | **Stops binding.** There are no pilot users |
+| **X-4** Legal brief | X-7, X-8, X-9, SHIP-172 | **Still binds, and it is now the only external row that does.** See below — the binding half is X-9 |
+| **X-5** Pilot metro area | Provider recruitment | Still worth doing this week: SHIP-186 cannot generate believable addresses without a city and a radius |
+| **X-10** Firebase project | SHIP-144, 145, 146 | Still binds, needs no third party, and its Android half can be done today |
+
+**None of those five rows is cancelled and none should be closed.** They are deferred, they still
+gate the pilot exactly as written, and the day a buyer wants a store listing they bind again on the
+same terms. **The mistake to avoid here is deleting a row because it stopped being urgent** — this
+file has no instrument that could tell the difference afterwards.
+
+### X-4 still binds, and the binding edge is X-9 rather than the brief
+
+**X-9 depends on X-4, and X-9 gates the entire customer journey.** Measured on this branch by
+walking the dependency column: accepting X-9 releases **9 rows and 29 points** — SHIP-58, 59, 63,
+72, 73, 74, 75, and behind them SHIP-186 and SHIP-191. That is the whole of the demonstration's
+content.
+
+**The demonstration does not need a lawyer for it, and saying why matters more than the shortcut.**
+SHIP-58's *Done when* is *"Categories load from configuration and are served to clients, not
+compiled in"* — the criterion is the **mechanism**, and a provisional list exercises the mechanism
+exactly as a reviewed one does. `Docs/01` §2's out-of-scope list already names the categories in
+prose.
+
+**So X-9 should be taken in reduced form, and reduced form has a precedent in this file rather than
+being invented here.** SHIP-139 and SHIP-143 shipped against an FCM project that did not exist and
+are carried in §4 with X-10 named as the owner of the unmet half. X-9 is the same shape: **the owner
+approves a provisional list, the list is marked provisional in the reference data itself, X-4 stays
+open, and §4 carries what is still owed.** `Docs/01` §8's pilot gate already requires an approved
+prohibited-goods policy and that requirement is untouched — a provisional list is enough to
+demonstrate and is not enough to put in front of the public.
+
+**What must not happen is the dependency column being edited.** `X-9 → X-4` is a real edge and it is
+still true; removing it would make the graph say the legal answer is not needed, which is false. A
+reduced-form acceptance is a §4 entry. **A ticket taken in reduced form and recorded nowhere is
+indistinguishable from one that was finished**, and that is the whole reason §4 exists.
+
+### The pilot table, unchanged
+
 **Track X is ten tickets now and one of them is closed.** X-6 was decided in wave 9 and is in the done list; the other nine have not started, none of them is code, and all of them are slow.
 
 | Ticket | Gates |
@@ -16815,6 +16909,56 @@ sentence below is why this was not simply written into the table when it was fir
 still governs the next proposal: §9 has the entry, the two measured blockers and the proposed backlog rows in full.
 
 ## 6. Ready to start now
+
+**Recomputed on `ship-15ar-demo-rescope` over `develop` at `01eb04c`**, by the same discipline every
+pass here uses: a parser over `Docs/09`'s dependency column and `Docs/11-done.txt` that reproduced
+`make status` cell for cell — 246 rows, 766 points, 205 done, 637 points, and all ten milestone
+denominators — before a figure below was written.
+
+**Eleven rows have every dependency met: 34 points, and for the first time in two passes the code
+half is not empty.**
+
+| Ticket | Pts | Area | In scope for the demonstration? |
+|---|---|---|---|
+| **SHIP-187** | 3 | **Container images for the API, worker and notifier.** Depends on SHIP-20 alone, which landed in M0. There is **no Dockerfile anywhere in this repository** — `deploy/` holds local infrastructure and nothing that packages the application | **Yes — start here** |
+| X-5 | 2 | Pilot metro area. No third party | Yes — SHIP-186 needs a city and a radius |
+| X-10 | 3 | Firebase project. No third party; Android half is an hour | Yes — releases 3 rows, 10 points |
+| X-4 | 3 | Legal brief | Only through X-9, and X-9 should be taken in reduced form instead. §5 |
+| X-1, X-3 | 4 | D-U-N-S, Play Console | **Deferred.** Nothing is being published |
+| ~~SHIP-156~~ | 3 | **Strike carried, tenth consecutive pass, re-measured again this time.** No `reports` table in any migration, no report route on `routes_golden.txt`, no `Docs/09` row that builds one. Blocked *internally* — this is a gap in the plan, not a dependency | Deferred |
+| ~~SHIP-172~~ | 5 | Struck by X-4, which no parser can see. §5 | Deferred |
+| ~~SHIP-174~~ | 3 | Struck — needs a Datadog account, and no Track-X row procures one | Deferred |
+| ~~SHIP-178~~ | 3 | Struck — needs store-console access, which is X-2 and X-3 | Deferred |
+| ~~SHIP-182~~ | 5 | **The strike lifts and the ticket stays deferred, which are different events.** It was struck for "needs a deployed environment"; SHIP-188 builds one. A demonstration still does not need a restore rehearsal | Deferred |
+
+**SHIP-187 is the answer to the sentence this section carried one pass ago** — *"the
+startable-and-sensible set is empty, and that is a first for this file"*. That was true, and it was
+true because every row left was pointed at a release nobody was making. **Changing the destination
+produced buildable work out of rows that depend only on things already finished**, which is worth
+noticing as a property of re-scoping rather than as a fact about this wave.
+
+### The demonstration's build order, which is not the backlog's
+
+**`Docs/09` says the next ticket is the lowest-numbered open one. That is SHIP-24, and it is
+deferred.** Strict build order is **suspended for the deferred set** by the decision in §9 — recorded
+in writing because the next session will otherwise open the backlog, read the rule, and start on iOS
+signing. The order below replaces it *for this phase only* and the rule resumes untouched afterwards.
+
+| Order | Work | Pts | Waiting on |
+|---|---|---|---|
+| 1 | **X-9 in reduced form**, X-10, X-5 | 8 | The owner. None needs a third party |
+| 2 | SHIP-187 → SHIP-188 → SHIP-189, SHIP-190 | 12 | Nothing. Can run in parallel with everything below |
+| 3 | SHIP-58 → SHIP-59 → **SHIP-63** | 10 | X-9 |
+| 4 | SHIP-72 → 73 → 74 → 75 | 12 | X-9, and SHIP-63 for the publish call |
+| 5 | SHIP-144, 145, 146 | 10 | X-10 |
+| 6 | SHIP-186 → SHIP-191 | 7 | SHIP-63 exists; the rest of M8 deployed |
+
+**59 points in scope, 70 deferred, and the split is measured rather than judged**: 41 open rows at
+129 points, less the 70 points §5's table and this one strike out. **SHIP-63 is the single row that
+matters most** — 5 points, and until it exists no job reaches `Open`, no provider sees one, and none
+of the 205 finished tickets can be reached through the product at all.
+
+### What this section said before the re-scope, kept for its reasoning
 
 **Recomputed on `develop` at `abb3d04`, after wave 17 merged**, by parsing `Docs/09`'s dependency
 column against `Docs/11-done.txt` with a parser that reproduced `make status` cell for cell before a
@@ -18693,6 +18837,49 @@ Kept, struck, because the shape recurs and this is the second instance of it. **
 **That prediction held exactly, and SHIP-83 found the one thing it does not cover.** The source-parsing guard did fire first, and `internal/fleet`'s copy reached SHIP-82's and SHIP-83's new response types with no change to it — they are non-test files in the package it parses. What it cannot do is refuse a budget under a name that is not "budget", because it reads source and can only match a spelling. SHIP-83's serialised-response test is the axis it lacks, and `make verify` now makes the same closed-key-set assertion from outside Go, so neither can be quietly deleted alone.
 
 ## 9. Open recommendations nobody has decided
+
+**~~What the next release is for.~~ Decided by the owner on 20 August 2026 — a hosted demonstration,
+not a pilot.** Shipper is being built to sell rather than to launch, so store publishing, pilot
+recruitment and production hardening stop being the destination and a demonstration a prospective
+buyer can drive unaided takes their place. `Docs/01` §8 carries both gates; `Docs/09` gains M8; §5
+and §6 are re-cut against it. **59 of the 129 open points are in scope and 70 are deferred.**
+
+**Strict build order is suspended for the deferred set, and this sentence is the whole reason this
+entry is at the top of §9.** `Docs/09` says the next ticket is the lowest-numbered open one. That is
+**SHIP-24, iOS build signing**, and under this decision it is deferred indefinitely. A session that
+opens the backlog, applies the rule and starts work will start on the wrong thing, and **nothing in
+this repository will report it** — `make status` counts rows and has no opinion about order. The
+replacement order is §6's table. The rule itself is untouched and resumes for everything in scope.
+
+**What was decided, in one place, so no lane has to reconstruct it:**
+
+- **Hosted, not local.** A buyer gets a link, not a laptop. This is genuinely new scope — there is no
+  Dockerfile anywhere in this repository and no infrastructure-as-code of any kind.
+- **Push is in, Android only.** X-10 needs no third party. The iOS leg needs an APNs key from the
+  Apple Developer Program and goes with the rest of the store chain.
+- **Seeded data gets a row** (SHIP-186). Nothing seeds anything today.
+- **X-9 is taken in reduced form** rather than by editing its dependency on X-4. §5 has the reasoning
+  and the precedent.
+- **No existing `Docs/09` row is re-marked.** The deferral lives here and in §5, where a decision
+  about order belongs, rather than on 240 rows where it would have to be maintained.
+
+**Four questions this decision opens and does not answer:**
+
+1. **Where SHIP-188 deploys.** The recommendation is one small VM running the existing
+   `deploy/docker-compose.yml` plus three application containers behind a TLS terminator, rather than
+   a managed platform — **Kafka is the deciding factor**, and managed Kafka costs more per month than
+   everything else in the demonstration combined. Not decided; it is SHIP-188's to settle.
+2. **Whether the demonstration ships with a prepared login.** A buyer who has to register four
+   accounts to see a marketplace will not see a marketplace. SHIP-186's *Done when* does not say, and
+   somebody should decide before it is built.
+3. **SHIP-156 is still a plan gap and the re-scope does not close it.** Ten passes have carried the
+   strike. There is no `reports` table, no report route, and **no `Docs/09` row that builds one** —
+   so the row reads as startable and is not, in a way no parser can see. Deferring it is not the same
+   as answering it, and if moderation ever matters to a buyer this becomes urgent with no ticket
+   behind it.
+4. **What happens to the demonstration instance when a sale does not close.** It holds seeded data
+   and no real personal information by construction, so nothing forces a decision — but an instance
+   nobody owns, left running with a public address, is how a demonstration becomes an incident.
 
 **~~Job status as a database guarantee.~~ Decided and built at SHIP-57 — see §3.** The trigger exists, and it asks for more than the recommendation did: not merely that a session variable is set, but that it names a `job_status_history` row written in the same transaction which describes this job making exactly this move. The weaker form would have been a flag any caller could set; this one cannot be satisfied without leaving the record, which is what makes SHIP-57a's *Done when* structural rather than remembered.
 
