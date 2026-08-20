@@ -222,7 +222,59 @@ Staying inside one state avoids cross-border variation in transport rules during
 
 **Decision required:** which metropolitan area. Owner: business. Needed before provider recruitment begins, not before build starts — at pilot scale supply is recruited by hand, and the practical constraint is where the team can meet operators in person.
 
-### Gate conditions
+### There are two gates, and the near-term one is not the pilot
+
+**Decided 20 August 2026.** Shipper is being built to **sell** rather than to launch. The near-term
+target is therefore a **hosted demonstration a prospective buyer can open and drive unaided** — not
+a pilot release to real customers in a real metro area.
+
+This does not cancel the pilot gate below. It puts a smaller gate in front of it, and the two ask
+genuinely different questions. **The pilot gate asks whether it is safe to put this in front of the
+public**; that is why it is made of enrolments, signed builds, published policies and store
+declarations. **The demo gate asks whether the product can be shown doing what it claims** — which
+turns out to be a question about the journey, not about distribution.
+
+**The re-scope was worth taking because of what it revealed rather than what it saved.** With store
+distribution as the destination, the backlog's binding constraint was Track X, and every open ticket
+began outside this repository. With a demonstration as the destination, the constraint moves to
+something else entirely: **a customer cannot publish a job.** `POST /v1/jobs` creates a draft and
+`PATCH /v1/jobs/{id}` edits it, and nothing transitions a job to `Open`. Everything this document
+describes after §4.1 — bidding, award, delivery, proof, disputes, moderation — is finished code
+sitting downstream of a journey that cannot be started. That was invisible while the plan was
+measured against a release nobody could reach.
+
+### Demo gate
+
+The demonstration is ready when **one person can drive the whole marketplace through its own
+interfaces, with no direct database access at any point**:
+
+- A customer registers, creates a job through every step of the creation flow, and **publishes it**.
+- A provider registers, is verified, finds that job in discovery, and bids on it.
+- The customer compares bids, negotiates, and awards exactly one.
+- The customer assigns a driver; the driver opens a job-scoped link with no account and no install.
+- The driver records milestones and completes the delivery with photograph proof.
+- A notification reaches a handset and opens the job it concerns.
+- An administrator finds the job and reads its audit trail.
+
+Three conditions sit alongside that journey:
+
+- **The surfaces are hosted**, reachable over HTTPS at a stable address, so a buyer can be sent a
+  link rather than a laptop.
+- **The marketplace is populated.** An empty demonstration shows a well-built shell. Seeded data
+  carries **no real personal information** — generated names and generated addresses only.
+- **The invariants hold under inspection**, because a buyer's technical adviser is the most likely
+  person to probe them: a provider never sees a customer's budget, exactly one bid can be accepted
+  per job, delivery requires proof or a recorded exception, and a driver's token opens exactly one
+  job.
+
+**What the demo gate deliberately does not require:** store enrolment, signed store builds,
+published legal materials, observability, alerting, load testing, or a restore rehearsal. Those are
+the pilot's questions and they are answered below, unchanged.
+
+### Pilot gate conditions
+
+**Deferred, not dropped.** Every condition here still stands and none has been weakened; the demo
+gate above simply comes first. This block is unchanged from before the re-scope.
 
 Do not invite public users until the team has approved the job lifecycle, prohibited-goods policy, provider verification approach, support procedure, pilot geography, and terms/privacy materials.
 
@@ -234,3 +286,8 @@ The mobile client adds prerequisites that must be met before the first build rea
 - Privacy policy published at a public URL, with Apple privacy labels and the Play data-safety declaration submitted.
 
 Pilot distribution deliberately avoids public store review. A later public listing is a separate gate requiring store assets, age rating, and export-compliance declarations.
+
+**One prohibited-goods caveat carries across both gates and is easy to lose.** The demo runs on a
+**provisional** category list approved by the owner rather than by a legal adviser, which is enough
+to demonstrate the mechanism and is **not** enough to put in front of public users. The pilot gate's
+first sentence already requires an approved prohibited-goods policy; that requirement is untouched.
