@@ -6,9 +6,23 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**240 tickets, 747 points.** Counted from the rows on 2026-08-19, at `c710ed4`, plus the one row
-this branch adds. The previous figure — 239 and 744 — was correct for the tree it was written on
-and this pass adds `SHIP-17d`, three points.
+**246 tickets, 766 points.** Counted from the rows on 2026-08-20, at `01eb04c`, plus the six rows
+this branch adds. The previous figure — 240 and 747 — was correct for the tree it was written on;
+this pass adds **M8**, the demonstration track, at nineteen points.
+
+**M8 is the first milestone added since the backlog was written, and the reason is a change of
+destination rather than a change of plan.** `Docs/01` §8 now carries two gates: a demonstration a
+buyer can drive, in front of the pilot release that was always the target. Nothing already in this
+file was re-scoped, re-pointed or removed to make room for it — the deferral of the store and
+hardening work is recorded in `Docs/11` §5 and §6, where a decision about *order* belongs, and not
+here, where a decision about *content* would.
+
+**Its rows are numbered `SHIP-186`…`SHIP-191` rather than given a track letter of their own, and
+that was a measurement rather than a preference.** `scripts/delivery-status.sh` matches rows on
+`/^(SHIP|X)-[0-9]+[a-z]?$/` and commit subjects on `^((SHIP|X)-[0-9]+(-[0-9]+)?[a-z]?):` — so a
+`D-1` row would have been counted by nobody and claimed by nothing, and the header would have
+disagreed with `make status` from the moment it was written. That is the exact drift this file's own
+guard exists to catch.
 
 **The line before that read 237 and 738, and it was wrong for two waves.** It predated wave 16's
 Phase 0, which split three rows without the header being recounted, and `SHIP-15ao` exists only to
@@ -59,7 +73,8 @@ whenever a row is added rather than left for a later pass to reconcile.
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 14 | 48 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 22 | 69 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 24 | 72 |
-| | | **240** | **747** |
+| **M8** — Demonstration | The marketplace runs at a stable address and a buyer can drive the whole journey unaided. | 6 | 19 |
+| | | **246** | **766** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -479,6 +494,37 @@ Five segments or more are safe, because the literal route has only three after `
 
 What does work is an endpoint the app reads **while it still has signal** and keeps. SHIP-167's `GET /v1/app/minimum-version` is already exactly that shape — unauthenticated, per-platform, changed by configuration rather than by a release — which is why this row sits beside it and depends on it rather than inventing a second convention. The compiled default stays as the floor for an install that has never once been online, and is the *only* case it is used for; a build that has ever reached the platform uses what it was told.
 
+## M8 — Demonstration
+
+**Goal:** The marketplace runs at a stable address and a buyer can drive the whole journey unaided.  
+**Size:** 6 tickets, 19 points
+
+| ID | Ticket | Pts | Done when | Depends on |
+|---|---|---|---|---|
+| SHIP-186 | Demo seed dataset | 5 | One command populates verified providers, open jobs, bids in flight, a delivery in progress and one completed delivery with photograph proof; it is idempotent, and it contains no real personal information | SHIP-63 |
+| SHIP-187 | Container images for the API, worker and notifier | 3 | Each binary builds to an image that starts from environment configuration alone, with no file baked in that a deployment would need to change | SHIP-20 |
+| SHIP-188 | Demonstration environment | 5 | The API answers /health over HTTPS at a stable hostname, with migrations and the topic set applied by the same deployment | SHIP-187 |
+| SHIP-189 | Deploy the admin panel and the driver portal | 2 | Both are reachable over HTTPS and talk to the demonstration API; a driver link opens on a handset with no account | SHIP-188 |
+| SHIP-190 | Demonstration build of the mobile app | 2 | An installable Android build talks to the demonstration API with no change to any source file | SHIP-188 |
+| SHIP-191 | Demonstration walkthrough | 2 | A written script drives every step of Docs 01 §8's demo gate against the hosted instance, unaided, with no direct database access | SHIP-186, SHIP-189, SHIP-190 |
+
+**Every dependency here points backwards and that is why this milestone sits last rather than
+first.** Demonstration work wraps finished code: SHIP-186 cannot seed a published job until SHIP-63
+can publish one, and SHIP-190 needs somewhere to point before it can point at it. A `Track D`
+sorted first — the shape Track X has — would have made `SHIP-186 → SHIP-63` a *forward* edge and
+required the count of ten above to be re-derived. It is last, so the count is untouched.
+
+**SHIP-190 is a two-point ticket because the mechanism already exists.** `ApiEnvironment.baseUrl()`
+reads `SHIPPER_API_BASE_URL` and returns it ahead of every compiled-in host, so pointing a build at
+the demonstration is a `--dart-define` rather than an edit. The `staging` and `production` hostnames
+in that file stay provisional; neither is registered and neither is what a demonstration uses.
+
+**What is deliberately not here: signing, store distribution, observability and a restore
+rehearsal.** Those are M7's, they are unchanged, and a demonstration needs none of them. SHIP-182's
+strike in `Docs/11` §6 reads *"needs a deployed environment"* — SHIP-188 supplies one, so that
+strike lifts even though the ticket stays deferred. The strike lifting and the ticket moving are
+different events and only the first has happened.
+
 ## Sequencing notes
 
 ### Start Track X on day one
@@ -505,11 +551,13 @@ Worth stating plainly rather than discovering in month four.
 
 | Working pattern | Points per week | Elapsed |
 |---|---|---|
-| Full-time, focused | 20–25 | **29–37 weeks** (roughly 7–9 months) |
-| Full-time, with interruptions | 15 | **~49 weeks** |
-| Evenings and weekends | 6–8 | **93–124 weeks** (around two years) |
+| Full-time, focused | 20–25 | **30–38 weeks** (roughly 7–9 months) |
+| Full-time, with interruptions | 15 | **~51 weeks** |
+| Evenings and weekends | 6–8 | **95–127 weeks** (around two years) |
 
-**The three rows are `floor(747 / rate)` and nothing else, and the total they divide is the one the rows carry.** They read 23, 29, 39, 74 and 99 until this pass, which is `floor(599 / rate)` exactly — so the table was not merely stale, it was arithmetic over a total the plan stopped having long ago, and the 599 was still printed under *If you need to cut scope* where it was easiest to read as current. Recompute all five figures whenever the point total moves — 29, 37, 49, 93 and 124 — together with the 747 under *If you need to cut scope*, which is the same total wearing prose. They are derived, not estimated.
+**The three rows are `floor(766 / rate)` and nothing else, and the total they divide is the one the rows carry.** They read 23, 29, 39, 74 and 99 two passes ago, which is `floor(599 / rate)` exactly — so the table was not merely stale, it was arithmetic over a total the plan stopped having long ago, and the 599 was still printed under *If you need to cut scope* where it was easiest to read as current. Recompute all five figures whenever the point total moves — now 30, 38, 51, 95 and 127 — together with the 766 under *If you need to cut scope*, which is the same total wearing prose. They are derived, not estimated.
+
+**M8 moved them for the first time since that correction, and it is the cheap case rather than the instructive one.** Nineteen points is under three weeks at any of these rates, so every row moved by one or two and none of the prose around them stopped being true. **The figure to distrust is the one that did not move**: a derived table is at its most dangerous when the total changes by little, because nothing about the page looks wrong.
 
 These assume the point scale above and one experienced developer who already knows Flutter. They do **not** assume time spent learning Go, AWS, or Kafka — if any of those are new, add to M0 and M5 specifically.
 
@@ -517,7 +565,7 @@ Two things move this number more than working faster does: cutting scope (below)
 
 ## If you need to cut scope
 
-747 points is a substantial solo build. These are the honest levers, in the order I would pull them:
+766 points is a substantial solo build. These are the honest levers, in the order I would pull them:
 
 | Cut | Saves | What you lose |
 |---|---|---|
