@@ -1,0 +1,41 @@
+# What never reaches the build context (SHIP-187).
+#
+# The context is services/core rather than the repository root, which already puts deploy/.env,
+# the Flutter app and node_modules out of reach — see the header of Dockerfile for why that is a
+# security property and not a convenience. What is left to exclude is noise: files that change on
+# every run, invalidate the COPY layer, and are never read by a build.
+#
+# A build that ignores nothing still produces a correct image. It produces it slower, and it puts
+# a developer's local build output into a layer, which is how a stale binary ends up shipped
+# beside a fresh one.
+
+# Test binaries and coverage output, per the root .gitignore's Go section.
+*.test
+*.out
+coverage.*
+
+# A bare `go build ./cmd/<name>` run from services/core drops the binary here rather than into
+# bin/. The root .gitignore lists these one per command for the reason given there; the same list
+# applies for the same reason.
+/api
+/lintboundaries
+/migrate
+/notifier
+/statusgen
+/topics
+/worker
+
+# Nothing in the image build reads a test, and the integration tests are the bulk of the tree.
+# They are excluded from the context, not from the build: `make check` on the host is what runs
+# them, and CI runs that before an image is ever built.
+**/*_test.go
+**/testdata/
+
+# The build stage runs `go mod download` against go.mod and go.sum. A vendor directory in the
+# context would be copied and then ignored, which is the slowest possible way to reach the same
+# result.
+/vendor/
+
+# Editor and OS leftovers.
+.DS_Store
+*.swp
