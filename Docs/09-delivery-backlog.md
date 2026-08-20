@@ -38,7 +38,9 @@ whenever a row is added rather than left for a later pass to reconcile.
 
 **Every one of the ten points at finished work again, and that is a state this paragraph has now been through in both directions.** The wave-10 reconciliation recorded the first exception in the file's history — `SHIP-65a → SHIP-83a`, where the target was open, so `SHIP-65a` was genuinely not startable and a tool treating forward edges as decorative would have reported it as ready. **SHIP-83a landed in wave 11**, so that edge is satisfied and SHIP-65a is startable; the warning is kept rather than deleted because the condition recurs the next time a lettered row is written ahead of its blocker. **Compute startability from the dependency column itself, never from ticket order, and never from whether this paragraph currently names an exception.**
 
-**This figure is hand-maintained and has been checked by a parser rather than counted by eye.** Both totals above and the milestone table below are the same kind of number — the rows are the truth, `scripts/delivery-status.sh` reads them, and nothing reads this sentence. Whoever adds a lettered row recounts all three in the same change.
+**This figure is hand-maintained and has been checked by a parser rather than counted by eye.** Both totals above, the milestone table below, and the **Size:** line under each milestone heading are all the same kind of number — the rows are the truth, `scripts/delivery-status.sh` reads them, and nothing reads any of these. Whoever adds a lettered row recounts **all eight figures across those four places** in the same change: the two headline totals, the milestone table's row and its total line, and that milestone's Size line.
+
+**This sentence used to say "all three" and omitted the Size lines, and that omission is what they drifted through.** A row added to M3 moved its table row and not its Size line, so one figure had two hand-maintained copies that disagreed with each other; M0's and M7's went the same way. **An enumeration that is not exhaustive is worse than no enumeration**, because it reads as a checklist somebody has completed.
 
 **The two totals above are maintained by hand and the rows are the truth.** `scripts/delivery-status.sh` parses the rows, so `make status` is unaffected by a stale header — which is precisely why one drifted unnoticed after SHIP-15e was added. If the two disagree, correct the header.
 
@@ -49,15 +51,15 @@ whenever a row is added rather than left for a later pass to reconcile.
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
 | **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 10 | 29 |
-| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 39 | 111 |
+| **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 41 | 117 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 29 | 83 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 28 | 84 |
 | **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 39 | 133 |
 | **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 33 | 112 |
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 14 | 48 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 22 | 69 |
-| **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 23 | 69 |
-| | | **237** | **738** |
+| **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 24 | 72 |
+| | | **240** | **747** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -88,7 +90,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M0 — Foundation
 
 **Goal:** The stack runs locally, CI is green, and a signed build reaches a real device.  
-**Size:** 38 tickets, 106 points
+**Size:** 41 tickets, 117 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -234,7 +236,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 ## M3 — Bidding and award
 
 **Goal:** Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one.  
-**Size:** 38 tickets, 128 points
+**Size:** 39 tickets, 133 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -444,7 +446,7 @@ Five segments or more are safe, because the literal route has only three after `
 ## M7 — Hardening and pilot readiness
 
 **Goal:** The store prerequisites are met, the system is observable, and the release gate can be run.  
-**Size:** 20 tickets, 58 points
+**Size:** 24 tickets, 72 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -503,9 +505,11 @@ Worth stating plainly rather than discovering in month four.
 
 | Working pattern | Points per week | Elapsed |
 |---|---|---|
-| Full-time, focused | 20–25 | **23–29 weeks** (roughly 5–7 months) |
-| Full-time, with interruptions | 15 | **~39 weeks** |
-| Evenings and weekends | 6–8 | **74–99 weeks** (over a year) |
+| Full-time, focused | 20–25 | **29–37 weeks** (roughly 7–9 months) |
+| Full-time, with interruptions | 15 | **~49 weeks** |
+| Evenings and weekends | 6–8 | **93–124 weeks** (around two years) |
+
+**The three rows are `floor(747 / rate)` and nothing else, and the total they divide is the one the rows carry.** They read 23, 29, 39, 74 and 99 until this pass, which is `floor(599 / rate)` exactly — so the table was not merely stale, it was arithmetic over a total the plan stopped having long ago, and the 599 was still printed under *If you need to cut scope* where it was easiest to read as current. Recompute all five figures whenever the point total moves — 29, 37, 49, 93 and 124 — together with the 747 under *If you need to cut scope*, which is the same total wearing prose. They are derived, not estimated.
 
 These assume the point scale above and one experienced developer who already knows Flutter. They do **not** assume time spent learning Go, AWS, or Kafka — if any of those are new, add to M0 and M5 specifically.
 
@@ -513,7 +517,7 @@ Two things move this number more than working faster does: cutting scope (below)
 
 ## If you need to cut scope
 
-599 points is a substantial solo build. These are the honest levers, in the order I would pull them:
+747 points is a substantial solo build. These are the honest levers, in the order I would pull them:
 
 | Cut | Saves | What you lose |
 |---|---|---|

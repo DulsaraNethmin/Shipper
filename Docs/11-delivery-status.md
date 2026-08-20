@@ -10,7 +10,9 @@
 
 `make status` prints the machine-checkable half — which tickets have a commit claiming them. It cannot see nuance, so **this file is authoritative** for anything a commit subject does not capture: partly finished tickets, external blockers, and what is safe to start next.
 
-**Last updated:** 2026-08-17, on **`ship-15y-wave-14-prep`**, the wave-13 reconciliation, running concurrently with wave 14's code lanes rather than ahead of them — the fifth consecutive pass cut alongside the lanes and the sixth in a row that is **not** a backlog ticket. There is no `SHIP-15y` row in `Docs/09` and there must not be one in a commit subject: `scripts/delivery-status.sh` hard-fails on a claim the done list does not carry, so this branch's subjects name the surface they touch — `Docs/11:` — exactly as `ship-15q` through `ship-15x` did. It rewrites §1's arithmetic, §2's branch state and §6's startable set against `develop` at **`54ea9af`**, writes wave 13 up as the new §7 with the twelve earlier waves renumbered behind it, re-reads §5 and every remaining strike against today's tree, and adds nine entries to §9 — of which **two are corrections to entries the last pass wrote correctly and the merge made stale**, and **two close questions that had been recorded as blocked and were in fact ownerless.** **Every scalar below was measured on `54ea9af` and says which command produced it**, by a parser written for this pass that reproduced `make status`'s done counts exactly — 188 / 231 tickets, 576 / 714 points, and all nine milestone rows cell for cell — before a single row was written.
+**Last updated:** 2026-08-20, on **`ship-15aq-header-and-snapshot-counts`** — a counts-only pass, not a reconciliation. It rewrites §1's snapshot to the tree at **`36b0c3b`**, gives wave 1 back the section letter it shared with wave 2, and records in §11 why a `SHIP-15aq:` commit subject is invisible to `make status` where a `SHIP-15y:` one would hard-fail. **It closes no ticket, adds no `Docs/09` row, and touches §2, §3, §4, §5, §6, §7 and §9 not at all** — so every figure in those sections still carries the ref its own pass measured it on, and §6's startable set is `abb3d04`'s. That set was re-derived on `36b0c3b` before this pass began and is unchanged at ten rows and 31 points, which is why it was left alone rather than restated.
+
+**The last full reconciliation:** 2026-08-17, on **`ship-15y-wave-14-prep`**, the wave-13 reconciliation, running concurrently with wave 14's code lanes rather than ahead of them — the fifth consecutive pass cut alongside the lanes and the sixth in a row that is **not** a backlog ticket. There is no `SHIP-15y` row in `Docs/09` and there must not be one in a commit subject: `scripts/delivery-status.sh` hard-fails on a claim the done list does not carry, so this branch's subjects name the surface they touch — `Docs/11:` — exactly as `ship-15q` through `ship-15x` did. It rewrites §1's arithmetic, §2's branch state and §6's startable set against `develop` at **`54ea9af`**, writes wave 13 up as the new §7 with the twelve earlier waves renumbered behind it, re-reads §5 and every remaining strike against today's tree, and adds nine entries to §9 — of which **two are corrections to entries the last pass wrote correctly and the merge made stale**, and **two close questions that had been recorded as blocked and were in fact ownerless.** **Every scalar below was measured on `54ea9af` and says which command produced it**, by a parser written for this pass that reproduced `make status`'s done counts exactly — 188 / 231 tickets, 576 / 714 points, and all nine milestone rows cell for cell — before a single row was written.
 
 **It closes no ticket, it adds no `Docs/09` row, and it does not touch §3.** Four lanes are appending to §3 concurrently, and its check-count line belongs to whoever merges: it reads 862 against a tree that measures **926**, and this pass deliberately leaves it alone rather than taking a side. The rule is symmetric and both halves have now been paid for — **a prep pass must not edit §3, and a lane must not edit §1, §2, §4, §5, §6 or §7.**
 
@@ -56,17 +58,27 @@
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 203 | 631 |
+| **Done** | 205 | 637 |
 | Remaining | 35 | 110 |
-| **Total** | 238 | 741 |
+| **Total** | 240 | 747 |
 
-**Measured on `develop` at `abb3d04`** — wave 17's last merge, which is `develop`'s tip as this is
-written and is also where `origin/develop` points, so it is a ref that stays true. `make status`
-prints 203 / 238 and 631 / 741 on it, with both guards green. **A parser written for this pass
-reproduced every one of those figures before a row below it was written** — 238 rows and 741 points
-read off `Docs/09`, 203 declared and 631 points read off `Docs/11-done.txt`, 35 open against 110
-remaining, and the nine milestone rows cell for cell. That check is the only thing that separates a
-measured figure from a copied one, and this file has been wrong five times for skipping it.
+**Measured on `develop` at `36b0c3b`**, which is `develop`'s tip as this is written and is also
+where `origin/develop` points, so it is a ref that stays true. `make status` prints 205 / 240 and
+637 / 747 on it, with both guards green. **A parser written for this pass reproduced every one of
+those figures before this table was touched** — 240 rows and 747 points read off `Docs/09`, 205
+declared and 637 points read off `Docs/11-done.txt`, 35 open against 110 remaining, and the nine
+milestone denominators cell for cell against what `make status` prints from its own parse. That
+check is the only thing that separates a measured figure from a copied one, and this file has been
+wrong five times for skipping it.
+
+**This table read 203 / 238 and 631 / 741 until this pass, and it was correct when it was written.**
+Re-measured on `abb3d04` rather than assumed: the same parser run against that tree's `Docs/09` and
+`Docs/11-done.txt` returns exactly 203 / 238 and 631 / 741. **Six merges landed on `develop` after
+it and two of them moved the count** — `ship-17c-job-state-builder` and
+`ship-17d-contract-final-five`, three points each. **This is the expiry this file already names,
+recurring in the gap between two passes rather than inside one**: a measurement taken on a
+pre-merge tree expires at the merge, nothing fails when it does, and `make status` cannot catch it
+because it parses the rows and has never read this table.
 
 **Wave 17 delivered four tickets and 16 points, and created one row.** SHIP-17b (M0, 5) on
 `ship-17b-contract-authenticated-surface`; SHIP-183 (M7, 5) on `ship-183-api-rate-limit-review`;
@@ -17339,6 +17351,8 @@ it as SHIP-164's blocker.
 
 ## 7. Wave 16 — what landed
 
+> **§7 is not a complete record of the waves, and this note is here so the gap is not read as one.** The letters run 16, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 — **there is no section for wave 14, wave 15 or wave 17.** Each of the three has a summary paragraph in §1 instead, written by the pass that measured it, and each states its own ref. **A missing section reads as a wave that did not happen**, which is the same silence §4 carried for SHIP-120 across three passes; naming it costs a sentence and finding it out the hard way costs a reader's afternoon.
+
 **A repair-and-unblock wave, and the first one this file has recorded that shipped no feature it set
 out to ship.** Wave 15 handed forward three startable code rows; **all three were mis-sized or
 unbuildable when measured**, and two live defects were sitting on `develop`, one of them wave 15's
@@ -18583,7 +18597,7 @@ Two of SHIP-15c's mechanisms caught real mistakes within the wave: the protocol-
 - **The last merge always conflicts in this file.** Three tracks each append to §3 and §10. §10 in particular is a candidate for `merge=union` in `.gitattributes`, because a union there is always a superset and `make status` fails on a drop rather than passing quietly — unlike YAML, where a union is invalid. Recorded in §9.
 - **Agents deviate from a brief in both directions, and both need checking.** One track merged `develop` into its own branch after being told not to; its conflict resolution was nonetheless correct. Another corrected a paragraph in `Docs/07` that was outside its ownership, and was right to — the reasoning behind a decision had stopped being true. Neither was harmful; both were only visible because the diff was read against the stated ownership.
 
-## 7l. Wave 1 — what landed
+## 7m. Wave 1 — what landed
 
 Fourteen tickets across four branches. All three tracks completed, but not all at once: the Flutter track was blocked mid-wave, deferred, and finished after the block cleared.
 
@@ -20745,6 +20759,12 @@ second list is a list nothing reads.
 Update it in the same change that finishes a ticket. A tracker maintained afterwards is a tracker that is wrong — and this repository has already demonstrated the failure mode: `CLAUDE.md` described the project as sitting at SHIP-9 for the entire time SHIP-10 to SHIP-15 was being written.
 
 `make status` compares three things: the backlog, the list in §10, and the tickets named by commit subjects. It fails when §10 claims something git has never seen, and warns when git has seen something §10 does not mention. It reads subjects only, so a commit finishing two tickets while naming one under-reports — which is why §10 is authoritative and the git side is a check on it rather than the source.
+
+**Which commit subjects it reads is decided by one optional letter, and that is an accident this file has been treating as a rule.** The subject parser is `^((SHIP|X)-[0-9]+(-[0-9]+)?[a-z]?):` — `[a-z]` **once**, optionally. So `SHIP-15y:` matches, claims `SHIP-15y`, finds no such row in §10, and **hard-fails**; `SHIP-15ao:`, `SHIP-15ap:` and `SHIP-15aq:` match nothing at all and are invisible to both guards. Confirmed by running the parser's own `sed` over each form rather than by reading it.
+
+**That is the whole reason the commit-subject convention appears to have changed at `ship-15ao`, and nobody decided it.** §13 and the paragraph above tell a repair pass to name the surface it touches — `Docs/11:` — rather than its own id, and `ship-15q` through `ship-15y` had to, because a single-letter suffix is claimable. The branch letters then ran past `z` into `aa`, `ab`, … and two-letter suffixes stopped matching, so `ship-15ao` onwards could put their ids in subjects and stay green. **Both conventions are live in the log and only one of them was ever a choice.**
+
+**The trap that follows: widening `[a-z]?` to `[a-z]*` breaks `make status` on `develop` retroactively.** Measured on `36b0c3b` by running the widened expression over `git log --format=%s`: it claims `SHIP-15an`, `SHIP-15ao` and `SHIP-15ap`, none of which is in §10 or in `Docs/09`, and undeclared-but-claimed is the branch that exits 1. **A reader who notices that `SHIP-15ap:` slips through and 'fixes' the regex fails the gate on merged history**, which is a bad afternoon for a one-character change. If two-letter suffixes should be caught, the §10 list or the backlog has to take those ids first.
 
 **It could not see table structure until this pass, and both the blindness and its fix were demonstrated by mutation rather than reasoned about.** The §3 completeness check counts lines beginning with `|` and asks whether every done ticket appears in a first cell; it has no idea how many tables there are, so **a blank line inside a summary table splits it in two, every row below the gap is still counted, and the two halves still render as two adjacent tables in most viewers.** A merge resolution that leaves a blank line behind produces exactly that, and nothing reported it.
 
