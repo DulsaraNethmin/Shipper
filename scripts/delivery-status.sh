@@ -173,8 +173,14 @@ printf '  remaining %d tickets, %d points\n\n' \
     $((total_tickets - done_count)) $((total_points - done_points))
 
 # Per milestone, so it is obvious which one is actually in progress.
+#
+# This list is hand-maintained and the awk above is not: `/^## M[0-9]/` picks up a new milestone
+# heading on its own, so a milestone added to Docs/09 is counted in the totals immediately and is
+# invisible here until its name is added below. That asymmetry is the failure mode — the headline
+# would move while the breakdown silently omitted the rows that moved it. M8 was added with the
+# demonstration track; whoever adds M9 adds it here in the same change.
 printf '  %sby milestone%s\n' "$bold" "$off"
-for m in X M0 M1 M2 M3 M4 M5 M6 M7; do
+for m in X M0 M1 M2 M3 M4 M5 M6 M7 M8; do
     m_total=$(awk -F'\t' -v m="$m" '$3 == m {n++} END {print n+0}' <<<"$backlog")
     [[ "$m_total" -gt 0 ]] || continue
     m_done=0
