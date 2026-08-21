@@ -440,7 +440,8 @@ type HTTPMessaging struct {
 	// Path is appended to the base URL. Defaults to /messages.
 	Path string
 
-	// AuthHeader is the header the credential is presented in. Defaults to Authorization.
+	// AuthHeader is the header the credential is presented in. Defaults to
+	// Authorization (spelling:ok — HTTP header name, RFC 9110).
 	AuthHeader string
 
 	// AuthScheme prefixes the credential. Defaults to Bearer; the literal "none" sends the

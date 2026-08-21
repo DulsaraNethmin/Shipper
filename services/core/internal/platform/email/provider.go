@@ -54,7 +54,8 @@ type Options struct {
 	Path string
 
 	// AuthHeader is the header the credential is presented in. Defaults to
-	// "Authorization". Vendors that use their own — Postmark's X-Postmark-Server-Token,
+	// "Authorization" (spelling:ok — HTTP header name, RFC 9110). Vendors that use their
+	// own — Postmark's X-Postmark-Server-Token,
 	// for one — set it here.
 	AuthHeader string
 
@@ -263,7 +264,7 @@ const authHeader = "Authorization" // spelling:ok — HTTP header name, RFC 9110
 // Together they reproduce exactly what this adapter sent before any of it was
 // configurable, which is the property that let the change land without rewriting a test:
 // a POST of {"from":…,"to":…,"subject":…,"text":…} to {base}/messages, bearing the
-// credential as `Authorization: Bearer`.
+// credential as `Authorization: Bearer` (spelling:ok — HTTP header name, RFC 9110).
 const (
 	defaultPath        = "/messages"
 	defaultAuthScheme  = "Bearer"

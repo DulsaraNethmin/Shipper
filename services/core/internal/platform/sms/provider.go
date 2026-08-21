@@ -50,7 +50,7 @@ type Options struct {
 	Path string
 
 	// AuthHeader is the header the credential is presented in. Defaults to
-	// "Authorization".
+	// "Authorization" (spelling:ok — HTTP header name, RFC 9110).
 	AuthHeader string
 
 	// AuthScheme prefixes the credential, separated by a space. Defaults to "Bearer"; set
