@@ -399,6 +399,17 @@ func (t TrustedProxy) Configured() bool {
 // staging it is caught where the adapter is constructed, which is at startup and with a message
 // that says which variable is missing.
 type Email struct {
+	// Transport is which implementation carries the message: console, http, or smtp
+	// (SHIP-187a, SHIP-187b).
+	//
+	// Left unset it is derived from SHIPPER_ENV — console in development, http everywhere
+	// else — which is exactly what email.UseConsole decided before this field existed. What
+	// it adds is the ability to say otherwise: a demonstration instance runs hardened, with
+	// real signing keys and every deployment-safety rule in force, and still sends its mail
+	// to a local catcher over SMTP. That combination could not be expressed while the
+	// transport was a function of the environment.
+	Transport Transport
+
 	// ProviderBaseURL is the root of the vendor's API. Empty in development, where nothing
 	// reaches it.
 	ProviderBaseURL string
@@ -410,6 +421,56 @@ type Email struct {
 	// service in the MVP; per-domain senders are a deliverability decision nobody has needed
 	// to make yet.
 	Sender string
+
+	// HTTP is what the http transport needs beyond the three fields above, and it is all
+	// optional: unset, it reproduces the request the adapter sent before any of it was
+	// configurable. See internal/platform/email.Options for what each field means and for
+	// the argument that the vendor belongs in configuration rather than in Go.
+	HTTP HTTPMessaging
+
+	// SMTP is what the smtp transport needs.
+	SMTP SMTP
+}
+
+// HTTPMessaging is the vendor-shaped half of an HTTP messaging adapter (SHIP-187a).
+//
+// Shared by [Email] and [SMS] because the three things vendors differ on are the same three
+// for both, and a buyer who has to repoint one will usually repoint the other.
+type HTTPMessaging struct {
+	// Path is appended to the base URL. Defaults to /messages.
+	Path string
+
+	// AuthHeader is the header the credential is presented in. Defaults to Authorization.
+	AuthHeader string
+
+	// AuthScheme prefixes the credential. Defaults to Bearer; the literal "none" sends the
+	// credential bare, which is what Postmark and several SMS gateways expect.
+	AuthScheme string
+
+	// ContentType defaults to application/json.
+	ContentType string
+
+	// BodyTemplate renders the request body. Interpolate every value with {{json .Field}},
+	// which supplies its own quotes — the adapter refuses a template that cannot produce
+	// valid JSON when the content type says JSON.
+	BodyTemplate string
+}
+
+// SMTP configures the SMTP email transport (SHIP-187b).
+type SMTP struct {
+	// Host and Port of the mail server. Port defaults per Encryption: 587 for starttls,
+	// 465 for implicit, 25 for none.
+	Host string
+	Port int
+
+	// Username and Password authenticate the session. Both empty means no authentication,
+	// which is what a local catcher wants and what a real provider refuses.
+	Username string
+	Password string
+
+	// Encryption is starttls, implicit, or none. Defaults to starttls. A credential over
+	// "none" is refused by the adapter rather than warned about.
+	Encryption string
 }
 
 // Passwords configures how the platform stores a password (SHIP-29, SHIP-15r, SHIP-147a).
@@ -528,6 +589,14 @@ type Delivery struct {
 // environment that dispatched by accident would be a bill as well as a nuisance to whoever last
 // used that number for testing.
 type SMS struct {
+	// Transport is which implementation carries the message: console or http (SHIP-187a).
+	//
+	// There is no smtp here for the obvious reason, and no silent fallback either — a
+	// deployment that wants an instance not to send real text messages says so by setting
+	// this to console, which is a visible choice in a configuration file rather than an
+	// inference from the environment.
+	Transport Transport
+
 	// ProviderBaseURL is the root of the gateway's API. Empty in development.
 	ProviderBaseURL string
 
@@ -538,7 +607,39 @@ type SMS struct {
 	// originating number, depending on what the gateway and the destination country permit.
 	// Australia allows both; the choice is made with the vendor.
 	Sender string
+
+	// HTTP is the vendor-shaped half, all optional. SMS gateways vary by country as well as
+	// by vendor, so this is the adapter a buyer is most likely to have to repoint.
+	HTTP HTTPMessaging
 }
+
+// Transport names which implementation of a messaging adapter is built (SHIP-187a).
+//
+// # Why this is configuration and no longer a function of the environment
+//
+// It was email.UseConsole(env) and sms.UseConsole(env), which answered well for the two
+// cases that existed: a developer must not send real mail, and a deployment must not
+// silently swallow it. What it could not express is the third case, which arrived with the
+// demonstration environment — an instance that is hardened in every respect, running with
+// real signing keys under every deployment-safety rule, and deliberately sending its mail
+// somewhere free.
+//
+// The safe default is kept exactly as it was: unset, this resolves to console in
+// development and http everywhere else. Choosing wrongly towards the console costs a
+// developer a puzzled minute; choosing wrongly towards the provider sends real email, and
+// real text messages cost money per send and wake a real handset.
+type Transport string
+
+const (
+	// TransportConsole writes the message to the log and sends nothing.
+	TransportConsole Transport = "console"
+
+	// TransportHTTP posts the message to a vendor's HTTP API.
+	TransportHTTP Transport = "http"
+
+	// TransportSMTP hands the message to a mail server. Email only.
+	TransportSMTP Transport = "smtp"
+)
 
 // Push configures the Firebase Cloud Messaging adapter (SHIP-139), consumed by cmd/notifier.
 //
@@ -924,14 +1025,38 @@ func Load() (*Config, error) {
 				developmentDriverActiveKID),
 		},
 		Email: Email{
+			// Empty is resolved against the environment below, once Env is known.
+			Transport:       Transport(l.str("EMAIL_TRANSPORT", "")),
 			ProviderBaseURL: l.str("EMAIL_PROVIDER_BASE_URL", ""),
 			ProviderAPIKey:  l.str("EMAIL_PROVIDER_API_KEY", ""),
 			Sender:          l.str("EMAIL_SENDER", "no-reply@shipper.com.au"),
+			HTTP: HTTPMessaging{
+				Path:         l.str("EMAIL_PROVIDER_PATH", ""),
+				AuthHeader:   l.str("EMAIL_PROVIDER_AUTH_HEADER", ""),
+				AuthScheme:   l.str("EMAIL_PROVIDER_AUTH_SCHEME", ""),
+				ContentType:  l.str("EMAIL_PROVIDER_CONTENT_TYPE", ""),
+				BodyTemplate: l.str("EMAIL_PROVIDER_BODY_TEMPLATE", ""),
+			},
+			SMTP: SMTP{
+				Host:       l.str("EMAIL_SMTP_HOST", ""),
+				Port:       l.port("EMAIL_SMTP_PORT", 0),
+				Username:   l.str("EMAIL_SMTP_USERNAME", ""),
+				Password:   l.str("EMAIL_SMTP_PASSWORD", ""),
+				Encryption: l.str("EMAIL_SMTP_ENCRYPTION", ""),
+			},
 		},
 		SMS: SMS{
+			Transport:       Transport(l.str("SMS_TRANSPORT", "")),
 			ProviderBaseURL: l.str("SMS_PROVIDER_BASE_URL", ""),
 			ProviderAPIKey:  l.str("SMS_PROVIDER_API_KEY", ""),
 			Sender:          l.str("SMS_SENDER", "Shipper"),
+			HTTP: HTTPMessaging{
+				Path:         l.str("SMS_PROVIDER_PATH", ""),
+				AuthHeader:   l.str("SMS_PROVIDER_AUTH_HEADER", ""),
+				AuthScheme:   l.str("SMS_PROVIDER_AUTH_SCHEME", ""),
+				ContentType:  l.str("SMS_PROVIDER_CONTENT_TYPE", ""),
+				BodyTemplate: l.str("SMS_PROVIDER_BODY_TEMPLATE", ""),
+			},
 		},
 		Push: Push{
 			ProjectID:  l.str("PUSH_PROJECT_ID", ""),
@@ -1007,12 +1132,36 @@ func Load() (*Config, error) {
 		},
 	}
 
+	resolveTransports(cfg)
 	l.validate(cfg)
 
 	if err := errors.Join(l.errs...); err != nil {
 		return nil, fmt.Errorf("invalid configuration:\n%w", err)
 	}
 	return cfg, nil
+}
+
+// resolveTransports fills in a messaging transport that was not set explicitly (SHIP-187a).
+//
+// Separate from the loader literal because it needs Env, which is read inside that same
+// literal and cannot be referred to from within it. Separate from validate because it
+// assigns rather than checks, and a step that does both is one nobody can read.
+//
+// The rule reproduces email.UseConsole exactly, including its bias: anything that is not
+// recognisably a deployed environment gets the console. Choosing wrongly towards the
+// console costs a developer a puzzled minute, and choosing wrongly towards the provider
+// sends real messages from a machine that should never have had the credential.
+func resolveTransports(cfg *Config) {
+	def := TransportHTTP
+	if cfg.Env.IsDevelopment() || !cfg.Env.valid() {
+		def = TransportConsole
+	}
+	if cfg.Email.Transport == "" {
+		cfg.Email.Transport = def
+	}
+	if cfg.SMS.Transport == "" {
+		cfg.SMS.Transport = def
+	}
 }
 
 // LogValue renders the configuration for a startup log line with credentials removed.
@@ -1052,6 +1201,11 @@ func (c Config) LogValue() slog.Value {
 		// Whether a base URL is set, not what it is, and never the key. "Email is going to
 		// the console" is the line somebody needs when a verification message has not
 		// arrived, and it is the one thing a hostname would not tell them.
+		// The transport is in the startup line because it is the one setting that decides
+		// whether anything leaves the building, and an instance quietly on the console is
+		// indistinguishable from a working one until somebody waits for a message.
+		slog.String("email_transport", string(c.Email.Transport)),
+		slog.String("sms_transport", string(c.SMS.Transport)),
 		slog.Bool("email_provider_configured", c.Email.ProviderBaseURL != ""),
 		slog.String("email_sender", c.Email.Sender),
 		slog.Bool("sms_provider_configured", c.SMS.ProviderBaseURL != ""),
@@ -1631,6 +1785,33 @@ func (l *loader) validate(cfg *Config) {
 		l.errf("PROOF_COMPRESSION_BUDGET_BYTES (%d) cannot exceed STORAGE_MAX_UPLOAD_BYTES (%d); "+
 			"the budget is what the client compresses towards and the bound is what the platform "+
 			"will accept", cfg.App.ProofCompressionBudgetBytes, cfg.Storage.MaxUploadBytes)
+	}
+
+	// An unrecognised transport is refused rather than defaulted, and that direction is
+	// deliberate: the defaulting above happens only for a variable nobody set, whereas a
+	// value that is present and wrong is somebody's intention spelled incorrectly. Falling
+	// back would send real email from a deployment that had asked for the console, or
+	// swallow it in one that had asked for a provider — and both are silent.
+	switch cfg.Email.Transport {
+	case TransportConsole, TransportHTTP, TransportSMTP:
+	default:
+		l.errf("EMAIL_TRANSPORT: %q is not a transport (want console, http, or smtp)",
+			cfg.Email.Transport)
+	}
+
+	switch cfg.SMS.Transport {
+	case TransportConsole, TransportHTTP:
+	case TransportSMTP:
+		l.errf("SMS_TRANSPORT: smtp is an email transport; want console or http")
+	default:
+		l.errf("SMS_TRANSPORT: %q is not a transport (want console or http)", cfg.SMS.Transport)
+	}
+
+	// The smtp transport needs a host, and the failure without this is a panic out of
+	// cmd/api's composition root — a configuration fault reported as a wiring one, at the
+	// point furthest from the line that caused it. The same argument the presign TTLs make.
+	if cfg.Email.Transport == TransportSMTP && cfg.Email.SMTP.Host == "" {
+		l.errf("EMAIL_SMTP_HOST: must be set when EMAIL_TRANSPORT is smtp")
 	}
 
 	// A credential with nowhere to go is the shape of a half-finished configuration, and the

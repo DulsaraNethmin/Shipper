@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 
-	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
 
@@ -30,7 +29,7 @@ func NewConsole() *Console { return &Console{} }
 //
 // The body is logged in full, which for the MVP means the OTP is legible in the log. That
 // is deliberate: reading the code out of the log is how a developer completes phone
-// verification without a handset (SHIP-34, SHIP-36). It is also exactly why [UseConsole]
+// verification without a handset (SHIP-34, SHIP-36). It is also exactly why the transport setting
 // decides where this runs rather than a caller remembering to.
 func (c *Console) Send(ctx context.Context, to, body string) error {
 	if to == "" {
@@ -44,21 +43,4 @@ func (c *Console) Send(ctx context.Context, to, body string) error {
 		slog.String("body", body),
 	)
 	return nil
-}
-
-// UseConsole reports whether env logs its messages rather than dispatching them.
-//
-// Only staging and production hand a message to a gateway. Everything else — development,
-// an environment string nobody recognises, an empty one — logs.
-//
-// The fallback leans that way deliberately. Choosing wrongly towards the console costs a
-// developer a puzzled minute; choosing wrongly towards the gateway sends a real text to a
-// real phone, and charges for it.
-func UseConsole(env config.Environment) bool {
-	switch env {
-	case config.Staging, config.Production:
-		return false
-	default:
-		return true
-	}
 }

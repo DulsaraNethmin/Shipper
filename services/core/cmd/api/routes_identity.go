@@ -230,52 +230,90 @@ func identityHandler(d Deps) *identity.Handler {
 // adapter knows nothing about identity. Go satisfies the interface structurally, and the two
 // meet here (Docs/06 §4.1).
 //
-// email.UseConsole owns the rule rather than a switch written here, and it leans towards the
-// console for anything it does not recognise. Choosing wrongly towards the console costs a
-// developer a puzzled minute; choosing wrongly towards the provider sends real email from a
-// machine that should never have had the credential.
+// config.Email.Transport owns the choice rather than a rule written here (SHIP-187a). It was
+// email.UseConsole(cfg.Env), and the bias it leaned with is unchanged — an unrecognised
+// environment still gets the console, because choosing wrongly towards the console costs a
+// developer a puzzled minute while choosing wrongly towards the provider sends real email from a
+// machine that should never have had the credential. What moved is only where the rule lives, and
+// it moved because the environment could not express a hardened instance that deliberately sends
+// its mail to a local catcher.
 //
-// A staging or production deployment with no provider configured stops the process, and that is
-// the correct direction. The alternative is a service that registers accounts, reports success,
-// and silently sends no verification message — so every account it creates is one nobody can
-// finish setting up, discovered a day later by the people who signed up.
+// A deployment whose transport cannot be built stops the process, and that is the correct
+// direction. The alternative is a service that registers accounts, reports success, and silently
+// sends no verification message — so every account it creates is one nobody can finish setting up,
+// discovered a day later by the people who signed up.
 func newEmailSender(cfg *config.Config) identity.EmailSender {
-	if email.UseConsole(cfg.Env) {
+	switch cfg.Email.Transport {
+	case config.TransportSMTP:
+		sender, err := email.NewSMTP(email.SMTPOptions{
+			Host:       cfg.Email.SMTP.Host,
+			Port:       cfg.Email.SMTP.Port,
+			Username:   cfg.Email.SMTP.Username,
+			Password:   cfg.Email.SMTP.Password,
+			Sender:     cfg.Email.Sender,
+			Encryption: email.Encryption(cfg.Email.SMTP.Encryption),
+		})
+		if err != nil {
+			panic("cmd/api: email smtp: " + err.Error() +
+				" — set EMAIL_SMTP_HOST and EMAIL_SENDER, or choose another EMAIL_TRANSPORT")
+		}
+		return sender
+
+	case config.TransportHTTP:
+		sender, err := email.NewProvider(email.Options{
+			BaseURL:      cfg.Email.ProviderBaseURL,
+			APIKey:       cfg.Email.ProviderAPIKey,
+			Sender:       cfg.Email.Sender,
+			Path:         cfg.Email.HTTP.Path,
+			AuthHeader:   cfg.Email.HTTP.AuthHeader,
+			AuthScheme:   cfg.Email.HTTP.AuthScheme,
+			ContentType:  cfg.Email.HTTP.ContentType,
+			BodyTemplate: cfg.Email.HTTP.BodyTemplate,
+		})
+		if err != nil {
+			panic("cmd/api: email provider: " + err.Error() +
+				" — set EMAIL_PROVIDER_BASE_URL, EMAIL_PROVIDER_API_KEY and EMAIL_SENDER, or " +
+				"set EMAIL_TRANSPORT to smtp or console")
+		}
+		return sender
+
+	default:
+		// console, and everything else. The unrecognised case lands here deliberately:
+		// config.Load refuses a value it does not know, so nothing reaching this line came
+		// through it — a Config built in code did, and the bias that has always governed
+		// this choice says such a Config must not dispatch. Choosing wrongly towards the
+		// console costs a developer a puzzled minute; choosing wrongly towards the provider
+		// sends real email from a process that should never have had the credential.
 		return email.NewConsole()
 	}
-
-	sender, err := email.NewProvider(email.Options{
-		BaseURL: cfg.Email.ProviderBaseURL,
-		APIKey:  cfg.Email.ProviderAPIKey,
-		Sender:  cfg.Email.Sender,
-	})
-	if err != nil {
-		panic("cmd/api: email provider: " + err.Error() +
-			" — set EMAIL_PROVIDER_BASE_URL, EMAIL_PROVIDER_API_KEY and EMAIL_SENDER, or run " +
-			"with SHIPPER_ENV=development to log messages to the console instead")
-	}
-	return sender
 }
 
 // newSMSSender picks the SMS implementation for this environment (SHIP-35, SHIP-34).
 //
 // The same shape as newEmailSender and the same reasoning, with one difference in emphasis:
-// sms.UseConsole leaning towards the console matters more here, because a message costs money
+// The console bias matters more here, because a message costs money
 // per send and wakes a real handset belonging to whoever last used that number for testing.
 func newSMSSender(cfg *config.Config) identity.SMSSender {
-	if sms.UseConsole(cfg.Env) {
+	// Explicitly http, or the console. The same bias as email above, and it matters more
+	// here: a text message costs money per send and wakes a real handset.
+	if cfg.SMS.Transport != config.TransportHTTP {
 		return sms.NewConsole()
 	}
 
 	sender, err := sms.NewProvider(sms.Options{
-		BaseURL: cfg.SMS.ProviderBaseURL,
-		APIKey:  cfg.SMS.ProviderAPIKey,
-		Sender:  cfg.SMS.Sender,
+		BaseURL:      cfg.SMS.ProviderBaseURL,
+		APIKey:       cfg.SMS.ProviderAPIKey,
+		Sender:       cfg.SMS.Sender,
+		Path:         cfg.SMS.HTTP.Path,
+		AuthHeader:   cfg.SMS.HTTP.AuthHeader,
+		AuthScheme:   cfg.SMS.HTTP.AuthScheme,
+		ContentType:  cfg.SMS.HTTP.ContentType,
+		BodyTemplate: cfg.SMS.HTTP.BodyTemplate,
 	})
 	if err != nil {
 		panic("cmd/api: sms provider: " + err.Error() +
-			" — set SMS_PROVIDER_BASE_URL, SMS_PROVIDER_API_KEY and SMS_SENDER, or run with " +
-			"SHIPPER_ENV=development to log messages to the console instead")
+			" — set SMS_PROVIDER_BASE_URL, SMS_PROVIDER_API_KEY and SMS_SENDER, or set " +
+			"SMS_TRANSPORT to console to log messages instead")
 	}
 	return sender
 }

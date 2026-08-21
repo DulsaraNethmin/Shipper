@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 
-	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
 
@@ -33,7 +32,7 @@ func NewConsole() *Console { return &Console{} }
 //
 // The body is logged in full and unredacted. That is the point of this implementation —
 // the verification link in a development signup is read out of the log (SHIP-31, SHIP-33),
-// and a redacted one would be useless. It is also exactly why [UseConsole] must decide
+// and a redacted one would be useless. It is also exactly why config.Email.Transport must decide
 // where this runs rather than a caller remembering to.
 func (c *Console) Send(ctx context.Context, to, subject, body string) error {
 	if to == "" {
@@ -48,22 +47,4 @@ func (c *Console) Send(ctx context.Context, to, subject, body string) error {
 		slog.String("body", body),
 	)
 	return nil
-}
-
-// UseConsole reports whether env logs its email rather than dispatching it.
-//
-// The rule is stated once, here, rather than three times in the composition root: only
-// staging and production hand a message to a provider. Everything else — development, an
-// environment string nobody recognises, an empty one — logs.
-//
-// The fallback leans that way deliberately. Choosing wrongly towards the console costs a
-// developer a puzzled minute; choosing wrongly towards the provider sends real email from
-// a machine that should never have had the credential in the first place.
-func UseConsole(env config.Environment) bool {
-	switch env {
-	case config.Staging, config.Production:
-		return false
-	default:
-		return true
-	}
 }

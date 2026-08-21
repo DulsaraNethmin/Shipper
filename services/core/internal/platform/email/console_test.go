@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/httpx"
 )
 
@@ -79,29 +78,5 @@ func TestConsoleHoldsNoTransport(t *testing.T) {
 func TestConsoleRefusesAMessageWithNoRecipient(t *testing.T) {
 	if err := NewConsole().Send(context.Background(), "", "Subject", "Body"); !errors.Is(err, ErrNoRecipient) {
 		t.Errorf("Send with no recipient: err = %v, want ErrNoRecipient", err)
-	}
-}
-
-// SHIP-32's acceptance criterion in one table: console in dev, the provider in staging.
-func TestUseConsoleSelectsByEnvironment(t *testing.T) {
-	cases := []struct {
-		env         config.Environment
-		wantConsole bool
-	}{
-		{config.Development, true},
-		{config.Staging, false},
-		{config.Production, false},
-
-		// Neither of these can reach a validated Config — config.Load refuses them —
-		// but the fallback direction is the whole safety property, so it is asserted
-		// rather than assumed.
-		{config.Environment(""), true},
-		{config.Environment("staging "), true},
-	}
-
-	for _, c := range cases {
-		if got := UseConsole(c.env); got != c.wantConsole {
-			t.Errorf("UseConsole(%q) = %v, want %v", c.env, got, c.wantConsole)
-		}
 	}
 }
