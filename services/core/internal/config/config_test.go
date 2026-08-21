@@ -1169,3 +1169,135 @@ func TestThereIsOneArgon2CostSetting(t *testing.T) {
 		}
 	}
 }
+
+// --- SHIP-187a: the messaging transport ---------------------------------------------------
+
+// The rule this asserts used to live in email.UseConsole and sms.UseConsole and was tested
+// there. It moved here when the transport became configurable, and the test moved with it —
+// one place owning the rule is the whole point of the move, and a rule tested where it no
+// longer lives is how two places start to disagree.
+func TestTransportDefaultsToTheEnvironmentWhenUnset(t *testing.T) {
+	cases := map[string]struct {
+		env  Environment
+		want Transport
+	}{
+		"development logs":                 {env: Development, want: TransportConsole},
+		"staging dispatches":               {env: Staging, want: TransportHTTP},
+		"production dispatches":            {env: Production, want: TransportHTTP},
+		"an unrecognised environment logs": {env: Environment("prod"), want: TransportConsole},
+		"an empty environment logs":        {env: Environment(""), want: TransportConsole},
+	}
+
+	// resolveTransports directly rather than through Load, because two of these environments
+	// are invalid and Load returns no configuration at all for an invalid one — so the rule
+	// under test would be unreachable through it for exactly the cases that matter most.
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := &Config{Env: c.env}
+			resolveTransports(cfg)
+
+			if cfg.Email.Transport != c.want {
+				t.Errorf("email transport = %q, want %q", cfg.Email.Transport, c.want)
+			}
+			if cfg.SMS.Transport != c.want {
+				t.Errorf("sms transport = %q, want %q", cfg.SMS.Transport, c.want)
+			}
+		})
+	}
+}
+
+// Defaulting fills a gap and never overrides a choice.
+func TestResolveTransportsLeavesAnExplicitChoiceAlone(t *testing.T) {
+	cfg := &Config{
+		Env:   Development,
+		Email: Email{Transport: TransportSMTP},
+		SMS:   SMS{Transport: TransportHTTP},
+	}
+	resolveTransports(cfg)
+
+	if cfg.Email.Transport != TransportSMTP {
+		t.Errorf("email transport = %q, want smtp", cfg.Email.Transport)
+	}
+	if cfg.SMS.Transport != TransportHTTP {
+		t.Errorf("sms transport = %q, want http", cfg.SMS.Transport)
+	}
+}
+
+// The case the environment could not express, and the reason the setting exists: an instance
+// hardened in every other respect that deliberately sends its mail somewhere free.
+func TestTransportCanBeChosenAgainstTheEnvironment(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("SHIPPER_ENV", "staging")
+	t.Setenv("LOG_FORMAT", "json")
+	t.Setenv("DATABASE_URL", "postgres://u:p@db.internal:5432/shipper?sslmode=require")
+	t.Setenv("REDIS_URL", "redis://cache.internal:6379/0")
+	t.Setenv("IDENTITY_ACCESS_TOKEN_KEYS", deploymentSigningKeys)
+	t.Setenv("DELIVERY_DRIVER_TOKEN_KEYS", deploymentDriverSigningKeys)
+	t.Setenv("IDENTITY_ACCESS_TOKEN_ACTIVE_KID", "2026-08")
+	t.Setenv("DELIVERY_DRIVER_TOKEN_ACTIVE_KID", "2026-08")
+	t.Setenv("STORAGE_ACCESS_KEY_ID", "AKIAEXAMPLE")
+	t.Setenv("STORAGE_SECRET_ACCESS_KEY", "secretexamplesecretexample")
+	t.Setenv("STORAGE_ENDPOINT", "https://s3.ap-southeast-2.amazonaws.com")
+	t.Setenv("EMAIL_TRANSPORT", "smtp")
+	t.Setenv("EMAIL_SMTP_HOST", "mailpit")
+	t.Setenv("EMAIL_SMTP_PORT", "1025")
+	t.Setenv("EMAIL_SMTP_ENCRYPTION", "none")
+	t.Setenv("SMS_TRANSPORT", "console")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned %v, want nil", err)
+	}
+	if cfg.Email.Transport != TransportSMTP {
+		t.Errorf("email transport = %q, want smtp", cfg.Email.Transport)
+	}
+	if cfg.Email.SMTP.Host != "mailpit" || cfg.Email.SMTP.Port != 1025 {
+		t.Errorf("smtp = %s:%d, want mailpit:1025", cfg.Email.SMTP.Host, cfg.Email.SMTP.Port)
+	}
+	if cfg.SMS.Transport != TransportConsole {
+		t.Errorf("sms transport = %q, want console", cfg.SMS.Transport)
+	}
+}
+
+// A value that is present and wrong is somebody's intention spelled incorrectly, and
+// defaulting it would either send real email from a deployment that asked for the console or
+// swallow it in one that asked for a provider. Both are silent.
+func TestLoadRefusesAnUnknownTransport(t *testing.T) {
+	cases := map[string]struct{ key, value, want string }{
+		"an unknown email transport": {"EMAIL_TRANSPORT", "sendmail", "EMAIL_TRANSPORT"},
+		"an unknown sms transport":   {"SMS_TRANSPORT", "carrier-pigeon", "SMS_TRANSPORT"},
+		// smtp is a real transport and a real mistake: it is the email one, and an SMS
+		// gateway that spoke it would be news. Named separately so the message can say so.
+		"smtp asked of sms": {"SMS_TRANSPORT", "smtp", "SMS_TRANSPORT"},
+	}
+
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(c.key, c.value)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() accepted %s=%s", c.key, c.value)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error = %v, want it to name %s", err, c.want)
+			}
+		})
+	}
+}
+
+// The failure without this is a panic out of cmd/api's composition root — a configuration
+// fault reported as a wiring one, at the point furthest from the line that caused it.
+func TestLoadRefusesSMTPWithoutAHost(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("EMAIL_TRANSPORT", "smtp")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() accepted EMAIL_TRANSPORT=smtp with no host")
+	}
+	if !strings.Contains(err.Error(), "EMAIL_SMTP_HOST") {
+		t.Errorf("error = %v, want it to name EMAIL_SMTP_HOST", err)
+	}
+}

@@ -148,3 +148,107 @@ func newTestProvider(t *testing.T, opts Options) *Provider {
 	}
 	return p
 }
+
+// --- SHIP-187a: the gateway is configuration, not code ------------------------------------
+
+// captureSMS runs one send against a recording server and returns what arrived.
+func captureSMS(t *testing.T, opts Options, to, body string) (path, credential, payload string) {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		for name := range r.Header {
+			if v := r.Header.Get(name); strings.Contains(v, testAPIKey) {
+				credential = name + ": " + v
+			}
+		}
+		read, _ := io.ReadAll(r.Body)
+		payload = string(read)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	opts.BaseURL = srv.URL
+	if opts.APIKey == "" {
+		opts.APIKey = testAPIKey
+	}
+	if opts.Sender == "" {
+		opts.Sender = "Shipper"
+	}
+
+	provider, err := NewProvider(opts)
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	if err := provider.Send(context.Background(), to, body); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	return path, credential, payload
+}
+
+// SMS gateways vary by country as well as by vendor, so this is the adapter a buyer is
+// most likely to have to repoint.
+func TestProviderUsesAConfiguredPathAndCredentialHeader(t *testing.T) {
+	path, credential, _ := captureSMS(t, Options{
+		Path:       "v1/send",
+		AuthHeader: "X-Api-Key",
+		AuthScheme: AuthSchemeNone,
+	}, "+61400000000", "Your code is 123456.")
+
+	if path != "/v1/send" {
+		t.Errorf("path = %q, want /v1/send", path)
+	}
+	if want := "X-Api-Key: " + testAPIKey; credential != want {
+		t.Errorf("credential header = %q, want %q", credential, want)
+	}
+}
+
+func TestProviderRendersAConfiguredBodyTemplate(t *testing.T) {
+	_, _, payload := captureSMS(t, Options{
+		BodyTemplate: `{"source":{{json .From}},"destination":{{json .To}},"message":{{json .Text}}}`,
+	}, "+61400000000", "Your code is 123456.")
+
+	var got struct {
+		Source      string `json:"source"`
+		Destination string `json:"destination"`
+		Message     string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(payload), &got); err != nil {
+		t.Fatalf("payload is not the configured shape: %v\n%s", err, payload)
+	}
+	if got.Destination != "+61400000000" || got.Message != "Your code is 123456." {
+		t.Errorf("payload = %s", payload)
+	}
+}
+
+// The default template has to survive the values it is given, and a body concatenated from
+// unescaped strings is an injection into the gateway's API rather than merely a bug.
+func TestProviderEscapesValuesThatWouldBreakTheBody(t *testing.T) {
+	_, _, payload := captureSMS(t, Options{}, "+61400000000", `He said "go"`)
+
+	if !json.Valid([]byte(payload)) {
+		t.Fatalf("default template produced invalid JSON:\n%s", payload)
+	}
+	var got message
+	if err := json.Unmarshal([]byte(payload), &got); err != nil {
+		t.Fatalf("unmarshalling: %v", err)
+	}
+	if got.Text != `He said "go"` {
+		t.Errorf("text round-tripped as %q", got.Text)
+	}
+}
+
+func TestNewProviderRefusesABodyTemplateThatCannotRenderJSON(t *testing.T) {
+	_, err := NewProvider(Options{
+		BaseURL:      "https://gateway.example.com",
+		APIKey:       testAPIKey,
+		Sender:       "Shipper",
+		BodyTemplate: `{"text":"{{.Text}}"}`,
+	})
+	if err == nil {
+		t.Fatal("NewProvider accepted a template that renders invalid JSON")
+	}
+	if !strings.Contains(err.Error(), "{{json .Field}}") {
+		t.Errorf("error = %v, want it to name the correct form", err)
+	}
+}

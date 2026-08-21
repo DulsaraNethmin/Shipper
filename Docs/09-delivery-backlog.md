@@ -6,9 +6,17 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**246 tickets, 766 points.** Counted from the rows on 2026-08-20, at `01eb04c`, plus the six rows
-this branch adds. The previous figure — 240 and 747 — was correct for the tree it was written on;
-this pass adds **M8**, the demonstration track, at nineteen points.
+**248 tickets, 774 points.** Counted from the rows on 2026-08-21, at `9991578`. The previous
+figure — 246 and 766 — was correct for the tree it was written on; this pass adds **SHIP-187a** and
+**SHIP-187b**, which take M8 to eight rows and twenty-seven points.
+
+**Both rows were written because a deployment could not be built without them, which is the same
+way X-10 was found.** Attempting SHIP-188 established by running it that the API refuses to start
+outside development with no messaging vendor configured — and that **no row in this file created
+one**. `internal/platform/email/provider.go` recorded the choice as deferred to SHIP-33, and
+SHIP-33 is done, so the deferral had outlived the ticket that owned it. The answer is not a Track X
+row asking somebody to open an account: the vendor belongs to whoever deploys, so the work was to
+make it configuration.
 
 **M8 is the first milestone added since the backlog was written, and the reason is a change of
 destination rather than a change of plan.** `Docs/01` §8 now carries two gates: a demonstration a
@@ -73,8 +81,8 @@ whenever a row is added rather than left for a later pass to reconcile.
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 14 | 48 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 22 | 69 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 24 | 72 |
-| **M8** — Demonstration | The marketplace runs at a stable address and a buyer can drive the whole journey unaided. | 6 | 19 |
-| | | **246** | **766** |
+| **M8** — Demonstration | The marketplace runs at a stable address and a buyer can drive the whole journey unaided. | 8 | 27 |
+| | | **248** | **774** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -497,13 +505,15 @@ What does work is an endpoint the app reads **while it still has signal** and ke
 ## M8 — Demonstration
 
 **Goal:** The marketplace runs at a stable address and a buyer can drive the whole journey unaided.  
-**Size:** 6 tickets, 19 points
+**Size:** 8 tickets, 27 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
 | SHIP-186 | Demo seed dataset | 5 | One command populates verified providers, open jobs, bids in flight, a delivery in progress and one completed delivery with photograph proof; it is idempotent, and it contains no real personal information | SHIP-63 |
 | SHIP-187 | Container images for the API, worker and notifier | 3 | Each binary builds to an image that starts from environment configuration alone, with no file baked in that a deployment would need to change | SHIP-20 |
-| SHIP-188 | Demonstration environment | 5 | The API answers /health over HTTPS at a stable hostname, with migrations and the topic set applied by the same deployment | SHIP-187 |
+| SHIP-187a | Messaging vendor as configuration | 5 | An email or SMS vendor differing in path, credential header and body shape is reachable by configuration alone, and the transport is chosen by setting rather than by environment | SHIP-32, SHIP-35 |
+| SHIP-187b | SMTP email transport | 3 | A message sent over SMTP is accepted by a mail server with its headers and body intact, and a credential is refused over an unencrypted connection | SHIP-187a |
+| SHIP-188 | Demonstration environment | 5 | The API answers /health over HTTPS at a stable hostname, with migrations and the topic set applied by the same deployment | SHIP-187, SHIP-187b |
 | SHIP-189 | Deploy the admin panel and the driver portal | 2 | Both are reachable over HTTPS and talk to the demonstration API; a driver link opens on a handset with no account | SHIP-188 |
 | SHIP-190 | Demonstration build of the mobile app | 2 | An installable Android build talks to the demonstration API with no change to any source file | SHIP-188 |
 | SHIP-191 | Demonstration walkthrough | 2 | A written script drives every step of Docs 01 §8's demo gate against the hosted instance, unaided, with no direct database access | SHIP-186, SHIP-189, SHIP-190 |
@@ -553,9 +563,9 @@ Worth stating plainly rather than discovering in month four.
 |---|---|---|
 | Full-time, focused | 20–25 | **30–38 weeks** (roughly 7–9 months) |
 | Full-time, with interruptions | 15 | **~51 weeks** |
-| Evenings and weekends | 6–8 | **95–127 weeks** (around two years) |
+| Evenings and weekends | 6–8 | **96–129 weeks** (around two years) |
 
-**The three rows are `floor(766 / rate)` and nothing else, and the total they divide is the one the rows carry.** They read 23, 29, 39, 74 and 99 two passes ago, which is `floor(599 / rate)` exactly — so the table was not merely stale, it was arithmetic over a total the plan stopped having long ago, and the 599 was still printed under *If you need to cut scope* where it was easiest to read as current. Recompute all five figures whenever the point total moves — now 30, 38, 51, 95 and 127 — together with the 766 under *If you need to cut scope*, which is the same total wearing prose. They are derived, not estimated.
+**The three rows are `floor(774 / rate)` and nothing else, and the total they divide is the one the rows carry.** They read 23, 29, 39, 74 and 99 two passes ago, which is `floor(599 / rate)` exactly — so the table was not merely stale, it was arithmetic over a total the plan stopped having long ago, and the 599 was still printed under *If you need to cut scope* where it was easiest to read as current. Recompute all five figures whenever the point total moves — now 30, 38, 51, 96 and 129 — together with the 774 under *If you need to cut scope*, which is the same total wearing prose. They are derived, not estimated.
 
 **M8 moved them for the first time since that correction, and it is the cheap case rather than the instructive one.** Nineteen points is under three weeks at any of these rates, so every row moved by one or two and none of the prose around them stopped being true. **The figure to distrust is the one that did not move**: a derived table is at its most dangerous when the total changes by little, because nothing about the page looks wrong.
 
@@ -565,7 +575,7 @@ Two things move this number more than working faster does: cutting scope (below)
 
 ## If you need to cut scope
 
-766 points is a substantial solo build. These are the honest levers, in the order I would pull them:
+774 points is a substantial solo build. These are the honest levers, in the order I would pull them:
 
 | Cut | Saves | What you lose |
 |---|---|---|
