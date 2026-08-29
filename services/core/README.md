@@ -93,7 +93,7 @@ Every failure — a validation error, a panic, `ServeMux`'s own 404 — has one 
     "code": "validation_failed",
     "message": "The job could not be published.",
     "request_id": "9f2c1b…",
-    "details": [{"field": "goods.category", "code": "prohibited_category", "message": "…"}]
+    "details": [{"field": "goods_category", "code": "not_allowed", "message": "…"}]
   }
 }
 ```
@@ -111,7 +111,7 @@ protocol codes `internal/httpx` owns plus every code each domain declares for it
 
 ```go
 var CodeProhibitedCategory = httpx.RegisterCode(
-    "prohibited_category", "The goods category may not be published.")
+    "jobs_prohibited_category", "The goods category may not be published.")
 ```
 
 Declaring one edits nothing shared, which is the point: a single file listing every code in the

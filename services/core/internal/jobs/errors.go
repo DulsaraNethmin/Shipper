@@ -157,6 +157,19 @@ var (
 	// client got wrong — a stale catalogue on a phone, or a typo — and the client's move is to
 	// re-fetch the list. See [Catalogue.Lookup].
 	ErrUnknownCategory = errors.New("jobs: not a goods category this platform serves")
+
+	// ErrProhibitedCategory means a category the platform does not carry (SHIP-59).
+	//
+	// The client got nothing wrong: the code is real, the customer chose it deliberately, and
+	// the answer is a policy decision rather than a validation failure. Docs/01 §2 puts
+	// dangerous goods, live animals, people and specialist regulated freight out of scope, and
+	// Docs/05 §4's draft position adds illegal goods.
+	//
+	// It is raised at publication and not at draft time, which is Docs/09's own framing —
+	// SHIP-59 is "prohibited goods validation *on publish*". A customer sketching a job should
+	// not be argued with halfway through; the refusal belongs at the moment the job would
+	// become visible to providers, which is the moment it would matter.
+	ErrProhibitedCategory = errors.New("jobs: this platform does not carry that category of goods")
 )
 
 // The error codes this domain's endpoints answer with (Docs/10 §4.4).
@@ -208,4 +221,33 @@ var (
 		"The job's expiry cannot be extended. Either it is not being offered to providers any "+
 			"more, or its pickup date is what is ending it — and no amount of extra listing "+
 			"time keeps a job alive past the date its goods were to be collected.")
+
+	// CodeProhibitedCategory is returned when a job is published in a category the platform
+	// does not carry (SHIP-59).
+	//
+	// 422 rather than 409 or 403. Not 403, because the caller is permitted — this is their own
+	// draft and they may publish; it is the goods that are refused. Not 409, because nothing
+	// about the job's *state* is in conflict: the same request will be refused identically
+	// tomorrow, whereas the three 409s above all describe a job that has moved on and invite the
+	// client to reload.
+	//
+	// A domain code rather than `validation_failed`, though, and the distinction earns its place
+	// here in a way it rarely does: Docs/09 asks for a refusal that "explains why", the
+	// explanation is the platform's own policy wording for that category, and a client showing
+	// it needs to know the difference between "you typed something wrong" and "we do not carry
+	// this". The first invites a correction; the second invites the customer to go somewhere
+	// else, and an app that offers a retry for it is wasting their afternoon.
+	//
+	// The registered description is deliberately general because the message on the wire is
+	// not: [apiError] names the category and quotes the catalogue's own description of it.
+	//
+	// Docs/10 §4.4 and internal/httpx/codes.go both use this code as their worked example of a
+	// domain-declared code, and both spell it `prohibited_category` without the domain prefix —
+	// against the naming rule stated in the same paragraph. The rule wins, every other code in
+	// this file follows it, and httpx's own codes_test.go already expected the prefixed form.
+	// Both examples are corrected in this commit rather than left to mislead the next domain.
+	CodeProhibitedCategory = httpx.RegisterCode("jobs_prohibited_category",
+		"The goods category may not be published. Shipper does not carry goods in this "+
+			"category — see the catalogue at GET /v1/goods-categories, where every entry "+
+			"says whether it is carried.")
 )

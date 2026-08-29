@@ -192,3 +192,61 @@ func (s *Service) Categories() (Catalogue, error) {
 	}
 	return s.catalogue, nil
 }
+
+// checkCategory reports whether a job in this category may be published (SHIP-59).
+//
+// Two failures, deliberately distinct — see [Catalogue.Lookup]. An unknown code is a client
+// working from a stale catalogue and is answered as a field error; a known code the platform does
+// not carry is a policy decision and is answered with [CodeProhibitedCategory].
+//
+// Neither is reachable with an empty code. Publication requires a category, and [publishable]
+// reports a missing one as a required field rather than as an unknown one — "you have not chosen"
+// and "there is no such thing" are different sentences to the person reading them.
+//
+// # This is the whole of the prohibited-goods rule, and it names no category
+//
+// Docs/01 §2 puts dangerous goods, live animals, people and specialist regulated freight out of
+// scope and Docs/05 §4 adds illegal goods, and none of those five words appears in this package.
+// The list is X-9's, it lives in configuration, and what is compiled in is only the *shape* of the
+// rule: a category must be known, and a category that is not carried cannot be published. That is
+// the same division model.go draws between the transition table, which is a decision, and the
+// twelve status names, which are a vocabulary.
+func (s *Service) checkCategory(code string) error {
+	catalogue, err := s.Categories()
+	if err != nil {
+		return err
+	}
+
+	category, known := catalogue.Lookup(code)
+	if !known {
+		return fmt.Errorf("jobs: %q: %w", code, ErrUnknownCategory)
+	}
+	if !category.Carried {
+		return fmt.Errorf("jobs: %q: %w", code, ErrProhibitedCategory)
+	}
+	return nil
+}
+
+// prohibitedCategory returns the refused category with the given code, if that is what it is.
+//
+// The handler needs the [Category] and not merely the fact of the refusal, because Docs/09's
+// "explains why" is answered with the platform's own label and description — "Dangerous goods:
+// explosives, flammable liquids or gases, corrosives, oxidisers" — rather than with a code the
+// customer has to go and look up. And because the wording comes from the catalogue, the
+// explanation moves when the policy does, with no release.
+//
+// Written as a second lookup rather than by carrying the category inside the error, because a
+// sentinel wrapped with %w is what every other refusal in this domain is, and one error type that
+// behaves differently is a shape every future caller has to learn. The lookup is over a few dozen
+// entries on a path that is already refusing a request.
+func (s *Service) prohibitedCategory(code string) (Category, bool) {
+	catalogue, err := s.Categories()
+	if err != nil {
+		return Category{}, false
+	}
+	category, known := catalogue.Lookup(code)
+	if !known || category.Carried {
+		return Category{}, false
+	}
+	return category, true
+}

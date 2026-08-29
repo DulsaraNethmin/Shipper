@@ -219,3 +219,90 @@ func TestNamingACategoryWithoutACatalogueIsAWiringErrorRatherThanARefusal(t *tes
 		t.Fatalf("CreateDraft naming no category: %v", err)
 	}
 }
+
+// SHIP-59: the prohibited-goods rule.
+//
+// The rule is here; the endpoint that applies it is SHIP-63, next on this branch, and the
+// end-to-end demonstration — a publication refused with the category named — is
+// TestPublishingProhibitedGoodsIsRefusedAndSaysWhy in publish_test.go. These hold the rule itself,
+// which is what the ordering in Docs/09 is for: the prohibition exists before anything can
+// publish, so there is no commit on this branch at which a job in a refused category could reach
+// Open.
+
+// TestARefusedCategoryCannotBePublishedAndAKnownOneCan is SHIP-59's rule, stated directly.
+func TestARefusedCategoryCannotBePublishedAndAKnownOneCan(t *testing.T) {
+	svc := NewService(&recordingSink{}, clock.NewFixed(testInstant), nil,
+		WithCatalogue(testCatalogue(t)))
+
+	if err := svc.checkCategory("widgets"); err != nil {
+		t.Errorf("checkCategory(widgets) = %v, want nil — the catalogue carries it", err)
+	}
+
+	err := svc.checkCategory("anvils")
+	if !errors.Is(err, ErrProhibitedCategory) {
+		t.Fatalf("checkCategory(anvils) = %v, want ErrProhibitedCategory", err)
+	}
+
+	// Distinct from a prohibited one, in Go and on the wire. A client working from a stale
+	// catalogue re-fetches; a customer whose goods are refused does not.
+	if err := svc.checkCategory("live_unicorns"); !errors.Is(err, ErrUnknownCategory) {
+		t.Fatalf("checkCategory(live_unicorns) = %v, want ErrUnknownCategory", err)
+	}
+	if errors.Is(err, ErrUnknownCategory) {
+		t.Error("a prohibited category also reports ErrUnknownCategory; the two must stay distinct")
+	}
+}
+
+// TestTheRefusalCanNameTheCategoryFromTheCatalogue is the "and explains why" half.
+//
+// The explanation is the platform's own wording for that category rather than a code the customer
+// has to look up — and because it comes from the catalogue, it moves when the policy does.
+func TestTheRefusalCanNameTheCategoryFromTheCatalogue(t *testing.T) {
+	svc := NewService(&recordingSink{}, clock.NewFixed(testInstant), nil,
+		WithCatalogue(testCatalogue(t)))
+
+	category, refused := svc.prohibitedCategory("anvils")
+	if !refused {
+		t.Fatal("prohibitedCategory(anvils) reported nothing to explain")
+	}
+	if category.Label != "Anvils" || category.Description != "Far too heavy." {
+		t.Errorf("explanation = %q / %q, want the catalogue's own wording",
+			category.Label, category.Description)
+	}
+
+	// A carried category and an unknown one are both "nothing to explain" — there is no
+	// refusal to describe, and answering with a Category would invite a caller to render one.
+	for _, code := range []string{"widgets", "live_unicorns"} {
+		if _, refused := svc.prohibitedCategory(code); refused {
+			t.Errorf("prohibitedCategory(%s) reported a refusal", code)
+		}
+	}
+}
+
+// TestTheProhibitionNamesNoCategoryOfItsOwn is what keeps the list in one place.
+//
+// Docs/01 §2's four and Docs/05 §4's fifth live in configuration. A copy of any of them in this
+// package would be a second list, and the one that never gets updated when X-4 answers.
+func TestTheProhibitionNamesNoCategoryOfItsOwn(t *testing.T) {
+	// A catalogue that carries everything Docs/01 §2 puts out of scope. If the rule held any
+	// opinion of its own about these names, this would fail.
+	permissive, err := NewCatalogue([]Category{
+		{Code: "dangerous_goods", Label: "Dangerous goods", Carried: true},
+		{Code: "live_animals", Label: "Live animals", Carried: true},
+		{Code: "people", Label: "Passengers", Carried: true},
+		{Code: "illegal_goods", Label: "Unlawful goods", Carried: true},
+	})
+	if err != nil {
+		t.Fatalf("building the permissive catalogue: %v", err)
+	}
+
+	svc := NewService(&recordingSink{}, clock.NewFixed(testInstant), nil,
+		WithCatalogue(permissive))
+
+	for _, code := range []string{"dangerous_goods", "live_animals", "people", "illegal_goods"} {
+		if err := svc.checkCategory(code); err != nil {
+			t.Errorf("checkCategory(%s) = %v against a catalogue that carries it; the rule "+
+				"holds a compiled-in copy of the policy", code, err)
+		}
+	}
+}
