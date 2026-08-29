@@ -27,6 +27,7 @@ import 'package:shipper/features/identity/sign_in_screen.dart';
 import 'package:shipper/features/jobs/job_detail_screen.dart';
 import 'package:shipper/features/jobs/job_goods_screen.dart';
 import 'package:shipper/features/jobs/job_locations_screen.dart';
+import 'package:shipper/features/jobs/job_schedule_screen.dart';
 import 'package:shipper/features/jobs/open_job_screen.dart';
 import 'package:shipper/features/profile/capture_document_screen.dart';
 import 'package:shipper/features/profile/verification_document.dart';
@@ -105,6 +106,12 @@ abstract final class Routes {
 
   /// [jobGoods] for one draft.
   static String jobGoodsFor(String jobId) => '/jobs/$jobId/goods';
+
+  /// The schedule and vehicle step (SHIP-73).
+  static const jobSchedule = '/jobs/:id/schedule';
+
+  /// [jobSchedule] for one draft.
+  static String jobScheduleFor(String jobId) => '/jobs/$jobId/schedule';
 
 
   /// One delivery in full, to the customer who owns it (SHIP-77).
@@ -434,6 +441,9 @@ final _signedInPatterns = <RegExp>[
   // than failing.
   RegExp(r'^/jobs/[^/]+/goods$'),
 
+  // The schedule step (SHIP-73). Its own line, for the reason the goods step above has one.
+  RegExp(r'^/jobs/[^/]+/schedule$'),
+
   // `/fleet/vehicles/new` likewise (SHIP-98). Forgetting this line is the failure run 1 named: a
   // route reachable only through an identifier looks, from the outside, like a card that does
   // nothing when it is tapped.
@@ -608,6 +618,10 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.jobGoods,
         builder: (context, state) => JobGoodsScreen(jobId: state.pathParameters['id'] ?? ''),
+      ),
+      GoRoute(
+        path: Routes.jobSchedule,
+        builder: (context, state) => JobScheduleScreen(jobId: state.pathParameters['id'] ?? ''),
       ),
       // Before `jobDetail`, in the same spirit as `newJob`. It does not actually collide —
       // `/jobs/:id` matches one segment and this has two — and it is declared first anyway, so that

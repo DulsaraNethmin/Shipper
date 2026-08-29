@@ -168,6 +168,72 @@ void main() {
     });
   });
 
+  group('the schedule body', () {
+    test('is the four keys the step owns, with both windows always present', () {
+      final body = scheduleBody(
+        pickupFrom: DateTime(2026, 9, 3),
+        pickupTo: DateTime(2026, 9, 5),
+        dropoffBy: DateTime(2026, 9, 8),
+        vehicleRequirement: 'Ute with a tailgate lifter',
+        handlingNotes: 'Ring ahead.',
+      );
+
+      expect(body.keys, <String>{
+        'pickup_window',
+        'dropoff_window',
+        'vehicle_requirement',
+        'handling_notes',
+      });
+      expect(body['vehicle_requirement'], 'Ute with a tailgate lifter');
+      expect(body['handling_notes'], 'Ring ahead.');
+    });
+
+    test('opens a window at the start of its day and closes it at the end of one', () {
+      final body = scheduleBody(
+        pickupFrom: DateTime(2026, 9, 3),
+        pickupTo: DateTime(2026, 9, 5),
+      );
+      final pickup = body['pickup_window']! as Map<String, Object?>;
+
+      // The edge worth a test of its own: a window closing at midnight *on* its day ends before
+      // that day has happened, so "collect by the 5th" would mean "collect by the 4th at
+      // midnight". Off by a day, in the direction that refuses a delivery.
+      expect(pickup['start'], startsWith('2026-09-03T00:00:00'));
+      expect(pickup['end'], startsWith('2026-09-05T23:59:59'));
+    });
+
+    test('sends RFC 3339 with an offset, which is what the platform parses', () {
+      final pickup =
+          scheduleBody(pickupFrom: DateTime(2026, 9, 3))['pickup_window']! as Map<String, Object?>;
+
+      // `DateTime.toIso8601String()` on a local value produces no offset at all, which is not RFC
+      // 3339 and which `time.Parse(time.RFC3339, …)` refuses.
+      expect(pickup['start'], matches(RegExp(r'^2026-09-03T00:00:00[+-]\d{2}:\d{2}$')));
+    });
+
+    test('a date that was never given is the empty string, never an omitted key', () {
+      final body = scheduleBody();
+      final pickup = body['pickup_window']! as Map<String, Object?>;
+      final dropoff = body['dropoff_window']! as Map<String, Object?>;
+
+      // A `PATCH` leaves out what it is not given, so an omitted end would mean "keep whatever is
+      // there" rather than "the customer cleared it". The contract names the empty string.
+      expect(pickup['start'], '');
+      expect(pickup['end'], '');
+      expect(dropoff['start'], '');
+      expect(dropoff['end'], '');
+      expect(body['vehicle_requirement'], '');
+      expect(body['handling_notes'], '');
+    });
+
+    test('carries no status, and there is no field for one', () {
+      final body = scheduleBody(pickupFrom: DateTime(2026, 9, 3));
+
+      expect(body.containsKey('status'), isFalse);
+      expect(jsonEncode(body), isNot(contains('status')));
+    });
+  });
+
   group('the goods catalogue', () {
     test('GETs /v1/goods-categories with no idempotency key', () async {
       final adapter = _StubAdapter(

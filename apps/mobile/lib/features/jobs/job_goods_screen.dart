@@ -144,10 +144,10 @@ class _GoodsFormState extends ConsumerState<_GoodsForm> {
     if (!mounted) return;
 
     if (saved) {
-      // The schedule step is SHIP-73 and does not exist yet, so this returns to the customer's
-      // own jobs rather than to a route that is not registered. The draft is waiting there: every
-      // step saves to the platform before it moves on.
-      context.go(Routes.home);
+      // Pushed rather than gone to, which keeps this step listening to the draft — so the next
+      // step finds it already loaded and issues no second read, and Back returns here with what
+      // was typed still in the fields.
+      unawaited(context.push(Routes.jobScheduleFor(widget.jobId)));
       return;
     }
 

@@ -2,6 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:shipper/core/api/api_client.dart';
 import 'package:shipper/core/api/page.dart';
+import 'package:shipper/features/jobs/date_field.dart';
 import 'package:shipper/features/jobs/job.dart';
 
 /// The job endpoints a customer screen calls (SHIP-71, SHIP-76, SHIP-77).
@@ -221,6 +222,52 @@ Map<String, Object?> goodsBody({
     'width_cm': widthCm ?? 0,
     'height_cm': heightCm ?? 0,
     'weight_kg': weightKg ?? 0,
+  };
+}
+
+/// The body of the schedule and vehicle step (SHIP-73).
+///
+/// ## Both windows are always sent, and either end may be empty
+///
+/// The step owns `pickup_window`, `dropoff_window`, `vehicle_requirement` and `handling_notes`, so
+/// all four keys go on every save for the reason [locationsBody] sends both addresses: a `PATCH`
+/// leaves out what it is not given, and a customer who cleared the latest collection date meant to
+/// clear it. The contract names the empty string as the clearing value for each end of a window,
+/// so a cleared date is sent as `''` rather than dropped.
+///
+/// ## The day is turned into an instant here, and which instant depends on the edge
+///
+/// The form collects days, because a job's window is a constraint rather than a commitment. The
+/// contract takes RFC 3339 instants. `dayStart` opens a window at the first moment of the chosen
+/// day and `dayEnd` closes it at the last — a window closed at midnight *on* its day would end
+/// before that day had happened, which is a delivery refused for a reason nobody typed.
+///
+/// **Only the start of the pickup window is required to publish**, which is
+/// `internal/jobs/publish.go`'s decision and not this function's: a customer who knows the
+/// earliest date they can release the goods has said something a provider can plan around, and
+/// being unable to name the latest is not a reason to refuse the job.
+Map<String, Object?> scheduleBody({
+  DateTime? pickupFrom,
+  DateTime? pickupTo,
+  DateTime? dropoffBy,
+  String vehicleRequirement = '',
+  String handlingNotes = '',
+}) {
+  return <String, Object?>{
+    'pickup_window': <String, Object?>{
+      'start': pickupFrom == null ? '' : dayStart(pickupFrom),
+      'end': pickupTo == null ? '' : dayEnd(pickupTo),
+    },
+    'dropoff_window': <String, Object?>{
+      // No `start`: for most road transport the drop-off is a consequence of the pickup rather
+      // than an independent constraint, so the form asks "by when" and nothing else. The key is
+      // still sent as an empty string, because omitting it would leave a value a customer had
+      // once set and then cleared.
+      'start': '',
+      'end': dropoffBy == null ? '' : dayEnd(dropoffBy),
+    },
+    'vehicle_requirement': vehicleRequirement,
+    'handling_notes': handlingNotes,
   };
 }
 

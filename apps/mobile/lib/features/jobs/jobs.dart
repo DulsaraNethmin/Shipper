@@ -15,6 +15,9 @@
 ///   repository rather than a method on `jobs_repository.dart`, because it is public,
 ///   unauthenticated, and describes no job.
 /// - `job_goods_screen.dart` — the second step: what is being moved (SHIP-72).
+/// - `job_schedule_screen.dart` — the third step: when it moves and what it needs (SHIP-73).
+/// - `date_field.dart` — a date-only picker. `features/bidding`'s `InstantField` is the same shape
+///   and the wrong control: a bid promises a time, and a job's window only constrains a day.
 /// - `customer_job_list.dart` and its controller — the customer's own jobs (SHIP-76).
 /// - `job_detail_screen.dart` and its controller — one delivery in full (SHIP-77).
 /// - `job_timeline.dart` — where a job has reached, derived from its status because the
