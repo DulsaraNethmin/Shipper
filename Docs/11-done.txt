@@ -59,6 +59,7 @@
 # Track X sorts before M0, as it does in Docs/09.
 
 # Track X — External dependencies
+X-5
 X-6
 X-9
 

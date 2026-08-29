@@ -1108,6 +1108,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-192** | M9 | The geocoding transport is named in `deploy/.env` rather than inferred from `SHIPPER_ENV`, and `geocoding.UseStub` is **deleted** rather than deprecated. **The default and the refusal are one decision read from both ends.** Unset is the stub in *every* environment including production, so nothing reaches a metered vendor by inheriting a string it did not recognise — and staging and production then **refuse to boot** until `GEOCODING_TRANSPORT` is named outright, because a deployment that forgot it would answer every address with a stable, plausible, entirely fictional coordinate and look exactly like one that works. **`Docs/09`'s row asked only for the first half**, and the first half alone reverses a position `routes_jobs.go` and the `Geocoding` doc comment both existed to hold — *see below* |
 | **SHIP-200** | M9 | A mail catcher in the development stack. `make up` starts Mailpit, `deploy/.env.example` points the stack's SMTP at it, and a verification code is read in a browser at `localhost:8025` rather than out of the API log. **The code default is untouched** — `internal/config` still resolves an unset `EMAIL_TRANSPORT` to the console, so a machine with no `deploy/.env` behaves exactly as it did; what changed is the example file, and the two are not in conflict. **The ports are fixed rather than per-worktree on purpose**, unlike `STORAGE_BUCKET`: a mailbox a person reads is not something two trees collide over the way a listing or a count is. Storage is in-memory, so there is no volume and a restart empties it. **The finding is that pointing the example file anywhere breaks two things that read the console, and neither would have failed at review** — `make verify` greps the server log for `email (console, not sent)`, and `config_test.go`'s `clearEnv` did not carry a single `EMAIL_*` or `SMS_*` key while `make` exports `deploy/.env` wholesale. The harness now pins both transports for its own run, and `clearEnv` carries all twenty-three keys — *see below* |
 | **SHIP-201** | M9 | The mail and SMS adapters' documentation says what the packages do. Three files still described the world before SHIP-187a and SHIP-187b, each carrying the same three false statements: that two implementations exist (email has three), that the choice is made in `cmd/api` from `SHIPPER_ENV` (it is `EMAIL_TRANSPORT` and `SMS_TRANSPORT`, in `internal/config`), and that a vendor would be named at SHIP-33 or SHIP-36 — both of which closed without naming one, after which SHIP-187a made naming unnecessary. Each package comment now carries a short note saying the environment **used to** decide, because a deleted function is the first thing a reader who knows the package looks for. **`sms/doc.go` still says two, and that is not the stale claim** — SMS genuinely has two and no third transport a gateway could want, and the file now states it as a complete set rather than a snapshot — *see below* |
+| **X-5** | X | **The pilot metropolitan area is Sydney, New South Wales.** Track X's third closed ticket, and the second that is a decision rather than code. `Docs/01` §8 named the radius and left the city open; it now names both. **The radius chose the city rather than the other way round** — a 150 km ring from the Sydney CBD reaches the Central Coast, the Blue Mountains, Wollongong and the Southern Highlands, which is the regional half §8 says the radius exists to capture, and every one of them is in New South Wales, so the single-state constraint costs nothing. **The 50 km first proposed for it was refused because §8 had already closed the radius at 150 km with an argument** — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -16910,6 +16911,45 @@ it.
 says so as a complete set rather than as a snapshot, so it cannot be read as the formula the other
 two were corrected for. Checked by grep across all three trees: no `SHIPPER_ENV`, no "two
 implementations exist today", no vendor deferred to SHIP-33 or SHIP-36.
+
+### X-5 — the radius chose the city, and a closed decision was nearly reopened by accident
+
+**The pilot metropolitan area is Sydney, New South Wales.** `Docs/01` §8's *Decision required*
+becomes *Decided*; Track X goes to three closed rows of twelve. It releases **SHIP-186**, the
+demonstration seed dataset — 5 points, and the only open M8 row no external party gates.
+
+**The city was chosen by the radius rather than by its own size, and that is the reasoning worth
+keeping.** §8 decided long ago that the pilot is one metropolitan area *plus approximately 150 km*,
+and argued for the radius specifically: intra-city work alone puts Shipper against established
+couriers in a crowded segment, while the regional runs are where independent operators make margin
+and where the customer's problem is genuinely unsolved. That turns the choice of city into a question
+about what its 150 km ring contains. Sydney's reaches the Central Coast, the Blue Mountains,
+Wollongong and the Southern Highlands, with Newcastle at its edge, and **every one of them is in New
+South Wales** — so §8's single-state constraint costs nothing rather than trimming the ring. A city
+whose ring is mostly farmland would have satisfied §8's letter and none of its argument.
+
+**Sydney is also the most crowded intra-city courier market in the country, and that is accepted
+rather than overlooked.** §8's own argument is that intra-city work is not where this product claims
+an advantage, so the cost falls on the half of the market the pilot was never trying to win.
+
+**The finding is procedural, and it nearly cost a closed decision.** This ticket was taken by asking
+the owner for a city *and a radius* — 25, 50 or 100 km — and 50 km was chosen. §8 had already closed
+the radius at 150 km with the paragraph of argument above. **X-5's *Done when* says "metro area
+named", not "metro area and radius named"**, and `Docs/09`'s row has read that way since it was
+written: the second half of the question was invented at the point of asking. Recording the answer
+would have left `Docs/01` §8 carrying a radius the paragraph directly above it argues against, in the
+same section, with nothing marking the reversal — the silent contradiction `CLAUDE.md` forbids, and
+the reason it says the document wins or the document is changed first. The owner was shown the
+conflict and kept 150 km.
+
+**What caught it was reading the destination before writing to it**, which is the cheap half of that
+rule and the half easiest to skip on a two-point documentation ticket. Nothing else would have:
+`make status` counts rows, `lint-spelling` reads words, and **no gate in this repository compares a
+decision against the decision beside it.** The three earlier instances this file records — X-10,
+X-11 and X-12 — are all prerequisites that were *never written down*. This is the first of the
+opposite shape: a decision that **was** written down, in the very section the answer was going to be
+recorded in, and was nearly overwritten by a question that did not know it existed.
+
 
 ## 4. Partly done — do not treat these as finished
 
