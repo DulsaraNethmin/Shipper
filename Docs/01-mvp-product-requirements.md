@@ -220,7 +220,15 @@ The radius matters more than it looks. Intra-city work alone would put Shipper a
 
 Staying inside one state avoids cross-border variation in transport rules during a pilot that has no capacity to absorb it.
 
-**Decision required:** which metropolitan area. Owner: business. Needed before provider recruitment begins, not before build starts — at pilot scale supply is recruited by hand, and the practical constraint is where the team can meet operators in person.
+**Decided 29 August 2026:** the pilot metropolitan area is **Sydney, New South Wales**. Owner: business.
+
+**The radius decides this, rather than the population.** A 150 km ring drawn from the Sydney CBD covers the Central Coast, the Blue Mountains, Wollongong and the Southern Highlands, and reaches Newcastle at its edge — regional destinations with genuine freight demand, which is the half of the pilot the radius exists to capture. A metropolitan area whose 150 km ring is mostly farmland would satisfy this section's letter and none of its argument.
+
+New South Wales then satisfies the single-state constraint on its own: every one of those destinations is in the same state, so a pilot run to its full radius never crosses a border.
+
+**The cost is the one the radius paragraph already accepts.** Sydney is the most crowded metropolitan courier market in the country, so intra-city work is competitive from the first day. That matters less than it appears, because intra-city work is not where this product claims an advantage — the regional runs are, and there the competition is a telephone.
+
+The timing constraint recorded here before the decision was taken is unchanged and still governs: at pilot scale supply is recruited by hand, the practical limit is where the team can meet operators in person, and this was needed before provider recruitment begins rather than before the build starts.
 
 ### There are two gates, and the near-term one is not the pilot
 

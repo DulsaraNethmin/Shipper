@@ -88,11 +88,42 @@ question.
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 208 | 648 |
-| Remaining | 57 | 183 |
+| **Done** | 224 | 697 |
+| Remaining | 41 | 134 |
 | **Total** | 265 | 831 |
 
-**Measured on `ship-15at-m8-m9-backlog-rows`, whose base is `develop` at `806b933`.** `make status`
+**Measured on `ship-15au-status-gate-and-reconciliation`, whose base is `develop` at `8f553cd`.**
+`make status` on this branch prints **224 / 265 and 697 / 831** with both guards green, and the
+figures above were read off that run rather than added up beside it. A parser over `Docs/09`'s
+dependency column and `Docs/11-done.txt`, written for this pass, reproduced those counts and all
+eleven milestone denominators cell for cell before a figure below was written.
+
+**`make status` was exiting 1 on pushed `develop`, and the wave-21 handoff quoted its totals as a
+clean measurement.** Two blank lines sat inside §3's summary table, between the SHIP-192, SHIP-200
+and SHIP-201 rows that wave appended, so every row beneath them was outside a header. This is the
+blindness the wave-12 reconciliation closed by mutation, caught by the check that pass added — and
+**the totals it printed were correct throughout**, which is why four sessions read them and none read
+the exit code. The fix is two deleted lines. The second guard, *every done ticket has a §3
+summary-table row*, passes, which answers its own warning: the merge that split the table did not
+also drop a row.
+
+**A gate whose failure prints the right answer is the failure mode to carry forward.** `make status`
+exits 1 and says why, in colour, four lines above a green tick; that was not enough, because the
+number a reader came for was already on the screen and correct. Every other instrument here fails by
+withholding its answer.
+
+**The movement is X-5, and it changes what §6 says rather than what any code does.** Track X goes to
+**3 of 12**; the totals move 223 → **224** and 695 → **697**. `Docs/01` §8's pilot geography has
+named a radius and left the city open since it was written, and it now names **Sydney, New South
+Wales**. §3 carries the reasoning and the procedural finding beneath it.
+
+**It ends the run of passes in which no code row was startable.** SHIP-186 — the demonstration seed
+dataset, 5 points — has been waiting on X-5 alone, through an edge §6 recorded and no parser can
+see, because `Docs/09` gives its dependency column SHIP-63 and nothing else. **It is startable now,
+and it is the only code row in the backlog that is**: every other row with its dependencies met
+carries a strike, and every remaining Track X row needs a registrar, a card, an adviser or a store.
+
+**The pass beneath it:** measured on `ship-15at-m8-m9-backlog-rows`, whose base is `develop` at `806b933`. `make status`
 on this branch prints **208 / 265 and 648 / 831** with both guards green, and the figures above were
 read off that run rather than added up beside it. **It closes no ticket**: the done column is
 unchanged and the whole of the movement is fourteen new rows and fifty-five points in `Docs/09` —
@@ -400,9 +431,40 @@ That distinction is worth keeping in mind rather than rounding away: six domains
 | Branch | At | Holds |
 |---|---|---|
 | `main` | PR #19 | **Wave 1, released 11 August 2026.** Now well behind `develop` |
-| `develop` | wave 17 merged, at `abb3d04` | Everything below. **Cut new branches from here** |
+| `develop` | wave 21 merged, at `8f553cd` | Everything below. **Cut new branches from here** |
 
-**`develop` is 491 commits ahead of `main` at `abb3d04`, and holds seventeen waves.** The other two
+**`develop` is 568 commits ahead of `main` at `8f553cd`, and holds twenty-one waves.** The other two
+readings, re-measured on that ref rather than adjusted: `--first-parent` **129**, `--no-merges`
+**436**.
+
+**`origin/develop` points at `8f553cd`, so waves 18 to 21 are pushed and the owner's gate has been
+taken on all four.** `develop` is **0 commits ahead of its remote**. The wave-21 handoff recorded it
+as 8 ahead of `94ab0f2` and awaiting review; that was true when written and expired at the push,
+which is the failure this file keeps naming — **a figure copied rather than measured expires, and a
+handoff is exactly where one gets copied.**
+
+**Nineteen first-parent merges since `abb3d04`, from eighteen distinct branches, and no direct commit
+on `develop` at all.** `git rev-list --count --first-parent --no-merges abb3d04..develop` returns
+**0**. The first-parent delta is 129 − 110 = **19**, and the identity §2 tracks needs a third term to
+absorb it: **`ship-192-geocoding-transport` was merged twice**, once for SHIP-192 and once for the
+defect the ticket's own boot logging exposed. So the identity is *first-parent delta = distinct
+branches + count-line commits on `develop` + re-merges*, which is 18 + 0 + 1. **A later pass reading
+19 against 19 branches would balance the books on a miscount**; the distinct-branch figure is the one
+to take.
+
+**The per-wave deltas for waves 18 to 21 are not reconstructed here, and that is deliberate rather
+than an omission.** This pass was scoped to §1, §2, §5 and §6; §7 still reads *Wave 16* and owes four
+write-ups. **Do not read the absence as zero** — the four waves are in the 19 merges above.
+
+**The release check was re-run on `8f553cd` and passes**: `git merge-tree --write-tree main develop`
+and `git rev-parse develop^{tree}` are both `264583f3ce2439d2b7fff93ecfe693213b7e5749`, so a
+`develop` → `main` merge produces exactly `develop`'s tree. **Every commit on either branch changes
+this, so re-run the pair immediately before cutting the release** — including the commits on this
+branch, which are not in the figure above.
+
+**What this section said when wave 17 was the tip, kept for its figures.**
+
+**`develop` was 491 commits ahead of `main` at `abb3d04`, and held seventeen waves.** The other two
 readings, re-measured on that ref rather than adjusted: `--first-parent` **110**, `--no-merges`
 **379**. **Wave 17's delta is 15 / 6 / 9 and the three tie out exactly** — 9 commits across six
 branches (`ship-15ak` 1, `ship-15al` 2, `ship-17b` 1, `ship-183` 1, `ship-183a` 2, `ship-183b` 2),
@@ -1106,10 +1168,9 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-188c** | M8 | A job opens with its bids, its status history and its audit trail, and `Docs/01` §8's "an administrator finds the job and reads its audit trail" runs through the product with no database access at any point. `GET /v1/admin/jobs/{id}` answers all three in one snapshot, so the screen cannot show an `Awarded` job beside a bid list with nothing accepted. **The trail is a component rather than a section, because the row asks two things of it and the second cannot be job-scoped**: `verifications.go` records `verification.decided` against `AuditTargetUser`, so a decision is done to a *provider* and no job's trail could ever contain one — confirmed on the running platform, where every existing `verification.decided` entry carries target type `user`. So it is embedded in the job screen filtered to that job, and again at `/audit` unfiltered, which is SHIP-165's viewer and the `audit.read` section the navigation has listed since SHIP-22. One file names `/v1/admin/audit` and two screens read it. **The `/audit` action filter is a text box on purpose**: the eleven action names live in `internal/admin/audit.go` and in no shared contract — `contracts/statuses.yaml` is scoped to *status* enumerations and says so — and a `<select>` would be a hand-written second copy that falls behind the day somebody adds a twelfth. A mistake costs one refusal, which lists every valid action. **This is the only screen where anything but `platform()` reaches a `/v1/` template**, so the segment is checked before it is interpolated and `surface.test.ts` spells the hole in its allow-list — `/v1/admin/jobs/${id}` — so a path that started being built from something shows as a changed expectation rather than passing. Demonstrated on a job unpublished through the real endpoint so the audit entry is genuine rather than an `INSERT`; a segment that is not an identifier is a 404 with no upstream request at all, and an identifier naming no job renders the platform's `not_found` |
 | **SHIP-188d** | M8 | The verification queue, its evidence and its decision — and `Docs/01` §8's "a provider registers, is verified" driven end to end through **two products' own interfaces**: the provider signs in to the mobile API, mints a pre-signed PUT, uploads a JPEG straight to MinIO with the API in neither direction, submits it as a licence; the reviewer opens it in the panel through a URL carrying `X-Amz-Signature`, records Verified with a reason; and `GET /v1/provider/verification` then reports Verified with that reason and a `decided_at`. **`state` is never defaulted here** — `/verifications` with none redirects to `?state=Pending`, so the reviewer's starting point is chosen and visible rather than assumed. **The idempotency key is *held* for a decision rather than minted per click, which is the opposite of `lib/keys.ts`'s rule for sign-in and is what the clause actually requires.** Two clicks with two keys are two actions: one decision plus a refusal. Measured both ways — the same key twice returns the identical body and writes one decision row and one audit entry, while a fresh key for the same decision is refused `409 admin_verification_unchanged`. The key is dropped whenever the outcome or the reason changes, because the middleware fingerprints the body. **Two findings from measurement.** Next serves a dynamic route `Cache-Control: no-cache, must-revalidate`, which permits *storing* and forbids only reuse without revalidation, and carries no `private` — so a screen showing a provider's licence photograph could sit in a shared support machine's disk cache after they signed out. `next.config.ts` now sets `private, no-store` and `Referrer-Policy: same-origin` on every path but the content-hashed build output; it is overridden by the dev server, so it was measured against `next build && next start`. And adding the decision route to *both* credential allow-lists failed the guard: it spends the credential and never names the cookie, because it reads the token through `sessionTokenFrom` — the two lists are not the same list, which is what an allow-list asserted by name is for. **The object key does appear in the HTML** and the honest statement is narrower than the row's wording: it is the path of the pre-signed URL and inseparable from showing the image. What the panel does not do is *keep* either — no browser storage anywhere, `no-store` on the response, and the platform sends no key as a field. The decision form is replaced by the reason it cannot be used for a role without `verifications.decide` (`Docs/07` §3's hide-or-disable), at the cost of a second `GET /v1/admin/me` on that screen alone |
 | **SHIP-192** | M9 | The geocoding transport is named in `deploy/.env` rather than inferred from `SHIPPER_ENV`, and `geocoding.UseStub` is **deleted** rather than deprecated. **The default and the refusal are one decision read from both ends.** Unset is the stub in *every* environment including production, so nothing reaches a metered vendor by inheriting a string it did not recognise — and staging and production then **refuse to boot** until `GEOCODING_TRANSPORT` is named outright, because a deployment that forgot it would answer every address with a stable, plausible, entirely fictional coordinate and look exactly like one that works. **`Docs/09`'s row asked only for the first half**, and the first half alone reverses a position `routes_jobs.go` and the `Geocoding` doc comment both existed to hold — *see below* |
-
 | **SHIP-200** | M9 | A mail catcher in the development stack. `make up` starts Mailpit, `deploy/.env.example` points the stack's SMTP at it, and a verification code is read in a browser at `localhost:8025` rather than out of the API log. **The code default is untouched** — `internal/config` still resolves an unset `EMAIL_TRANSPORT` to the console, so a machine with no `deploy/.env` behaves exactly as it did; what changed is the example file, and the two are not in conflict. **The ports are fixed rather than per-worktree on purpose**, unlike `STORAGE_BUCKET`: a mailbox a person reads is not something two trees collide over the way a listing or a count is. Storage is in-memory, so there is no volume and a restart empties it. **The finding is that pointing the example file anywhere breaks two things that read the console, and neither would have failed at review** — `make verify` greps the server log for `email (console, not sent)`, and `config_test.go`'s `clearEnv` did not carry a single `EMAIL_*` or `SMS_*` key while `make` exports `deploy/.env` wholesale. The harness now pins both transports for its own run, and `clearEnv` carries all twenty-three keys — *see below* |
-
 | **SHIP-201** | M9 | The mail and SMS adapters' documentation says what the packages do. Three files still described the world before SHIP-187a and SHIP-187b, each carrying the same three false statements: that two implementations exist (email has three), that the choice is made in `cmd/api` from `SHIPPER_ENV` (it is `EMAIL_TRANSPORT` and `SMS_TRANSPORT`, in `internal/config`), and that a vendor would be named at SHIP-33 or SHIP-36 — both of which closed without naming one, after which SHIP-187a made naming unnecessary. Each package comment now carries a short note saying the environment **used to** decide, because a deleted function is the first thing a reader who knows the package looks for. **`sms/doc.go` still says two, and that is not the stale claim** — SMS genuinely has two and no third transport a gateway could want, and the file now states it as a complete set rather than a snapshot — *see below* |
+| **X-5** | X | **The pilot metropolitan area is Sydney, New South Wales.** Track X's third closed ticket, and the second that is a decision rather than code. `Docs/01` §8 named the radius and left the city open; it now names both. **The radius chose the city rather than the other way round** — a 150 km ring from the Sydney CBD reaches the Central Coast, the Blue Mountains, Wollongong and the Southern Highlands, which is the regional half §8 says the radius exists to capture, and every one of them is in New South Wales, so the single-state constraint costs nothing. **The 50 km first proposed for it was refused because §8 had already closed the radius at 150 km with an argument** — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -16913,6 +16974,45 @@ says so as a complete set rather than as a snapshot, so it cannot be read as the
 two were corrected for. Checked by grep across all three trees: no `SHIPPER_ENV`, no "two
 implementations exist today", no vendor deferred to SHIP-33 or SHIP-36.
 
+### X-5 — the radius chose the city, and a closed decision was nearly reopened by accident
+
+**The pilot metropolitan area is Sydney, New South Wales.** `Docs/01` §8's *Decision required*
+becomes *Decided*; Track X goes to three closed rows of twelve. It releases **SHIP-186**, the
+demonstration seed dataset — 5 points, and the only open M8 row no external party gates.
+
+**The city was chosen by the radius rather than by its own size, and that is the reasoning worth
+keeping.** §8 decided long ago that the pilot is one metropolitan area *plus approximately 150 km*,
+and argued for the radius specifically: intra-city work alone puts Shipper against established
+couriers in a crowded segment, while the regional runs are where independent operators make margin
+and where the customer's problem is genuinely unsolved. That turns the choice of city into a question
+about what its 150 km ring contains. Sydney's reaches the Central Coast, the Blue Mountains,
+Wollongong and the Southern Highlands, with Newcastle at its edge, and **every one of them is in New
+South Wales** — so §8's single-state constraint costs nothing rather than trimming the ring. A city
+whose ring is mostly farmland would have satisfied §8's letter and none of its argument.
+
+**Sydney is also the most crowded intra-city courier market in the country, and that is accepted
+rather than overlooked.** §8's own argument is that intra-city work is not where this product claims
+an advantage, so the cost falls on the half of the market the pilot was never trying to win.
+
+**The finding is procedural, and it nearly cost a closed decision.** This ticket was taken by asking
+the owner for a city *and a radius* — 25, 50 or 100 km — and 50 km was chosen. §8 had already closed
+the radius at 150 km with the paragraph of argument above. **X-5's *Done when* says "metro area
+named", not "metro area and radius named"**, and `Docs/09`'s row has read that way since it was
+written: the second half of the question was invented at the point of asking. Recording the answer
+would have left `Docs/01` §8 carrying a radius the paragraph directly above it argues against, in the
+same section, with nothing marking the reversal — the silent contradiction `CLAUDE.md` forbids, and
+the reason it says the document wins or the document is changed first. The owner was shown the
+conflict and kept 150 km.
+
+**What caught it was reading the destination before writing to it**, which is the cheap half of that
+rule and the half easiest to skip on a two-point documentation ticket. Nothing else would have:
+`make status` counts rows, `lint-spelling` reads words, and **no gate in this repository compares a
+decision against the decision beside it.** The three earlier instances this file records — X-10,
+X-11 and X-12 — are all prerequisites that were *never written down*. This is the first of the
+opposite shape: a decision that **was** written down, in the very section the answer was going to be
+recorded in, and was nearly overwritten by a question that did not know it existed.
+
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -17130,8 +17230,10 @@ what changed is how much of it is in the way of anything anybody is building nex
 | **X-7** Privacy policy URL | SHIP-180, 181 | **Stops binding.** Both dependants are store declarations |
 | **X-8** Terms and provider agreement | Pilot users | **Stops binding.** There are no pilot users |
 | **X-4** Legal brief | X-7, X-8, X-9, SHIP-172 | **Still binds, and it is now the only external row that does.** See below — the binding half is X-9 |
-| **X-5** Pilot metro area | Provider recruitment | Still worth doing this week: SHIP-186 cannot generate believable addresses without a city and a radius |
+| ~~**X-5** Pilot metro area~~ | Provider recruitment, SHIP-186 | **Closed 29 August 2026 — Sydney, New South Wales.** It was the cheapest row on this table for three passes and it released SHIP-186. §3 has it |
 | **X-10** Firebase project | SHIP-144, 145, 146 | Still binds, needs no third party, and its Android half can be done today |
+| **X-11** Demonstration hostname | SHIP-188, 189, 190, 191, 202 | **Binds hardest of anything here.** 15 points and the whole demonstration chain, for a registrar and three DNS records |
+| **X-12** Maps project and keys | SHIP-193 to 199 | **Newly binding, and it changed reason rather than state.** SHIP-192 built the transport seam in wave 21, so 26 points of M9 now wait on a key rather than on unwritten code |
 
 **None of those five rows is cancelled and none should be closed.** They are deferred, they still
 gate the pilot exactly as written, and the day a buyer wants a store listing they bind again on the
@@ -17174,11 +17276,13 @@ indistinguishable from one that was finished**, and that is the whole reason §4
 | **X-2** Apple Developer Program | SHIP-24 (iOS signing), SHIP-25 (TestFlight) — and X-10's iOS leg, which needs an APNs key |
 | **X-3** Google Play Console | SHIP-26 (Android signing), SHIP-27 (Play internal) |
 | **X-4** Legal brief | X-7, X-8, X-9 — and **SHIP-172**. SHIP-171 and SHIP-159 both shipped without it and neither did so by oversight; see below |
-| **X-5** Pilot metro area | Provider recruitment. No code |
+| ~~**X-5**~~ Pilot metro area | **Closed** 29 August 2026 — Sydney, NSW, at `Docs/01` §8's existing 150 km radius. Released SHIP-186. §3 |
 | ~~**X-6**~~ Proof-exception auto-complete | **Closed** in wave 9 — the rule is in `Docs/02` §6.1. It gated SHIP-119, which shipped in the same wave |
 | **X-7** Privacy policy URL | SHIP-180, 181 |
 | **X-8** Terms and provider agreement | Pilot users |
-| **X-9** Prohibited-goods list | SHIP-58 |
+| ~~**X-9**~~ Prohibited-goods list | **Closed in reduced form** on `ship-58-63-goods-categories-and-publish`, merged at `c89fa0e` — thirteen categories approved by the owner, every entry `provisional: true` on the wire. **X-4 stays open and the `X-9 → X-4` edge is untouched**; §4 carries what is still owed. Released SHIP-58, and behind it SHIP-59 and SHIP-63 |
+| **X-11** Demonstration hostname | SHIP-188, SHIP-189, SHIP-202 directly; SHIP-190 and SHIP-191 behind them. **15 points, the largest set any open Track X row gates** |
+| **X-12** Maps project and two API keys | SHIP-193 and SHIP-197 directly; SHIP-194 to 199 behind them. **26 points, and binding only since wave 21** |
 | **X-10** Firebase project and push credentials | **SHIP-144, SHIP-145** — both declare the edge in `Docs/09` — and the unmet half of **SHIP-139** and **SHIP-143**, which are done in reduced form (§4) |
 
 **X-1 → X-2 is the longest pole in the entire plan.** Apple's organisational enrolment commonly takes one to two weeks *after* a D-U-N-S number issues, and obtaining one that does not exist adds more. Every other M0 ticket proceeds without it, so starting costs nothing and waiting costs weeks of finished code with nowhere to put it.
@@ -17190,6 +17294,29 @@ X-5 needs no third party at all — it is a decision somebody can make this week
 **The set behind X-10 is four rows and not five, and the correction matters because the wrong figure is written in §3.** A wave-10 lane's §3 paragraph says *"SHIP-139, SHIP-140, SHIP-143, SHIP-144 and SHIP-145 all sit behind a project no row anywhere asks anybody to create"*, and §4 — which is the section that decides this — lists **SHIP-139 and SHIP-143 only**. Re-read against the backlog on `4fd7fd5`: **SHIP-140 is not in the category.** Its *Done when* is *"tokens bind to a device session and clear on sign-out"*, which is a platform property the tables and the endpoints demonstrate whatever string a device registers; whoever supplies a real token is SHIP-143's business and it is already declared reduced. **A ticket named in a neighbouring sentence is not a ticket in the category**, and §3 is a lane's to correct rather than this pass's, so the correction is recorded here.
 
 **The test that would have caught it, stated so the next one is cheaper: for every external service in `Docs/06`'s stack table, name the Track-X row that procures it.** Datadog has none either — SHIP-174 is struck in §6 for exactly that, and the strike is doing the work an X row would do more honestly. AWS has none. The others are either local (PostgreSQL, Redis, Kafka, MinIO) or already covered.
+
+### X-12 became binding without moving, and no instrument here reports that event
+
+**Nothing about X-12 changed in wave 21. What changed is the reason its dependants are stopped**, and
+this section had no way to say so. Before SHIP-192, SHIP-193 was blocked twice over — no adapter and
+no key — and a reader could not tell which half was in front. SHIP-192 removed the code half: the
+transport is now `GEOCODING_TRANSPORT` in `deploy/.env`, `geocoding.UseStub` is deleted, and
+`provider.go`'s generic contract is unchanged. **So 26 points of M9 went from "unbuilt" to "waiting on
+a card", and the dependency column reads identically in both states.**
+
+**That is the shape worth carrying, because §5 is built to list rows and this was an event about an
+edge.** `make status` counts rows and cannot see it; the startable set in §6 is derived from the
+dependency column and cannot see it either, since `SHIP-193 → X-12` was there before and after. **The
+only reader who could tell is a person deciding which Track X row to take next**, and that reader is
+the one this section exists for.
+
+**It also inverts the usual priority argument.** X-12 costs a card and a budget alert and releases 26
+points — the largest set behind any Track X row, and more than X-10 and X-11 together. Its
+counter-argument is unchanged and is about sequencing rather than value: **the demonstration gate does
+not need a map.** `Docs/01` §8's demo runs on seeded jobs at addresses SHIP-186 generates, and the
+stub transport is now a supported choice rather than an accident, so a demonstration can be given with
+`GEOCODING_TRANSPORT=stub` and nothing about it is a fiction anybody is hiding. **X-11 is therefore
+still the row to take first at 15 points, and X-12 is the largest one to take next.**
 
 ### X-4 gates SHIP-159 and nothing in this file said so, which is the same failure in a second key
 
@@ -17253,33 +17380,51 @@ still governs the next proposal: §9 has the entry, the two measured blockers an
 
 ## 6. Ready to start now
 
-**Recomputed on `ship-15at-m8-m9-backlog-rows` over `develop` at `806b933`**, by the same discipline
-every pass here uses: a parser over `Docs/09`'s dependency column and `Docs/11-done.txt` that
-reproduced `make status` cell for cell — 265 rows, 831 points, 208 done, 648 points, and all eleven
-milestone denominators — before a figure below was written.
+**Recomputed on `ship-15au-status-gate-and-reconciliation` over `develop` at `8f553cd`**, by the
+same discipline every pass here uses: a parser over `Docs/09`'s dependency column and
+`Docs/11-done.txt` that reproduced `make status` cell for cell — 265 rows, 831 points, 224 done,
+697 points, and all eleven milestone denominators — before a figure below was written.
 
-**Sixteen rows have every dependency met: 47 points.** The same parser re-derived the forward-edge
-count from the dependency column and it is **unchanged at ten across nine tickets**, which is the
-claim `Docs/09` makes and the reason the four panel rows were lettered rather than numbered into the
-190s.
+**Twelve rows have every dependency met: 39 points. One of them is a code row, and it is startable
+for the first time.**
 
 | Ticket | Pts | Area | In scope for the demonstration? |
 |---|---|---|---|
-| **SHIP-188a** | 5 | **Admin panel sign-in and its session.** SHIP-22, SHIP-23a, SHIP-147 and SHIP-148 are all done, so this is startable today — and it is the row two of the demo gate's seven steps wait on. SHIP-188b, SHIP-188c and SHIP-188d unlock behind it, 11 more points | **Yes — start here** |
-| **X-11** | 2 | Demonstration hostname. No third party beyond a registrar; releases SHIP-188 and the whole M8 chain behind it | **Yes — it blocks SHIP-188** |
-| **SHIP-200** | 2 | **Mail catcher in the development stack.** Depends on SHIP-2 and SHIP-187b, both done. Pays for itself on the next ticket that needs a verification code | Not required, but cheap and immediate |
-| **SHIP-192** | 3 | **Geocoding transport as configuration.** Depends on SHIP-59a and SHIP-187a, both done. Removes `UseStub`, so a real coordinate stops requiring `SHIPPER_ENV=staging` | No — M9, and gated behind it by SHIP-193 |
-| **SHIP-201** | 1 | Email package documentation. Depends on SHIP-187a and SHIP-187b, both done | No — an hour, whenever |
-| **X-12** | 3 | Maps project and its two API keys. No third party approval; needs a card | No — releases SHIP-193 and SHIP-197 |
-| X-5 | 2 | Pilot metro area. No third party | Yes — SHIP-186 needs a city and a radius |
-| X-10 | 3 | Firebase project. No third party; Android half is an hour | Yes — releases 3 rows, 10 points |
-| X-4 | 3 | Legal brief | Only through X-9, and X-9 should be taken in reduced form instead. §5 |
-| X-1, X-3 | 4 | D-U-N-S, Play Console | **Deferred.** Nothing is being published |
-| ~~SHIP-156~~ | 3 | **Strike carried, tenth consecutive pass, re-measured again this time.** No `reports` table in any migration, no report route on `routes_golden.txt`, no `Docs/09` row that builds one. Blocked *internally* — this is a gap in the plan, not a dependency | Deferred |
-| ~~SHIP-172~~ | 5 | Struck by X-4, which no parser can see. §5 | Deferred |
-| ~~SHIP-174~~ | 3 | Struck — needs a Datadog account, and no Track-X row procures one | Deferred |
-| ~~SHIP-178~~ | 3 | Struck — needs store-console access, which is X-2 and X-3 | Deferred |
-| ~~SHIP-182~~ | 5 | **The strike lifts and the ticket stays deferred, which are different events.** It was struck for "needs a deployed environment"; SHIP-188 builds one. A demonstration still does not need a restore rehearsal | Deferred |
+| **SHIP-186** | 5 | **Demo seed dataset — start here.** One command populates verified providers, open jobs, bids in flight, a delivery in progress and one completed delivery with photograph proof; idempotent, and no real personal information. Its declared dependency is SHIP-63, merged at `c89fa0e`; the edge that actually held it was **X-5, which no parser could see**, and X-5 closed on this branch. **It is the only startable code row in the backlog** | **Yes — and it is the demonstration's content** |
+| **X-11** | 2 | Demonstration hostname. A registrar and three DNS records. **Releases the most: SHIP-188, 189, 190, 191 and 202, at 15 points** | **Yes — it blocks the entire M8 chain** |
+| **X-12** | 3 | Maps project and its two API keys. Needs a card and a billing account with a budget alert, no third-party approval. **Releases 26 points**, the largest set behind any Track X row | No — and §5 says why the demo does not need it |
+| **X-10** | 3 | Firebase project. No third party; the Android half is an hour. Releases SHIP-144, 145, 146 at 10 points | Yes — but nothing in the demo gate walks a push |
+| **X-4** | 3 | Legal brief | Only through SHIP-172 now. X-9 was taken in reduced form at `c89fa0e`, and X-7 and X-8 stopped binding at the re-scope. §5 |
+| **X-1, X-3** | 4 | D-U-N-S, Play Console | **Deferred.** Nothing is being published to a store |
+| ~~SHIP-156~~ | 3 | **Strike carried, eleventh consecutive pass, re-measured again this time.** No `reports` table in any migration, no report route on `routes_golden.txt`, no `Docs/09` row that builds one — the two migration files matching `reports` are both the verb in a comment. Blocked *internally* — a gap in the plan, not a dependency. **It is also the whole of M6's remainder**, which is worth saying because a milestone at 21 of 22 reads as nearly finished and this row has no owner | Deferred |
+| ~~SHIP-172~~ | 5 | Struck by X-4, which no parser can see. **The only code row X-4 still gates**; SHIP-159 and SHIP-171 both discharged theirs. §5 | Deferred |
+| ~~SHIP-174~~ | 3 | Struck — needs a Datadog account, and no Track-X row procures one. **Eleven passes and still no row**, which is the X-10 shape this file has now recorded four times | Deferred |
+| ~~SHIP-178~~ | 3 | Struck — needs store-console access, which is X-2 and X-3, both deferred | Deferred |
+| ~~SHIP-182~~ | 5 | The strike lifted when SHIP-188 was specified and the ticket stays deferred. A demonstration does not need a restore rehearsal | Deferred |
+
+**§6 reported an empty startable set for four passes and it was never empty — it was six code rows,
+five of them struck and one of them mis-recorded.** The wave-21 handoff put it plainly, that "every
+remaining code row waits on a Track-X decision", and the parser above disagrees on exactly one row:
+**SHIP-186 waited on X-5, and X-5 needed nobody outside this building.** The distinction the phrase
+lost is the one that matters to whoever picks the work up — *blocked on a third party* and *blocked on
+a decision the owner can take in a minute* are not the same state, and this table now separates them
+in its last column rather than in prose underneath.
+
+**Three of the five strikes are the same shape and it is worth naming once.** SHIP-156 needs a
+`reports` table nobody has specified, SHIP-174 needs a Datadog account no row procures, and SHIP-178
+needs a store console. **Only the third of those is blocked on a Track X row that exists.** The other
+two are struck against nothing at all — no ticket, no owner, no date — which means `make status`
+counts them among the 41 remaining and no instrument here will ever report them as stalled. This file
+has recorded that shape four times under other names (X-10, X-11, X-12, and `SHIP-159 → X-4`), and
+each time the answer was to write the row. **Two rows are still owed: the reports schema and the
+observability account.**
+
+**The handoff also carried `SHIP-159` as blocked on X-4, and SHIP-159 is done.** It is in
+`Docs/11-done.txt` and shipped in wave 15 with `admin.ExpiryQueue.LeadTimes` honouring the design
+rule §5 set for it. What that entry should have said is that **SHIP-156 is M6's remainder** — the
+strike above — and the two are not interchangeable: one is finished and one has no plan.
+
+**What this section said when `806b933` was the tip, kept for its reasoning.**
 
 **SHIP-187 headed this table one pass ago and has since landed with SHIP-187a and SHIP-187b behind
 it; SHIP-188a replaces it at the head for the same reason.** Both are rows whose dependencies were
