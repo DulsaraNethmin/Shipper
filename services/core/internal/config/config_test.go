@@ -24,7 +24,7 @@ var allKeys = []string{
 	"PASSWORDS_ARGON2_MEMORY_KIB", "PASSWORDS_ARGON2_ITERATIONS", "PASSWORDS_ARGON2_PARALLELISM",
 	"IDENTITY_ACCESS_TOKEN_TTL", "IDENTITY_ACCESS_TOKEN_KEYS", "IDENTITY_ACCESS_TOKEN_ACTIVE_KID",
 	"DELIVERY_DRIVER_TOKEN_TTL", "DELIVERY_DRIVER_TOKEN_KEYS", "DELIVERY_DRIVER_TOKEN_ACTIVE_KID",
-	"GEOCODING_BASE_URL", "GEOCODING_API_KEY",
+	"GEOCODING_TRANSPORT", "GEOCODING_BASE_URL", "GEOCODING_API_KEY",
 	"PAGINATION_DEFAULT_PAGE_SIZE", "PAGINATION_MAX_PAGE_SIZE",
 	"STORAGE_ENDPOINT", "STORAGE_BUCKET", "STORAGE_REGION",
 	"STORAGE_ACCESS_KEY_ID", "STORAGE_SECRET_ACCESS_KEY", "STORAGE_USE_PATH_STYLE",
@@ -128,12 +128,17 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	t.Setenv("STORAGE_ENDPOINT", "https://s3.ap-southeast-2.amazonaws.com")
 	t.Setenv("STORAGE_ACCESS_KEY_ID", deploymentStorageAccessKeyID)
 	t.Setenv("STORAGE_SECRET_ACCESS_KEY", deploymentStorageSecretAccessKey)
+	t.Setenv("GEOCODING_TRANSPORT", "http")
+	t.Setenv("GEOCODING_BASE_URL", "https://geo.internal/v1")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() returned %v, want nil", err)
 	}
 
+	if cfg.Geocoding.Transport != TransportHTTP {
+		t.Errorf("geocoding transport = %q, want http", cfg.Geocoding.Transport)
+	}
 	if cfg.Env != Staging {
 		t.Errorf("Env = %q, want staging", cfg.Env)
 	}
@@ -298,6 +303,7 @@ func TestDeploymentGuards(t *testing.T) {
 		"STORAGE_ENDPOINT":                 "https://s3.ap-southeast-2.amazonaws.com",
 		"STORAGE_ACCESS_KEY_ID":            deploymentStorageAccessKeyID,
 		"STORAGE_SECRET_ACCESS_KEY":        deploymentStorageSecretAccessKey,
+		"GEOCODING_TRANSPORT":              "stub",
 	}
 
 	t.Run("valid production configuration loads", func(t *testing.T) {
@@ -307,6 +313,37 @@ func TestDeploymentGuards(t *testing.T) {
 		}
 		if _, err := Load(); err != nil {
 			t.Fatalf("Load() returned %v, want nil", err)
+		}
+	})
+
+	// SHIP-192. Unset, the transport is the stub in every environment — which spends nothing
+	// and answers every address with a fictional coordinate. In development that is the right
+	// trade; in production it is a deployment that looks exactly like one that works, so the
+	// boot is the last moment anybody can be told.
+	t.Run("an unnamed geocoding transport is refused", func(t *testing.T) {
+		clearEnv(t)
+		for k, v := range base {
+			t.Setenv(k, v)
+		}
+		t.Setenv("GEOCODING_TRANSPORT", "")
+
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "GEOCODING_TRANSPORT: must be set explicitly") {
+			t.Fatalf("Load() returned %v, want a refusal naming GEOCODING_TRANSPORT", err)
+		}
+	})
+
+	// The refusal is of the *inheritance*, not of the stub. A demonstration instance runs
+	// hardened and resolves nothing, and saying so is a supported answer.
+	t.Run("a deliberate stub is accepted", func(t *testing.T) {
+		clearEnv(t)
+		for k, v := range base {
+			t.Setenv(k, v)
+		}
+		t.Setenv("GEOCODING_TRANSPORT", "stub")
+
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load() returned %v, want a deliberate stub to be accepted", err)
 		}
 	})
 
@@ -560,10 +597,13 @@ func TestGeocodingAndPaginationDefaults(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	// Empty is the supported "no provider" state, not a missing setting: cmd/api builds the
-	// stub in development and nothing outside it, and addresses are stored unresolved.
+	// Empty is the supported "nothing to fetch from" state, not a missing setting: the
+	// transport defaults to the stub, which presents neither of them (SHIP-192).
 	if cfg.Geocoding.ProviderBaseURL != "" || cfg.Geocoding.ProviderAPIKey != "" {
 		t.Errorf("geocoding defaults = %+v, want both empty", cfg.Geocoding)
+	}
+	if cfg.Geocoding.Transport != TransportStub {
+		t.Errorf("geocoding transport = %q, want %q", cfg.Geocoding.Transport, TransportStub)
 	}
 	if cfg.Pagination.DefaultPageSize != 20 || cfg.Pagination.MaxPageSize != 100 {
 		t.Errorf("pagination defaults = %+v, want 20 and 100 (Docs/10 §4.5)", cfg.Pagination)
@@ -620,11 +660,102 @@ func TestGeocodingRefusesAKeyWithoutABaseURL(t *testing.T) {
 // The reverse is legitimate: a local or self-hosted geocoder needs no credential.
 func TestGeocodingAcceptsABaseURLWithoutAKey(t *testing.T) {
 	clearEnv(t)
+	t.Setenv("GEOCODING_TRANSPORT", "http")
 	t.Setenv("GEOCODING_BASE_URL", "http://localhost:8088")
 	t.Setenv("GEOCODING_API_KEY", "")
 
 	if _, err := Load(); err != nil {
 		t.Fatalf("Load refused a base URL with no key: %v", err)
+	}
+}
+
+// --- SHIP-192: the geocoding transport ----------------------------------------------------
+
+// The messaging transports lean towards the console in development and the provider elsewhere.
+// This one leans towards the stub in *every* environment, and the asymmetry is the ticket: an
+// unsent email is reported by whoever was waiting for it, and an address resolved against a
+// vendor nobody chose is reported by an invoice, after the money is spent.
+//
+// resolveTransports directly rather than through Load, for the reason the SHIP-187a test above
+// gives: two of these environments are invalid, and Load returns no configuration at all for an
+// invalid one — so the rule under test would be unreachable through it for the cases that matter
+// most.
+func TestGeocodingDefaultsToTheStubInEveryEnvironment(t *testing.T) {
+	for _, env := range []Environment{Development, Staging, Production, Environment("prod"), Environment("")} {
+		t.Run(string(env), func(t *testing.T) {
+			cfg := &Config{Env: env}
+			resolveTransports(cfg)
+
+			if cfg.Geocoding.Transport != TransportStub {
+				t.Errorf("geocoding transport = %q, want %q — no environment may inherit a metered vendor",
+					cfg.Geocoding.Transport, TransportStub)
+			}
+		})
+	}
+}
+
+// Defaulting fills a gap and never overrides a choice, which is what makes the deployment rule
+// above expressible: staging and production may run the stub, but only by saying so.
+func TestGeocodingTransportKeepsAnExplicitChoice(t *testing.T) {
+	cfg := &Config{Env: Production, Geocoding: Geocoding{Transport: TransportHTTP}}
+	resolveTransports(cfg)
+
+	if cfg.Geocoding.Transport != TransportHTTP {
+		t.Errorf("geocoding transport = %q, want the explicit %q", cfg.Geocoding.Transport, TransportHTTP)
+	}
+}
+
+// Without the base URL the http transport has nowhere to send the request, and what used to
+// happen is the failure this refusal exists for: cmd/api built nil, logged one warning, and the
+// deployment stored every address unresolved until somebody noticed a month later.
+func TestGeocodingHTTPRefusesAMissingBaseURL(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("GEOCODING_TRANSPORT", "http")
+	t.Setenv("GEOCODING_BASE_URL", "")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted GEOCODING_TRANSPORT=http with no base URL")
+	} else if !strings.Contains(err.Error(), "GEOCODING_BASE_URL") {
+		t.Errorf("the error does not name the missing variable: %v", err)
+	}
+}
+
+// An unrecognised value is somebody's intention spelled incorrectly, and defaulting it would
+// resolve real addresses against a fiction or a vendor without being asked. Both are silent.
+func TestGeocodingRefusesAnUnrecognisedTransport(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("GEOCODING_TRANSPORT", "google")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load accepted an unrecognised geocoding transport")
+	} else if !strings.Contains(err.Error(), "GEOCODING_TRANSPORT") {
+		t.Errorf("the error does not name the variable: %v", err)
+	}
+}
+
+// The three adapters share one Transport type, so a value that is valid for one of them is
+// syntactically valid everywhere. Each is refused by the adapter it does not belong to, and told
+// which value it wanted instead — the same shape as SMS refusing smtp.
+func TestTransportsRefuseEachOthersValues(t *testing.T) {
+	cases := map[string]struct{ key, value, want string }{
+		"email cannot stub":        {"EMAIL_TRANSPORT", "stub", "stub is a geocoding transport"},
+		"sms cannot stub":          {"SMS_TRANSPORT", "stub", "stub is a geocoding transport"},
+		"geocoding cannot smtp":    {"GEOCODING_TRANSPORT", "smtp", "is a messaging transport"},
+		"geocoding has no console": {"GEOCODING_TRANSPORT", "console", "is a messaging transport"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(c.key, c.value)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load accepted %s=%s", c.key, c.value)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error %v does not say %q", err, c.want)
+			}
+		})
 	}
 }
 
@@ -1247,6 +1378,7 @@ func TestTransportCanBeChosenAgainstTheEnvironment(t *testing.T) {
 	t.Setenv("EMAIL_SMTP_PORT", "1025")
 	t.Setenv("EMAIL_SMTP_ENCRYPTION", "none")
 	t.Setenv("SMS_TRANSPORT", "console")
+	t.Setenv("GEOCODING_TRANSPORT", "stub")
 
 	cfg, err := Load()
 	if err != nil {

@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-
-	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 )
 
 const sydney = "1 Martin Place, Sydney NSW 2000"
@@ -121,20 +119,7 @@ func TestStubCanFailWithoutClaimingNotFound(t *testing.T) {
 	}
 }
 
-// SHIP-59a's acceptance criterion: provider-backed in staging, stub in tests.
-func TestUseStubSelectsByEnvironment(t *testing.T) {
-	cases := []struct {
-		env      config.Environment
-		wantStub bool
-	}{
-		{config.Development, true},
-		{config.Staging, false},
-		{config.Production, false},
-		{config.Environment(""), true},
-	}
-	for _, c := range cases {
-		if got := UseStub(c.env); got != c.wantStub {
-			t.Errorf("UseStub(%q) = %v, want %v", c.env, got, c.wantStub)
-		}
-	}
-}
+// SHIP-59a's "provider-backed in staging, stub in tests" was asserted here against UseStub until
+// SHIP-192 deleted that function. The rule is now GEOCODING_TRANSPORT and it is tested where it
+// lives, in internal/config — one place owning it is the whole point of the move, and a rule
+// tested where it no longer lives is how two places start to disagree.

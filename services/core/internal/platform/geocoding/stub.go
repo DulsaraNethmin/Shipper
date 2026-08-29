@@ -5,8 +5,6 @@ import (
 	"hash/fnv"
 	"math"
 	"strings"
-
-	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 )
 
 // Stub resolves an address without leaving the process.
@@ -77,24 +75,6 @@ func (s *Stub) Lookup(_ context.Context, address string) (lat, lng float64, form
 	lng = round6(lngWest + fraction(sum/1_000_000%1_000_000)*(lngEast-lngWest))
 
 	return lat, lng, tidy, true, nil
-}
-
-// UseStub reports whether env resolves addresses in-process rather than through the vendor.
-//
-// Only staging and production call a maps provider. Development does not, because there is
-// no vendor and no credential until SHIP-60 names one, and because a scaffold that reaches
-// the network on every locally created job is a slow and surprising way to work.
-//
-// The fallback leans towards the stub for the same reason the email and SMS adapters lean
-// towards the console: an environment string nobody recognises should not be the one that
-// spends money on a metered API.
-func UseStub(env config.Environment) bool {
-	switch env {
-	case config.Staging, config.Production:
-		return false
-	default:
-		return true
-	}
 }
 
 // tidyAddress collapses whitespace and trims, which is the whole of the stub's
