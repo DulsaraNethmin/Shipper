@@ -235,7 +235,7 @@ test("no client module names the cookie, reads one, or holds a credential", () =
   const code = sources();
   const offending = clientModules().filter((file) => {
     const source = code.get(file) ?? "";
-    return /SESSION_COOKIE|shipper_admin_session|next\/headers|\bcookies\s*\(|authorization|bearer/i
+    return /SESSION_COOKIE|shipper_admin_session|next\/headers|\bcookies\s*\(|authorization|bearer/i // spelling:ok — RFC 9110 spells the header; this matches it rather than writing it
       .test(source);
   });
 
@@ -245,7 +245,7 @@ test("no client module names the cookie, reads one, or holds a credential", () =
 /** A bearer credential is put on a request in two places, and both are server files. */
 test("only the server files spend the credential", () => {
   assert.deepEqual(
-    filesContaining(/authorization|bearer/i),
+    filesContaining(/authorization|bearer/i), // spelling:ok — RFC 9110 spells the header; this matches it rather than writing it
     [...MAY_SPEND_THE_CREDENTIAL].sort(),
   );
 });
