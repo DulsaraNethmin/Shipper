@@ -1,6 +1,4 @@
-import { cookies } from "next/headers";
-
-import { SESSION_COOKIE } from "@/lib/session";
+import { platformHeaders } from "@/lib/credential";
 import { isJSON, platform } from "@/lib/upstream";
 
 /**
@@ -8,11 +6,18 @@ import { isJSON, platform } from "@/lib/upstream";
  *
  * # It is a server module and cannot become anything else
  *
- * It imports `next/headers`, which Next refuses to bundle into a client component — importing this
- * file from a `"use client"` module is a build failure rather than a review comment. That is the
- * structural half of the guarantee `lib/session.ts` makes: the credential cannot reach the browser's
- * JavaScript because the only code that reads it cannot run there. `lib/surface.test.ts` holds the
- * other half, over the files a build would not notice.
+ * It imports `lib/credential.ts`, which imports `next/headers`, which Next refuses to bundle into a
+ * client component — importing this file from a `"use client"` module is a build failure rather than
+ * a review comment. That is the structural half of the guarantee `lib/session.ts` makes: the
+ * credential cannot reach the browser's JavaScript because the only code that reads it cannot run
+ * there. `lib/surface.test.ts` holds the other half, over the files a build would not notice.
+ *
+ * **The cookie is read by `lib/credential.ts` rather than here, since SHIP-188b.** This file was the
+ * only server module that needed it when SHIP-188a wrote it, and inlining three lines was right for
+ * one caller; five screens later the same three lines would be five files naming the cookie and five
+ * holding a credential, which is an allow-list that grows with the panel and has stopped guarding
+ * anything. What arrives here is a `Headers` — something to put on a request, and not a value this
+ * file can log or render.
  *
  * # There is no route handler for this, deliberately
  *
@@ -80,22 +85,18 @@ interface MeResponse {
 /**
  * Resolve the cookie this browser presented into an administrator, or say why not.
  *
- * The cookie is read here and the credential goes out in a header. A header reaches no access log;
- * a request line does, which is why nothing about the credential is ever in a path or a query
- * string on any hop.
+ * The credential goes out in a header. A header reaches no access log; a request line does, which is
+ * why nothing about the credential is ever in a path or a query string on any hop.
  */
 export async function viewer(): Promise<Viewer> {
-  const token = (await cookies()).get(SESSION_COOKIE)?.value;
-  if (token === undefined || token === "") return { state: "signed-out" };
+  const headers = await platformHeaders();
+  if (headers === null) return { state: "signed-out" };
 
   let upstream: Response;
   try {
     upstream = await fetch(`${platform()}/v1/admin/me`, {
       method: "GET",
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${token}`, // spelling:ok — RFC 9110 header name
-      },
+      headers,
       cache: "no-store",
     });
   } catch {

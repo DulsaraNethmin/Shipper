@@ -167,7 +167,7 @@ func TestEveryValueRoundTripsThroughItsWireForm(t *testing.T) {
 func TestValidationRefusesTheMistakesThatCompile(t *testing.T) {
 	base := func() *Spec {
 		s := &Spec{Version: 1}
-		s.TypeScript.File = "apps/x/status.gen.ts"
+		s.TypeScript.Files = []string{"apps/x/status.gen.ts"}
 		e := Enum{
 			Name:       "demo",
 			Authority:  "Docs/02 §1",
@@ -195,6 +195,29 @@ func TestValidationRefusesTheMistakesThatCompile(t *testing.T) {
 		mutate func(*Spec)
 		want   string
 	}{
+		{
+			// Two surfaces read the same vocabulary (SHIP-188b), so the output is a list —
+			// and a list is the first thing somebody pastes an entry into twice. The
+			// generator would write the file, report it written, and the second write would
+			// be indistinguishable from the first.
+			name:   "one TypeScript path listed twice",
+			mutate: func(s *Spec) { s.TypeScript.Files = append(s.TypeScript.Files, s.TypeScript.Files[0]) },
+			want:   "listed twice",
+		},
+		{
+			// A TypeScript path colliding with an enumeration's own output. Caught by the
+			// same map, which is why the two checks are one and not two.
+			name: "a TypeScript path an enumeration also writes",
+			mutate: func(s *Spec) {
+				s.TypeScript.Files = append(s.TypeScript.Files, s.Enums[0].Dart.File)
+			},
+			want: "both generate",
+		},
+		{
+			name:   "no TypeScript output at all",
+			mutate: func(s *Spec) { s.TypeScript.Files = nil },
+			want:   "typescript.files",
+		},
 		{
 			name:   "a wire form in the wrong case",
 			mutate: func(s *Spec) { s.Enums[0].Values[1].Wire = "PickedUp" },

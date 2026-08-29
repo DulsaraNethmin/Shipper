@@ -74,3 +74,160 @@ export async function forwardRefusal(upstream: Response): Promise<Response> {
     headers: { "content-type": "application/json", "cache-control": "no-store" },
   });
 }
+
+/**
+ * What a screen got back from the platform (SHIP-188b).
+ *
+ * Four answers, and every screen renders a different thing for each. **`refused` is separate from
+ * `unavailable` for the reason `lib/administrator.ts` separates `signed-out` from it**, and this is
+ * the case `Docs/09`'s SHIP-188b row names outright: "a search made by a session without the
+ * permission renders the platform's refusal rather than an empty table". A 403 collapsed into an
+ * empty result set tells a support engineer their search found nothing, when what happened is that
+ * their role does not hold `users.read` — so they search again, differently, for something that was
+ * never going to be shown to them.
+ *
+ * `signed-out` is the session dying between the layout's `GET /v1/admin/me` and the screen's own
+ * call. Rare, and it has a correct answer — the sign-in form — rather than an error card.
+ */
+export type Answer<T> =
+  | { state: "ok"; body: T }
+  | { state: "signed-out" }
+  | { state: "refused"; refusal: Refusal }
+  | { state: "unavailable" };
+
+/**
+ * One field the platform would not accept, from the error contract's `details` (SHIP-12).
+ *
+ * **Rendering these is the difference between a refusal a person can act on and one they cannot.**
+ * A `validation_failed` carries the top-level message "Some of the details you entered need
+ * attention" — true, and useless on its own — while the sentence that says *which* detail and what
+ * the accepted values are lives here. `Docs/10` §4.6 has the platform report every problem rather
+ * than the first for exactly this reason, and a panel that read only `message` would throw all of it
+ * away.
+ */
+export interface FieldProblem {
+  field: string;
+  code: string;
+  message: string;
+}
+
+/** A refusal, as much of the contract as a screen has any use for. */
+export interface Refusal {
+  code: string;
+  message: string;
+
+  /**
+   * The request identifier, which is in every error body (SHIP-12, SHIP-14).
+   *
+   * Shown to the reader rather than logged, because on a support surface the person looking at the
+   * screen is often not the person who can read the logs. An operator who can quote it has turned
+   * "the panel would not let me" into something somebody can look up.
+   */
+  requestId: string;
+
+  /** Empty unless the refusal was about the request's own fields. */
+  details: FieldProblem[];
+}
+
+/** The platform's error contract, as much of it as a screen renders. */
+interface ErrorBody {
+  error?: {
+    code?: unknown;
+    message?: unknown;
+    request_id?: unknown;
+    details?: unknown;
+  };
+}
+
+/**
+ * Classify one upstream answer.
+ *
+ * It takes a `Response` rather than making one, which is what keeps every endpoint named in the
+ * screen that reads it: a helper that fetched would need the path as an argument, and that is the
+ * shared forwarder this application refuses (see `lib/credential.ts`).
+ *
+ * **A refusal's `message` is the platform's own words, never a local copy.** The platform is the
+ * component that knows which no this is, and `Docs/10` §4.6 writes those messages for a person to
+ * read. A panel that substituted its own would drift from them silently, and would lose the field
+ * errors the validation contract puts in the message for a mistyped status or an expired cursor.
+ */
+export async function answered<T>(upstream: Response): Promise<Answer<T>> {
+  if (upstream.status === 401) return { state: "signed-out" };
+
+  // Not JSON means something between here and the platform answered — a load balancer's HTML error
+  // page is the usual one. Reading a result out of it would be reading something that is not the
+  // contract, so it is an outage rather than a refusal.
+  if (!isJSON(upstream)) return { state: "unavailable" };
+
+  if (!upstream.ok) {
+    let body: ErrorBody | null = null;
+    try {
+      body = (await upstream.json()) as ErrorBody;
+    } catch {
+      return { state: "unavailable" };
+    }
+
+    const code = typeof body?.error?.code === "string" ? body.error.code : "";
+    const message = typeof body?.error?.message === "string" ? body.error.message : "";
+
+    // A refusal outside the contract is not a refusal this panel can render. Saying "the platform
+    // said no" with nothing to show for it is worse than saying it is not answering, because the
+    // first invites somebody to fix their search and the second invites them to look at the
+    // platform — which is where the fault actually is.
+    if (code === "" || message === "") return { state: "unavailable" };
+
+    return {
+      state: "refused",
+      refusal: {
+        code,
+        message,
+        requestId: typeof body.error?.request_id === "string" ? body.error.request_id : "",
+        details: fieldProblems(body.error?.details),
+      },
+    };
+  }
+
+  try {
+    return { state: "ok", body: (await upstream.json()) as T };
+  } catch {
+    return { state: "unavailable" };
+  }
+}
+
+/**
+ * The `details` array, keeping only entries that are the shape the contract describes.
+ *
+ * Checked per entry rather than trusted, because this is rendered: a `details` that is not an array,
+ * or an entry missing its message, would throw during a server render and turn a refusal somebody
+ * could have acted on into an error page that says nothing at all. Dropping a malformed entry leaves
+ * the top-level message, which is still the platform's own words.
+ */
+function fieldProblems(raw: unknown): FieldProblem[] {
+  if (!Array.isArray(raw)) return [];
+
+  const out: FieldProblem[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const { field, code, message } = entry as Record<string, unknown>;
+    if (typeof message !== "string" || message === "") continue;
+
+    out.push({
+      field: typeof field === "string" ? field : "",
+      code: typeof code === "string" ? code : "",
+      message,
+    });
+  }
+  return out;
+}
+
+/**
+ * One page of a collection, in `internal/pagination`'s envelope (`Docs/10` §4.5).
+ *
+ * `next_cursor` is omitted rather than emptied when there is no further page — `omitempty` on the
+ * Go struct — so it is optional here for the same reason.
+ */
+export interface Page<T> {
+  data: T[];
+  next_cursor?: string;
+  has_more: boolean;
+}
