@@ -316,7 +316,7 @@ void main() {
       // The way on is present and enabled. A screen that made the customer resolve this before
       // continuing would be blocking on something they cannot change.
       expect(
-        tester.widget<FilledButton>(find.byKey(const Key('job-locations-done'))).onPressed,
+        tester.widget<FilledButton>(find.byKey(const Key('job-locations-continue'))).onPressed,
         isNotNull,
       );
     });

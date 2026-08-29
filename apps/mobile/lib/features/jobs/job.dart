@@ -47,6 +47,15 @@ abstract class Job with _$Job {
     JobLocation? dropoff,
 
     @JsonKey(name: 'goods_description') String? goodsDescription,
+
+    /// The catalogue **code** the customer chose — `general_freight`, never the label (SHIP-58).
+    ///
+    /// The code is the half that does not change when the wording does, so it is what the job
+    /// stores and what a client sends. Rendering it means looking the code up in the catalogue
+    /// from `GET /v1/goods-categories`; a job whose code is no longer served is shown as the raw
+    /// code rather than as nothing, because a category withdrawn this morning is still what this
+    /// job says it carries.
+    @JsonKey(name: 'goods_category') String? goodsCategory,
     @JsonKey(name: 'length_cm') int? lengthCm,
     @JsonKey(name: 'width_cm') int? widthCm,
     @JsonKey(name: 'height_cm') int? heightCm,
@@ -67,6 +76,14 @@ abstract class Job with _$Job {
     ///
     /// **Read it only on a customer surface.** See the note on this class.
     @JsonKey(name: 'budget_cents') int? budgetCents,
+
+    /// When the customer accepted the terms and the goods declaration **for this job** (SHIP-63).
+    ///
+    /// `Docs/04` §2 requires the declaration for every job rather than once per account, so this
+    /// is a fact about the job and not about the customer. Absent until the job is first
+    /// published, and unchanged if it later returns to `open` — it was published once, and the
+    /// acceptance that published it stands.
+    @JsonKey(name: 'terms_accepted_at') String? termsAcceptedAt,
 
     /// When the job stops being offered (SHIP-68).
     ///

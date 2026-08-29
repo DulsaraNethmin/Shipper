@@ -192,6 +192,38 @@ Map<String, Object?> locationsBody({
   };
 }
 
+/// The body of the goods step (SHIP-72).
+///
+/// Six fields, all of them always sent, for the reason [locationsBody] sends both addresses: the
+/// step owns these six and a customer who emptied a box means "clear it", which is not what
+/// omitting the key means to a `PATCH`. The contract spells the clearing values out — the empty
+/// string for [category] and [description], `0` for every measurement — so a blank input is sent
+/// as the value that empties the field rather than left out.
+///
+/// [category] is a **code** from `GET /v1/goods-categories`, never a label. The label is wording
+/// and changes; the code is what the job stores.
+///
+/// **A category Shipper does not carry is accepted here and refused at publication** (SHIP-58,
+/// SHIP-59). `Docs/01` §4.1 lets a customer save a half-finished job and come back, and somebody
+/// sketching a delivery may not have worked out yet that it will not be taken.
+Map<String, Object?> goodsBody({
+  required String category,
+  required String description,
+  int? lengthCm,
+  int? widthCm,
+  int? heightCm,
+  double? weightKg,
+}) {
+  return <String, Object?>{
+    'goods_category': category,
+    'goods_description': description,
+    'length_cm': lengthCm ?? 0,
+    'width_cm': widthCm ?? 0,
+    'height_cm': heightCm ?? 0,
+    'weight_kg': weightKg ?? 0,
+  };
+}
+
 /// The body of a cancellation (SHIP-77).
 ///
 /// **An empty object is a complete request**, which is what the contract says and why this is a

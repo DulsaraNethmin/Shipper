@@ -290,14 +290,22 @@ class _JobLocationsScreenState extends ConsumerState<JobLocationsScreen> {
         ),
         const SizedBox(height: 8),
         FilledButton(
+          key: const Key('job-locations-continue'),
+          // Pushed rather than gone to, which keeps this step in the stack: the next step finds
+          // the draft it needs already read, and Back returns here rather than to the shell.
+          onPressed: () => unawaited(context.push(Routes.jobGoodsFor(draft.id))),
+          child: const Text('Continue'),
+        ),
+        const SizedBox(height: 8),
+        TextButton(
           key: const Key('job-locations-done'),
           onPressed: () => context.go(Routes.home),
           child: const Text('Done for now'),
         ),
         const SizedBox(height: 16),
         Text(
-          // The rest of the wizard is SHIP-72 to SHIP-74. Saying what is coming, without
-          // promising a button that is not there, is better than a dead end that looks broken.
+          // Said because the button above commits to nothing: leaving is safe, and a customer who
+          // does not know that will finish a form they were not ready to finish.
           'What you are sending, when it needs to move and your budget come next. Your draft '
           'waits in your jobs until you finish it.',
           key: const Key('job-locations-next-note'),

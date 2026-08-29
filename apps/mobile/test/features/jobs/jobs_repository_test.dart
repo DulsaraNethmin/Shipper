@@ -13,6 +13,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/api/api_client.dart';
 import 'package:shipper/core/api/idempotency_interceptor.dart';
+import 'package:shipper/features/jobs/goods_categories_repository.dart';
 import 'package:shipper/features/jobs/job.dart';
 import 'package:shipper/features/jobs/job_status.dart';
 import 'package:shipper/features/jobs/jobs_repository.dart';
@@ -117,6 +118,82 @@ void main() {
       const typed = AddressInput(state: 'new south wales');
 
       expect(typed.toJson()['state'], 'new south wales');
+    });
+  });
+
+  group('the goods body', () {
+    test('is the six keys the contract names, with the category as a code', () {
+      expect(
+        goodsBody(
+          category: 'general_freight',
+          description: 'Two-seater sofa, wrapped, no legs attached',
+          lengthCm: 190,
+          widthCm: 90,
+          heightCm: 85,
+          weightKg: 45.5,
+        ),
+        <String, Object?>{
+          // The `code` from GET /v1/goods-categories, never the `label`. The label is wording and
+          // changes; a client that sent 'General freight' would be refused as `not_allowed`.
+          'goods_category': 'general_freight',
+          'goods_description': 'Two-seater sofa, wrapped, no legs attached',
+          'length_cm': 190,
+          'width_cm': 90,
+          'height_cm': 85,
+          'weight_kg': 45.5,
+        },
+      );
+    });
+
+    test('an absent measurement is sent as the value that clears it, never omitted', () {
+      // `PATCH` touches only the fields present, so omitting a measurement means "keep whatever is
+      // there" — which is not what a box the customer just emptied means. The contract names `0`
+      // as the clearing value for all four, and the empty string for the two strings.
+      final body = goodsBody(category: '', description: '');
+
+      expect(body['goods_category'], '');
+      expect(body['goods_description'], '');
+      expect(body['length_cm'], 0);
+      expect(body['width_cm'], 0);
+      expect(body['height_cm'], 0);
+      expect(body['weight_kg'], 0);
+      expect(body.keys, hasLength(6));
+    });
+
+    test('carries no status, and there is no field for one', () {
+      final body = goodsBody(category: 'general_freight', description: 'A pallet');
+
+      expect(body.containsKey('status'), isFalse);
+      expect(jsonEncode(body), isNot(contains('status')));
+    });
+  });
+
+  group('the goods catalogue', () {
+    test('GETs /v1/goods-categories with no idempotency key', () async {
+      final adapter = _StubAdapter(
+        (_) => _json(<String, Object?>{
+          'categories': <Object?>[
+            <String, Object?>{
+              'code': 'general_freight',
+              'label': 'General freight',
+              'description': 'Palletised or boxed goods needing no special handling.',
+              'carried': true,
+              'provisional': true,
+            },
+          ],
+        }),
+      );
+      final dio = buildDio(baseUrl: 'http://localhost:8092')..httpClientAdapter = adapter;
+
+      final catalogue = await ApiGoodsCategoriesRepository(ApiClient(dio)).catalogue();
+
+      expect(adapter.requests.single.method, 'GET');
+      expect(adapter.requests.single.path, '/v1/goods-categories');
+      // A read changes nothing, and the middleware lets read-only methods through untouched.
+      expect(adapter.requests.single.headers.containsKey('Idempotency-Key'), isFalse);
+
+      expect(catalogue.categories.single.code, 'general_freight');
+      expect(catalogue.categories.single.carried, isTrue);
     });
   });
 

@@ -20,6 +20,7 @@ _Job _$JobFromJson(Map<String, dynamic> json) => _Job(
       ? null
       : JobLocation.fromJson(json['dropoff'] as Map<String, dynamic>),
   goodsDescription: json['goods_description'] as String?,
+  goodsCategory: json['goods_category'] as String?,
   lengthCm: (json['length_cm'] as num?)?.toInt(),
   widthCm: (json['width_cm'] as num?)?.toInt(),
   heightCm: (json['height_cm'] as num?)?.toInt(),
@@ -33,6 +34,7 @@ _Job _$JobFromJson(Map<String, dynamic> json) => _Job(
       ? null
       : JobTimeWindow.fromJson(json['dropoff_window'] as Map<String, dynamic>),
   budgetCents: (json['budget_cents'] as num?)?.toInt(),
+  termsAcceptedAt: json['terms_accepted_at'] as String?,
   expiresAt: json['expires_at'] as String?,
   createdAt: json['created_at'] as String?,
   updatedAt: json['updated_at'] as String?,
@@ -44,6 +46,7 @@ Map<String, dynamic> _$JobToJson(_Job instance) => <String, dynamic>{
   'pickup': instance.pickup,
   'dropoff': instance.dropoff,
   'goods_description': instance.goodsDescription,
+  'goods_category': instance.goodsCategory,
   'length_cm': instance.lengthCm,
   'width_cm': instance.widthCm,
   'height_cm': instance.heightCm,
@@ -53,6 +56,7 @@ Map<String, dynamic> _$JobToJson(_Job instance) => <String, dynamic>{
   'pickup_window': instance.pickupWindow,
   'dropoff_window': instance.dropoffWindow,
   'budget_cents': instance.budgetCents,
+  'terms_accepted_at': instance.termsAcceptedAt,
   'expires_at': instance.expiresAt,
   'created_at': instance.createdAt,
   'updated_at': instance.updatedAt,

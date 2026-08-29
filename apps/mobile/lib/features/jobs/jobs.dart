@@ -7,6 +7,14 @@
 /// - `job_status.dart` — the twelve states of `Docs/02` §1, in their wire form.
 /// - `jobs_repository.dart` — the five endpoints a customer screen calls.
 /// - `job_locations_screen.dart` and its controller — the first step of publishing (SHIP-71).
+/// - `job_wizard.dart` — the four steps of describing a delivery, and the chrome they share.
+/// - `job_draft_controller.dart` — the spine of the wizard: one draft, read once and edited a
+///   step at a time. Every step after the first uses it, because they are all the same operation.
+/// - `goods_category.dart` — the `GoodsCategory` schema, and the catalogue as one response.
+/// - `goods_categories_repository.dart` — `GET /v1/goods-categories` (SHIP-58). Its own
+///   repository rather than a method on `jobs_repository.dart`, because it is public,
+///   unauthenticated, and describes no job.
+/// - `job_goods_screen.dart` — the second step: what is being moved (SHIP-72).
 /// - `customer_job_list.dart` and its controller — the customer's own jobs (SHIP-76).
 /// - `job_detail_screen.dart` and its controller — one delivery in full (SHIP-77).
 /// - `job_timeline.dart` — where a job has reached, derived from its status because the
