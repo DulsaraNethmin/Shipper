@@ -143,8 +143,8 @@ application bucket — which is a deployment decision, not this document's.
 
 ## 5. The assignment
 
-All 87 routes on `services/core/cmd/api/routes_golden.txt`, generated from the manifest rather than
-listed by hand. Counts: `Unlimited` 1, `Credential` 5, `Message` 3, `Upload` 3, `Write` 36,
+All 88 routes on `services/core/cmd/api/routes_golden.txt`, generated from the manifest rather than
+listed by hand. Counts: `Unlimited` 1, `Credential` 5, `Message` 3, `Upload` 3, `Write` 37,
 `Read` 35, `PublicRead` 4.
 
 | Method | Path | Auth | Class |
@@ -227,6 +227,7 @@ listed by hand. Counts: `Unlimited` 1, `Credential` 5, `Message` 3, `Upload` 3, 
 | GET | `/v1/jobs/{id}/history` | user | `Read` |
 | POST | `/v1/jobs/{id}/milestones` | user | `Write` |
 | POST | `/v1/jobs/{id}/proof-uploads` | user | `Upload` |
+| POST | `/v1/jobs/{id}/publish` | user | `Write` |
 | POST | `/v1/notifications/device-tokens` | user | `Write` |
 | DELETE | `/v1/notifications/device-tokens/current` | user | `Write` |
 | GET | `/v1/notifications/preferences` | user | `Read` |
@@ -315,7 +316,7 @@ person can hold in their head, against eighty-six they cannot.
 > `RemoteAddr` alone, which is the shared-bucket end of exactly this trade-off, deliberately
 > chosen as the safe default. §11 records what SHIP-183b decided along the way.
 
-**Twelve of the 87 routes key on a network address, and none of their limits can be trusted behind
+**Twelve of the 88 routes key on a network address, and none of their limits can be trusted behind
 a load balancer until the trusted-proxy configuration exists.** `Docs/11` §9 records that
 `X-Forwarded-For` is deliberately unread and parks the decision on "the deployment work". This
 review turns that from a note into a countable dependency.

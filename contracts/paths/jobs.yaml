@@ -323,6 +323,154 @@ JobByID:
             schema:
               $ref: '../openapi.yaml#/components/schemas/Error'
 
+PublishJob:
+  post:
+    operationId: publishJob
+    summary: Publish a draft, so providers can bid on it
+    tags: [Jobs]
+    description: |
+      Moves the caller's draft to `open` (SHIP-63). This is what makes a job visible to providers
+      and biddable; until it happens the job exists only for its owner.
+
+      **A verb under the resource rather than a field on the job.** Job status is not settable
+      (Docs/02 §2): a client names an intent and the platform decides what the state becomes.
+
+      ## What is checked, in this order
+
+      1. **The goods are ones Shipper carries.** A category with `carried: false` in
+         `GET /v1/goods-categories` is refused with `jobs_prohibited_category` and a `422`, and the
+         message names the category and quotes the catalogue's own wording for it (SHIP-59).
+         Checked first deliberately — a customer whose load will never be accepted should not first
+         be sent away to fill in the fields below.
+      2. **The customer has verified their email address and phone number** (Docs/04 §2).
+         `jobs_customer_not_verified`, `403`. Drafts can be created and edited without this; only
+         publishing requires it.
+      3. **The declaration was made with this request.** `jobs_terms_not_accepted`, `422`.
+      4. **The job says enough to be bid on** — pickup, drop-off, a goods description, a goods
+         category, and the start of the pickup window. `validation_failed`, `422`, listing every
+         missing field at once.
+
+      Size — weight and dimensions — is **not** required. A provider who needs it can ask on the
+      job's message thread, and refusing to publish is the more expensive failure: a customer who
+      cannot say what their pallet weighs would be stopped at the last step with no way forward.
+
+      ## Publishing an already-published job succeeds
+
+      It answers `200` with the job and records nothing further: no second transition, no second
+      event, and `terms_accepted_at` keeps the instant it already had. Retrying with the *same*
+      `Idempotency-Key` replays the original response; this covers the other case, where a phone
+      lost its connection, was restarted, and generated a fresh key for the same intent.
+
+      It does **not** re-check anything. A job that is already open whose category was withdrawn
+      from the catalogue this morning stays open — withdrawing a category decides what may be
+      published from now on, and taking down what is already live is a moderation act with an
+      audit trail.
+
+      Any other status answers `jobs_not_publishable` and a `409`.
+
+      **A job belonging to another customer answers `404`, not `403`** — see the note on editing a
+      draft.
+
+      ## What publication starts
+
+      `expires_at` is set as the job becomes `open`: the earlier of fourteen days and the end of
+      the pickup window (Docs/02 §6.3). A job published with a window that has already passed
+      expires almost immediately, which is the mechanism doing its job rather than a rule this
+      endpoint duplicates.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/JobPublication'
+    responses:
+      '200':
+        description: |
+          The job is open, and is returned in full. Also the answer when it already was.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Job'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '403':
+        description: |
+          The customer has not verified their email address and phone number
+          (`jobs_customer_not_verified`). The message says which is outstanding.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          The job is not a draft, so there is nothing to publish (`jobs_not_publishable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          The job cannot be published as it stands. One of three codes, and they want different
+          responses from a client: `jobs_prohibited_category` — Shipper does not carry these
+          goods, and the message says so in the catalogue's own words;
+          `jobs_terms_not_accepted` — the declaration was not made; `validation_failed` — a
+          required field is missing, listed in `details`.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+JobPublication:
+  type: object
+  required: [accepts_terms]
+  additionalProperties: false
+  description: |
+    The declaration Docs/04 §2 requires at publication, and nothing else.
+  properties:
+    accepts_terms:
+      type: boolean
+      description: |
+        The customer's acceptance of the terms and the goods declaration, for **this job**.
+
+        Docs/04 §2 requires it "for every job", so it is asked every time rather than remembered
+        against the account: the declaration is about these goods, made by a customer who has
+        just described them.
+
+        `false` is refused rather than ignored — a client sending it has said the customer
+        declined, and answering `200` would record an acceptance nobody made.
+      example: true
+
 CancelJob:
   post:
     operationId: cancelJob
@@ -693,6 +841,19 @@ JobDraft:
       maxLength: 2000
       description: What is being moved, in the customer's own words.
       example: Two-seater sofa, wrapped, no legs attached
+    goods_category:
+      type: string
+      description: |
+        A `code` from `GET /v1/goods-categories` (SHIP-58) — never the label, which is wording
+        that changes. A code the catalogue does not serve is refused here as `not_allowed` on
+        `goods_category`, and the client's move is to re-fetch the list.
+
+        **A category the platform does not carry is accepted on a draft** and refused at
+        publication (SHIP-59). A customer sketching a job may not have worked out yet that
+        Shipper will not take it, and Docs/01 §4.1 lets them save and come back.
+
+        The empty string clears the choice.
+      example: general_freight
     length_cm:
       type: integer
       minimum: 0
@@ -879,6 +1040,13 @@ Job:
     goods_description:
       type: string
       example: Two-seater sofa, wrapped, no legs attached
+    goods_category:
+      type: string
+      description: |
+        The catalogue code the customer chose (SHIP-58), not the label. Resolve it against
+        `GET /v1/goods-categories`; the job stores the code because that is the half that stays
+        stable when the wording changes. Omitted when no category has been chosen.
+      example: general_freight
     length_cm:
       type: integer
       example: 190
@@ -910,6 +1078,15 @@ Job:
         API that carries the budget.** Docs/01 §4.3 keeps it private from providers in every
         form; SHIP-82's feed and SHIP-83's provider job detail describe a job without it.
       example: 150000
+    terms_accepted_at:
+      type: string
+      format: date-time
+      description: |
+        When the customer accepted the terms and the goods declaration for this job (SHIP-63,
+        Docs/04 §2). Recorded per job rather than per account, because the declaration is about
+        these goods. Omitted until the job is first published, and unchanged if it later returns
+        to `open` — it was published once, and the acceptance that published it stands.
+      example: '2026-08-29T04:31:00.000Z'
     expires_at:
       type: string
       format: date-time

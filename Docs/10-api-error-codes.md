@@ -88,11 +88,14 @@ them where the call is made, beside the thing the user was trying to do.
 | `identity_session_not_found` | No such device session on this account. A session belonging to somebody else answers identically. |
 | `identity_verification_token_expired` | This verification link has expired. Ask for a new one. |
 | `identity_verification_token_invalid` | This verification link is no longer valid. Ask for a new one. |
+| `jobs_customer_not_verified` | The customer must verify their email address and phone number before publishing a job. Drafts can be created and edited without verification; publishing cannot. |
 | `jobs_customer_only` | Only a customer account can create or edit a job. Providers bid on jobs; they do not publish them. |
 | `jobs_not_a_draft` | The job has been published and can no longer be edited as a draft. Reload it to see its current status. |
 | `jobs_not_cancellable` | The job can no longer be cancelled. Once a provider has been awarded the work, ending the job is a support matter rather than a state change. Reload it to see its current status. |
 | `jobs_not_extendable` | The job's expiry cannot be extended. Either it is not being offered to providers any more, or its pickup date is what is ending it — and no amount of extra listing time keeps a job alive past the date its goods were to be collected. |
+| `jobs_not_publishable` | The job cannot be published. Only a draft can be published, so this one has already been published, cancelled, or awarded. Reload it to see its current status. |
 | `jobs_prohibited_category` | The goods category may not be published. Shipper does not carry goods in this category — see the catalogue at GET /v1/goods-categories, where every entry says whether it is carried. |
+| `jobs_terms_not_accepted` | Publishing a job requires accepting the terms and the goods declaration. It is recorded per job rather than per account, so it is asked every time. |
 | `notifications_category_essential` | This kind of notification cannot be switched off. Docs/01 §4.5 lists the events every account is told about. |
 | `notifications_no_device_session` | That credential does not name a device session, so there is nothing to register a push token against. Sign in again. |
 | `profiles_document_already_recorded` | That image has already been submitted. Ask for a new upload URL and send it again. |

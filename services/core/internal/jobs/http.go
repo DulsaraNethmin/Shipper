@@ -31,6 +31,7 @@ package jobs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -159,6 +160,27 @@ type draftRequest struct {
 // request looks like for the sake of saving a client two characters.
 type cancelRequest struct {
 	Reason string `json:"reason"`
+}
+
+// publishRequest is the body of POST /v1/jobs/{id}/publish (SHIP-63).
+//
+// One field, and it is not optional. Docs/04 §2 requires the terms and goods declaration "for
+// every job", so a publication that does not carry it is refused rather than defaulted — which is
+// the whole reason this is a field the client must send rather than a header or an assumption.
+//
+// A plain bool rather than a pointer: absent and false mean the same thing here, because both mean
+// the customer did not declare. There is no stored value to leave alone, which is the distinction
+// [draftRequest]'s pointers exist for.
+//
+// **`false` is refused rather than ignored.** A client that sends it has told the platform the
+// customer declined, and answering 200 to that would record an acceptance nobody made.
+type publishRequest struct {
+	// AcceptsTerms is the customer's declaration, made now, about these goods.
+	//
+	// Named for what it is rather than `confirmed` or `agreed`: the field name is what a client
+	// developer reads when they decide what to bind it to, and a vague one invites binding it to
+	// a constant.
+	AcceptsTerms bool `json:"accepts_terms"`
 }
 
 // extendRequest is the body of POST /v1/jobs/{id}/extend, and it has no fields at all (SHIP-70).
@@ -327,6 +349,15 @@ type jobResponse struct {
 	// tell "no budget" from "a budget of nothing" without a second flag.
 	BudgetCents int64 `json:"budget_cents,omitempty"`
 
+	// TermsAcceptedAt is when the customer made the declaration that published this job
+	// (SHIP-63).
+	//
+	// Omitted while the job is a Draft, because a draft has never been published. Returned to
+	// the owner because it is a record *of their own act* and Docs/04 §2 makes it the thing the
+	// platform relies on if the goods are not what the job said — a customer is entitled to see
+	// what they are on record as having declared, and when.
+	TermsAcceptedAt string `json:"terms_accepted_at,omitempty"`
+
 	// ExpiresAt is when this job stops being offered, once it is Open (SHIP-68).
 	//
 	// Omitted while the job is a Draft, because a Draft has no deadline — the clock starts at
@@ -360,8 +391,9 @@ func jobFrom(j Job) jobResponse {
 		PickupWindow:  windowFrom(j.PickupWindow),
 		DropoffWindow: windowFrom(j.DropoffWindow),
 
-		BudgetCents: j.BudgetCents,
-		ExpiresAt:   timestamp(j.ExpiresAt),
+		BudgetCents:     j.BudgetCents,
+		TermsAcceptedAt: timestamp(j.TermsAcceptedAt),
+		ExpiresAt:       timestamp(j.ExpiresAt),
 
 		CreatedAt: timestamp(j.CreatedAt),
 		UpdatedAt: timestamp(j.UpdatedAt),
@@ -483,6 +515,146 @@ func (h *Handler) Categories() http.Handler {
 		httpx.WriteJSON(w, http.StatusOK, out)
 		return nil
 	})
+}
+
+// Publish handles POST /v1/jobs/{id}/publish (SHIP-63).
+//
+// A verb under the resource, for the reason [Handler.Cancel] is one: job status is not a settable
+// field, so there is no `PATCH` that could carry `"status": "open"` and no request schema anywhere
+// in this domain that has a status in it. A client that sends one is told the field does not exist.
+//
+// State-changing, so it carries an `Idempotency-Key` like every other mutating route (SHIP-15),
+// and the middleware absorbs a retry that reuses its key. A retry with a *fresh* key is absorbed
+// too, by [Service.Publish] itself — unlike an extension, publishing twice is not two of anything.
+//
+// A job belonging to somebody else answers 404, byte-identically to a job that does not exist. See
+// [apiError].
+func (h *Handler) Publish() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		customerID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req publishRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		var published Job
+		err = db.InTx(r.Context(), pool, func(ctx context.Context, runner db.Runner) error {
+			var err error
+			published, err = h.svc.Publish(ctx, runner, customerID, jobID, req.AcceptsTerms)
+			return err
+		})
+		if err != nil {
+			return h.publishError(r.Context(), err, jobID)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, jobFrom(published))
+		return nil
+	})
+}
+
+// publishError maps [Service.Publish]'s refusals, naming the category when that is what happened.
+//
+// A method rather than a function, and the only error mapping in this file that is: answering
+// SHIP-59's "explains why" needs the catalogue, and the catalogue is on the service. Everything it
+// does not handle falls through to [apiError], which is where the rest of this domain's mapping
+// lives and stays.
+//
+// # Why the message is built here rather than registered with the code
+//
+// The registered description is what the generated document says the code means, and it has to be
+// true of every use. The *message* is about this request — these goods, this catalogue's wording
+// for them — and the wording moves when operations change it. Building it here is what lets a
+// category withdrawn on legal advice explain itself in the customer's own refusal on the same
+// afternoon, with no release.
+func (h *Handler) publishError(ctx context.Context, err error, jobID uuid.UUID) error {
+	switch {
+	case errors.Is(err, ErrProhibitedCategory):
+		return httpx.NewError(http.StatusUnprocessableEntity, CodeProhibitedCategory,
+			"%s", h.prohibitedMessage(ctx, jobID)).WithCause(err)
+
+	case errors.Is(err, ErrUnknownCategory):
+		// Reachable here only for a job whose stored category has since left the
+		// catalogue — a draft saved before operations withdrew it. The client's move is
+		// the same as for any stale reference: re-fetch the list and choose again.
+		return httpx.NewError(http.StatusUnprocessableEntity, httpx.CodeValidationFailed,
+			"This job's goods category is no longer one this platform serves. "+
+				"Choose another from the catalogue.").WithCause(err)
+
+	case errors.Is(err, ErrJobNotPublishable):
+		return httpx.NewError(http.StatusConflict, CodeNotPublishable,
+			"This job cannot be published. Reload it to see its current status.").WithCause(err)
+
+	case errors.Is(err, ErrCustomerNotVerified):
+		return httpx.NewError(http.StatusForbidden, CodeCustomerNotVerified,
+			"Verify your email address and phone number before publishing a job. "+
+				"You can keep editing the draft in the meantime.").WithCause(err)
+
+	case errors.Is(err, ErrTermsNotAccepted):
+		return httpx.NewError(http.StatusUnprocessableEntity, CodeTermsNotAccepted,
+			"Accept the terms and the goods declaration to publish this job.").WithCause(err)
+
+	default:
+		return apiError(err)
+	}
+}
+
+// prohibitedMessage is the sentence a refused customer reads.
+//
+// It quotes the catalogue's own label and description, so the explanation is the platform's
+// current policy wording rather than a copy of it compiled into this file. If the category cannot
+// be resolved — which would mean the catalogue changed between the refusal and this call — it
+// falls back to a sentence that is still true and still actionable.
+func (h *Handler) prohibitedMessage(ctx context.Context, jobID uuid.UUID) string {
+	category, refused := h.categoryOf(ctx, jobID)
+	if !refused {
+		return "Shipper does not carry goods in this category. " +
+			"See GET /v1/goods-categories for what can be published."
+	}
+
+	message := fmt.Sprintf("Shipper does not carry %s.", strings.ToLower(category.Label))
+	if category.Description != "" {
+		message += " " + category.Description
+	}
+	return message + " See GET /v1/goods-categories for what can be published."
+}
+
+// categoryOf reads the job's stored category and asks whether it is a refused one.
+//
+// A second read, on a path that is already refusing the request, and outside the transaction that
+// has just rolled back. That is deliberate: the alternative is threading the category out through
+// the error, which would make one refusal in this domain a different shape from every other. See
+// [Service.prohibitedCategory].
+//
+// It takes the request's context, so a client that has gone away stops this query too — the answer
+// is only ever used to word a refusal nobody is waiting for any more. Every failure reports "no
+// category to explain" and the caller falls back to a sentence that is still true: a refusal whose
+// wording could not be looked up is still a refusal, and turning it into a 500 would replace a
+// correct answer with an incorrect one.
+func (h *Handler) categoryOf(ctx context.Context, jobID uuid.UUID) (Category, bool) {
+	if h.pool == nil {
+		return Category{}, false
+	}
+
+	var code string
+	const q = `SELECT COALESCE(goods_category, '') FROM jobs WHERE id = $1`
+	if err := h.pool.QueryRow(ctx, q, jobID).Scan(&code); err != nil {
+		return Category{}, false
+	}
+	return h.svc.prohibitedCategory(code)
 }
 
 // Create handles POST /v1/jobs (SHIP-61).

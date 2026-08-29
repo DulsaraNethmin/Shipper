@@ -285,6 +285,17 @@ type Job struct {
 	// whether to warn — which is the notification domain's decision, not the app's.
 	ExpiryWarnedAt time.Time
 
+	// TermsAcceptedAt is when the customer accepted the terms and the goods declaration for
+	// this job (SHIP-63).
+	//
+	// Docs/04 §2 requires the declaration at publication and requires it "for every job", so it
+	// is a fact about the job rather than about the account — a customer who accepted once at
+	// registration has said nothing about *these* goods. Zero until the job is first published.
+	//
+	// A job that returns to Open under Docs/02 §6.2 keeps the instant it already had: it was
+	// published once, and the acceptance that published it stands.
+	TermsAcceptedAt time.Time
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

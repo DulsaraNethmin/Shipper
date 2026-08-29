@@ -314,6 +314,8 @@ paths:
     $ref: './paths/delivery.yaml#/Milestones'
   /v1/jobs/{id}/proof-uploads:
     $ref: './paths/delivery.yaml#/ProofUploads'
+  /v1/jobs/{id}/publish:
+    $ref: './paths/jobs.yaml#/PublishJob'
   /v1/notifications/device-tokens:
     $ref: './paths/notifications.yaml#/DeviceTokens'
   /v1/notifications/device-tokens/current:

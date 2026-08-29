@@ -88,6 +88,19 @@ func init() {
 			Handler: func(d Deps) http.Handler { return jobsHandler(d).Update() },
 		},
 		Route{
+			// SHIP-63. The endpoint the marketplace was waiting on: until it existed
+			// nothing in the platform moved a job to Open, so no provider ever saw one.
+			//
+			// A verb under the resource for the reason the cancellation below is one —
+			// status is not a settable field — and LimitWrite because it is.
+			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/publish",
+			Group:   GroupV1,
+			Auth:    RequireUser,
+			Limit:   LimitWrite,
+			Handler: func(d Deps) http.Handler { return jobsHandler(d).Publish() },
+		},
+		Route{
 			// A verb under the resource, because job status is not a settable field
 			// (Docs/02 §2). A PATCH carrying `{"status": "cancelled"}` would be a client
 			// naming a state; this is a client naming an intent.

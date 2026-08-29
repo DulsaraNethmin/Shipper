@@ -170,6 +170,31 @@ var (
 	// not be argued with halfway through; the refusal belongs at the moment the job would
 	// become visible to providers, which is the moment it would matter.
 	ErrProhibitedCategory = errors.New("jobs: this platform does not carry that category of goods")
+
+	// ErrJobNotPublishable means the job is in a status Docs/02 §2 has no `→ Open` row from
+	// (SHIP-63).
+	//
+	// Narrower than ErrTransitionNotPermitted for the reason ErrJobNotCancellable is, and that
+	// error's own note predicted this one: "SHIP-63's publish will want the same treatment and
+	// a different code … one code per intent, not one code per guard failure." A customer
+	// pressing "publish" asked for an outcome rather than for a move.
+	ErrJobNotPublishable = errors.New("jobs: only a draft can be published")
+
+	// ErrCustomerNotVerified means the account has not verified its email address, its phone
+	// number, or neither (SHIP-63).
+	//
+	// Docs/04 §2 requires both before publishing and is explicit that an account may create
+	// drafts without them — so this is raised at publication and nowhere else, exactly as
+	// ErrProhibitedCategory is.
+	ErrCustomerNotVerified = errors.New("jobs: the customer has not verified their contact details")
+
+	// ErrTermsNotAccepted means a publication arrived without the declaration Docs/04 §2
+	// requires (SHIP-63).
+	//
+	// "Terms and goods declaration | Accept at job publication | **Required for every job**" —
+	// every job, so it is not a property of the account that could be answered once at
+	// registration and remembered. It is asked and recorded per publication.
+	ErrTermsNotAccepted = errors.New("jobs: publishing requires the terms and goods declaration")
 )
 
 // The error codes this domain's endpoints answer with (Docs/10 §4.4).
@@ -250,4 +275,40 @@ var (
 		"The goods category may not be published. Shipper does not carry goods in this "+
 			"category — see the catalogue at GET /v1/goods-categories, where every entry "+
 			"says whether it is carried.")
+
+	// CodeNotPublishable is returned when a publication arrives for a job that is not a draft.
+	//
+	// 409 rather than 403, on the same reasoning as jobs_not_a_draft and jobs_not_cancellable:
+	// the caller is permitted and the request contradicts the state the job is in. The client
+	// reloads and shows the job's real status — which, for the overwhelmingly common case of a
+	// double-tapped publish button, is that the job is already Open. See [Service.Publish] for
+	// why that particular case does not reach this code at all.
+	CodeNotPublishable = httpx.RegisterCode("jobs_not_publishable",
+		"The job cannot be published. Only a draft can be published, so this one has already "+
+			"been published, cancelled, or awarded. Reload it to see its current status.")
+
+	// CodeCustomerNotVerified is returned when an unverified account tries to publish
+	// (SHIP-63).
+	//
+	// 403, and it is the one refusal in this file that genuinely is about the caller rather
+	// than about the job. A distinct code rather than a bare 403 because the client can act on
+	// it precisely: send the customer to the verification screens rather than to a support
+	// page. Docs/04 §2 requires email and phone both, and the message says which is missing —
+	// the code says what to do, the message says what to do it about.
+	CodeCustomerNotVerified = httpx.RegisterCode("jobs_customer_not_verified",
+		"The customer must verify their email address and phone number before publishing a "+
+			"job. Drafts can be created and edited without verification; publishing cannot.")
+
+	// CodeTermsNotAccepted is returned when a publication does not carry the declaration
+	// (SHIP-63).
+	//
+	// 422 rather than `validation_failed`, and for a reason worth separating from
+	// [CodeProhibitedCategory]'s. A missing boolean *is* a malformed request and
+	// `validation_failed` would be defensible — but Docs/04 §2 makes this a declaration the
+	// customer makes rather than a field they fill in, and a client that treats it as a
+	// validation error will helpfully tick the box for them on the retry. A code of its own is
+	// what stops that being the obvious implementation.
+	CodeTermsNotAccepted = httpx.RegisterCode("jobs_terms_not_accepted",
+		"Publishing a job requires accepting the terms and the goods declaration. It is "+
+			"recorded per job rather than per account, so it is asked every time.")
 )
