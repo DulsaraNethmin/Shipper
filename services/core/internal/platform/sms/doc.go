@@ -1,15 +1,27 @@
 // Package sms dispatches text messages, which in the MVP means phone-verification OTPs.
 //
-// Two implementations exist today (Docs/06 §4.1):
+// Two implementations, which is the whole set rather than a snapshot — there is no third
+// transport an SMS gateway could want (Docs/06 §4.1):
 //
-//	console.go    development — renders the message to the log and sends nothing
-//	provider.go   staging and production — hands it to the SMS provider
+//	console.go    renders the message to the log and sends nothing
+//	provider.go   posts it to a gateway's HTTP API
 //
-// Which one is constructed is chosen in cmd/api from SHIPPER_ENV. SHIP-35.
+// Which one is constructed is SMS_TRANSPORT — console or http — read in cmd/api and in
+// cmd/notifier (SHIP-35, SHIP-187a). There is no smtp here for the obvious reason, and
+// config refuses the value by name rather than ignoring it.
 //
-// SMS costs money per message and reaches a real handset, so the console implementation
-// being the development default matters more here than it does for email: a retry loop
-// against a live provider is a bill as well as a nuisance.
+// # The environment used to decide, and no longer does
+//
+// It was UseConsole(env). SHIP-187a moved the choice into configuration for the reason the
+// email package's own note gives, and the rule now lives in internal/config alone — no file
+// in this package reads the environment.
+//
+// Unset, SMS_TRANSPORT still resolves from it: console in development, http elsewhere. That
+// default matters more here than it does for email, and it is deliberately unchanged. SMS
+// costs money per message and reaches a real handset, so a retry loop against a live gateway
+// is a bill as well as a nuisance. An instance that should not send real messages says so
+// with SMS_TRANSPORT=console — a visible choice in a file, rather than an inference from the
+// environment.
 //
 // The interface this package satisfies is declared by identity, which is the domain that
 // needs an OTP delivered — never here.
@@ -21,9 +33,12 @@
 // JSON POST under a configured base URL, with a bearer credential — taking base URL, key
 // and sender as its own [Options] rather than reading internal/config.
 //
-// The vendor is named at SHIP-36, the phone-verification endpoint, which is the first
-// ticket that sends anything real. Docs/11 §7 records that as decided before wave 1 rather
-// than deferred by accident. Naming it should change provider.go and nothing else.
+// SHIP-36 was where a gateway was expected to be named and it closed without naming one,
+// which cost nothing: the seam had existed since wave 1. SHIP-187a then made the naming
+// unnecessary — the path, the credential's header and scheme, and the body template are all
+// configuration, so following a buyer to their gateway is an edit to deploy/.env and no Go
+// change. SMS gateways vary by country as well as by vendor, which makes this the adapter a
+// buyer is most likely to have to repoint. See [Options].
 //
 // # Why the method takes three strings and not a struct
 //

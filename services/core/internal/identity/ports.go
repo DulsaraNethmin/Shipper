@@ -53,18 +53,19 @@ import (
 
 // EmailSender delivers a transactional message.
 //
-// Satisfied by *email.Console in development and *email.Provider in staging and production
-// (SHIP-32). Which one exists is decided in cmd/api from SHIPPER_ENV; nothing here knows or asks
-// — and the console implementation logging the body in full is the whole reason a developer can
-// complete verification without a mailbox.
+// Satisfied by *email.Console, *email.Provider or *email.SMTP (SHIP-32, SHIP-187a, SHIP-187b).
+// Which one exists is decided in cmd/api from EMAIL_TRANSPORT; nothing here knows or asks. The
+// console implementation logs the body in full, which is how a developer completed verification
+// before the development stack had a mailbox — SHIP-200 gives it one, and the code is then read
+// from a browser rather than out of the API log.
 type EmailSender interface {
 	Send(ctx context.Context, to, subject, body string) error
 }
 
 // SMSSender delivers a text message, which in the MVP means a phone verification code.
 //
-// Satisfied by *sms.Console in development and *sms.Provider in staging and production
-// (SHIP-35). The adapter does not know it is carrying a one-time code and must not: generating
+// Satisfied by *sms.Console or *sms.Provider, chosen in cmd/api from SMS_TRANSPORT (SHIP-35,
+// SHIP-187a). The adapter does not know it is carrying a one-time code and must not: generating
 // the code, deciding its lifetime, rate-limiting it and comparing it on the way back are all
 // domain rules, and a transport that knew about them would be a domain rule living in the wrong
 // package.

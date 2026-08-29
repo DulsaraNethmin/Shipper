@@ -1109,6 +1109,8 @@ The file's own header says which invocation demonstrates which claim.
 
 | **SHIP-200** | M9 | A mail catcher in the development stack. `make up` starts Mailpit, `deploy/.env.example` points the stack's SMTP at it, and a verification code is read in a browser at `localhost:8025` rather than out of the API log. **The code default is untouched** — `internal/config` still resolves an unset `EMAIL_TRANSPORT` to the console, so a machine with no `deploy/.env` behaves exactly as it did; what changed is the example file, and the two are not in conflict. **The ports are fixed rather than per-worktree on purpose**, unlike `STORAGE_BUCKET`: a mailbox a person reads is not something two trees collide over the way a listing or a count is. Storage is in-memory, so there is no volume and a restart empties it. **The finding is that pointing the example file anywhere breaks two things that read the console, and neither would have failed at review** — `make verify` greps the server log for `email (console, not sent)`, and `config_test.go`'s `clearEnv` did not carry a single `EMAIL_*` or `SMS_*` key while `make` exports `deploy/.env` wholesale. The harness now pins both transports for its own run, and `clearEnv` carries all twenty-three keys — *see below* |
 
+| **SHIP-201** | M9 | The mail and SMS adapters' documentation says what the packages do. Three files still described the world before SHIP-187a and SHIP-187b, each carrying the same three false statements: that two implementations exist (email has three), that the choice is made in `cmd/api` from `SHIPPER_ENV` (it is `EMAIL_TRANSPORT` and `SMS_TRANSPORT`, in `internal/config`), and that a vendor would be named at SHIP-33 or SHIP-36 — both of which closed without naming one, after which SHIP-187a made naming unnecessary. Each package comment now carries a short note saying the environment **used to** decide, because a deleted function is the first thing a reader who knows the package looks for. **`sms/doc.go` still says two, and that is not the stale claim** — SMS genuinely has two and no third transport a gateway could want, and the file now states it as a complete set rather than a snapshot — *see below* |
+
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
 ### What SHIP-15a built
@@ -16877,6 +16879,29 @@ principle.
 
 **Done when:** a registration puts the verification email in a browser-readable mailbox and an unset
 `EMAIL_TRANSPORT` still selects the console — both demonstrated above; `make check` green.
+
+### SHIP-201 — three files describing an adapter that had changed underneath them
+
+`SHIP-187a` made the messaging transport configuration and `SHIP-187b` added SMTP, and three files
+went on describing what the packages did before that. Each carried the same three false statements:
+that two implementations exist (email has three), that the choice is made in `cmd/api` from
+`SHIPPER_ENV` (it is `EMAIL_TRANSPORT` and `SMS_TRANSPORT`, in `internal/config`), and that the
+vendor would be named at SHIP-33 or SHIP-36 (both closed without naming one, and SHIP-187a then made
+naming unnecessary — the path, the credential's header and scheme and the body template are all
+configuration).
+
+`email/doc.go` now lists `console.go`, `provider.go` and `smtp.go` with the setting that picks them,
+and both package comments carry a short note saying the environment used to decide and no longer
+does — because the deleted function is the thing a reader who knows this package will look for
+first. `identity/ports.go` names the three types its `EmailSender` can be satisfied by, and its note
+about the console logging the body in full is kept and pointed at SHIP-200, which is what replaces
+it.
+
+**`sms/doc.go` still says two implementations, and that is not the stale claim.** SMS genuinely has
+`console.go` and `provider.go` and there is no third transport a gateway could want — the file now
+says so as a complete set rather than as a snapshot, so it cannot be read as the formula the other
+two were corrected for. Checked by grep across all three trees: no `SHIPPER_ENV`, no "two
+implementations exist today", no vendor deferred to SHIP-33 or SHIP-36.
 
 ## 4. Partly done — do not treat these as finished
 
