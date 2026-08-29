@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 
 	"github.com/google/uuid"
 
@@ -247,6 +248,20 @@ func goodsCatalogue(d Deps) jobs.Catalogue {
 //
 // The log lines are deliberately at startup rather than per request: they are facts about the
 // deployment, and one line in the boot log is findable where one line per created job is noise.
+//
+// # Why the logging is behind a sync.Once
+//
+// jobsHandler is called once per route during attach, so this runs nine times on every boot and
+// built nine geocoders before this comment existed as well as after. That was invisible while the
+// development case returned the stub in silence; saying which transport is in use made it nine
+// identical lines, which is the noise the paragraph above claims to be avoiding.
+//
+// The Once covers the logging rather than the construction, deliberately. Building nine stubs
+// costs nothing and building nine providers costs nine idle HTTP clients, which is worth tidying
+// and is not this ticket — whereas a boot log that states a fact nine times is a defect this
+// ticket introduced, and it is fixed where it was made.
+var geocoderLogged sync.Once
+
 func newGeocoder(d Deps) jobs.Geocoder {
 	switch d.Config.Geocoding.Transport {
 	case config.TransportStub:
@@ -254,8 +269,10 @@ func newGeocoder(d Deps) jobs.Geocoder {
 		// the one adapter in the tree whose output is indistinguishable from a working one
 		// — plausible coordinates, inside Australia, entirely invented — so the boot log is
 		// the only place a reader can find out which they are looking at.
-		d.Logger.Info("geocoding resolves in-process; every coordinate stored is fictional",
-			"transport", string(config.TransportStub))
+		geocoderLogged.Do(func() {
+			d.Logger.Info("geocoding resolves in-process; every coordinate stored is fictional",
+				"transport", string(config.TransportStub))
+		})
 		return geocoding.NewStub()
 
 	case config.TransportHTTP:
@@ -264,14 +281,20 @@ func newGeocoder(d Deps) jobs.Geocoder {
 			APIKey:  d.Config.Geocoding.ProviderAPIKey,
 		})
 		if err != nil {
-			d.Logger.Warn("the geocoding provider could not be built; job addresses will be stored unresolved",
-				"transport", string(config.TransportHTTP), "error", err.Error())
+			// Same Once: the two outcomes are mutually exclusive on one boot, because
+			// every call reads the same configuration.
+			geocoderLogged.Do(func() {
+				d.Logger.Warn("the geocoding provider could not be built; job addresses will be stored unresolved",
+					"transport", string(config.TransportHTTP), "error", err.Error())
+			})
 			return nil
 		}
 
-		d.Logger.Info("geocoding provider configured",
-			"transport", string(config.TransportHTTP),
-			"base_url", d.Config.Geocoding.ProviderBaseURL)
+		geocoderLogged.Do(func() {
+			d.Logger.Info("geocoding provider configured",
+				"transport", string(config.TransportHTTP),
+				"base_url", d.Config.Geocoding.ProviderBaseURL)
+		})
 		return provider
 
 	default:
