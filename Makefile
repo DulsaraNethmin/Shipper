@@ -87,7 +87,7 @@ help: ## Show this help
 # --- Local stack (SHIP-2, SHIP-3, SHIP-4) ---------------------------------------------
 
 .PHONY: up
-up: ## Start Postgres, Redis, Kafka and the object store, waiting until each is healthy
+up: ## Start Postgres, Redis, Kafka, the object store and the mail catcher, waiting until each is healthy
 	$(COMPOSE) up -d --wait
 	@$(MAKE) --no-print-directory storage-bucket
 

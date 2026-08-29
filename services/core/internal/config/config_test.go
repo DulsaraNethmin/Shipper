@@ -35,6 +35,19 @@ var allKeys = []string{
 	// leaked into every test here — make exports the file's contents, so the tests would have
 	// been reading a developer's incident tuning.
 	"RATE_LIMIT_BURST_SCALE", "RATE_LIMIT_RATE_SCALE",
+	// SHIP-200's catcher, and the third instance of the note above. deploy/.env.example now
+	// sets EMAIL_TRANSPORT=smtp so the development stack delivers to Mailpit — and `make`
+	// exports that file wholesale, so without these keys every test here asserting a
+	// defaulted transport would be reading a developer's mailbox settings instead. The
+	// resolution rule is the thing under test; inheriting an answer to it tests nothing.
+	"EMAIL_TRANSPORT", "EMAIL_PROVIDER_BASE_URL", "EMAIL_PROVIDER_API_KEY", "EMAIL_SENDER",
+	"EMAIL_PROVIDER_PATH", "EMAIL_PROVIDER_AUTH_HEADER", "EMAIL_PROVIDER_AUTH_SCHEME",
+	"EMAIL_PROVIDER_CONTENT_TYPE", "EMAIL_PROVIDER_BODY_TEMPLATE",
+	"EMAIL_SMTP_HOST", "EMAIL_SMTP_PORT", "EMAIL_SMTP_USERNAME", "EMAIL_SMTP_PASSWORD",
+	"EMAIL_SMTP_ENCRYPTION",
+	"SMS_TRANSPORT", "SMS_PROVIDER_BASE_URL", "SMS_PROVIDER_API_KEY", "SMS_SENDER",
+	"SMS_PROVIDER_PATH", "SMS_PROVIDER_AUTH_HEADER", "SMS_PROVIDER_AUTH_SCHEME",
+	"SMS_PROVIDER_CONTENT_TYPE", "SMS_PROVIDER_BODY_TEMPLATE",
 	"TRUSTED_PROXY_HOPS", "TRUSTED_PROXY_NETWORKS",
 	// SHIP-58's catalogue, for exactly the reason the note above gives: make exports
 	// deploy/.env, so a developer overriding the category list locally would otherwise be

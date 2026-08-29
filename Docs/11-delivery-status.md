@@ -1107,6 +1107,10 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-188d** | M8 | The verification queue, its evidence and its decision — and `Docs/01` §8's "a provider registers, is verified" driven end to end through **two products' own interfaces**: the provider signs in to the mobile API, mints a pre-signed PUT, uploads a JPEG straight to MinIO with the API in neither direction, submits it as a licence; the reviewer opens it in the panel through a URL carrying `X-Amz-Signature`, records Verified with a reason; and `GET /v1/provider/verification` then reports Verified with that reason and a `decided_at`. **`state` is never defaulted here** — `/verifications` with none redirects to `?state=Pending`, so the reviewer's starting point is chosen and visible rather than assumed. **The idempotency key is *held* for a decision rather than minted per click, which is the opposite of `lib/keys.ts`'s rule for sign-in and is what the clause actually requires.** Two clicks with two keys are two actions: one decision plus a refusal. Measured both ways — the same key twice returns the identical body and writes one decision row and one audit entry, while a fresh key for the same decision is refused `409 admin_verification_unchanged`. The key is dropped whenever the outcome or the reason changes, because the middleware fingerprints the body. **Two findings from measurement.** Next serves a dynamic route `Cache-Control: no-cache, must-revalidate`, which permits *storing* and forbids only reuse without revalidation, and carries no `private` — so a screen showing a provider's licence photograph could sit in a shared support machine's disk cache after they signed out. `next.config.ts` now sets `private, no-store` and `Referrer-Policy: same-origin` on every path but the content-hashed build output; it is overridden by the dev server, so it was measured against `next build && next start`. And adding the decision route to *both* credential allow-lists failed the guard: it spends the credential and never names the cookie, because it reads the token through `sessionTokenFrom` — the two lists are not the same list, which is what an allow-list asserted by name is for. **The object key does appear in the HTML** and the honest statement is narrower than the row's wording: it is the path of the pre-signed URL and inseparable from showing the image. What the panel does not do is *keep* either — no browser storage anywhere, `no-store` on the response, and the platform sends no key as a field. The decision form is replaced by the reason it cannot be used for a role without `verifications.decide` (`Docs/07` §3's hide-or-disable), at the cost of a second `GET /v1/admin/me` on that screen alone |
 | **SHIP-192** | M9 | The geocoding transport is named in `deploy/.env` rather than inferred from `SHIPPER_ENV`, and `geocoding.UseStub` is **deleted** rather than deprecated. **The default and the refusal are one decision read from both ends.** Unset is the stub in *every* environment including production, so nothing reaches a metered vendor by inheriting a string it did not recognise — and staging and production then **refuse to boot** until `GEOCODING_TRANSPORT` is named outright, because a deployment that forgot it would answer every address with a stable, plausible, entirely fictional coordinate and look exactly like one that works. **`Docs/09`'s row asked only for the first half**, and the first half alone reverses a position `routes_jobs.go` and the `Geocoding` doc comment both existed to hold — *see below* |
 
+| **SHIP-200** | M9 | A mail catcher in the development stack. `make up` starts Mailpit, `deploy/.env.example` points the stack's SMTP at it, and a verification code is read in a browser at `localhost:8025` rather than out of the API log. **The code default is untouched** — `internal/config` still resolves an unset `EMAIL_TRANSPORT` to the console, so a machine with no `deploy/.env` behaves exactly as it did; what changed is the example file, and the two are not in conflict. **The ports are fixed rather than per-worktree on purpose**, unlike `STORAGE_BUCKET`: a mailbox a person reads is not something two trees collide over the way a listing or a count is. Storage is in-memory, so there is no volume and a restart empties it. **The finding is that pointing the example file anywhere breaks two things that read the console, and neither would have failed at review** — `make verify` greps the server log for `email (console, not sent)`, and `config_test.go`'s `clearEnv` did not carry a single `EMAIL_*` or `SMS_*` key while `make` exports `deploy/.env` wholesale. The harness now pins both transports for its own run, and `clearEnv` carries all twenty-three keys — *see below* |
+
+| **SHIP-201** | M9 | The mail and SMS adapters' documentation says what the packages do. Three files still described the world before SHIP-187a and SHIP-187b, each carrying the same three false statements: that two implementations exist (email has three), that the choice is made in `cmd/api` from `SHIPPER_ENV` (it is `EMAIL_TRANSPORT` and `SMS_TRANSPORT`, in `internal/config`), and that a vendor would be named at SHIP-33 or SHIP-36 — both of which closed without naming one, after which SHIP-187a made naming unnecessary. Each package comment now carries a short note saying the environment **used to** decide, because a deleted function is the first thing a reader who knows the package looks for. **`sms/doc.go` still says two, and that is not the stale claim** — SMS genuinely has two and no third transport a gateway could want, and the file now states it as a complete set rather than a snapshot — *see below* |
+
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
 ### What SHIP-15a built
@@ -16827,6 +16831,87 @@ looking at it.
 `TestGeocodingHTTPRefusesAMissingBaseURL`, `TestGeocodingRefusesAnUnrecognisedTransport`,
 `TestTransportsRefuseEachOthersValues`, and `TestDeploymentGuards`'s two new subtests. `make check`
 green on the branch tip.
+
+### SHIP-200 — the catcher was two points, and the two things it would have broken were the ticket
+
+The development stack ran PostgreSQL, Redis, Kafka and MinIO and no mail server, so a developer
+completing a registration read the verification code out of the API log. That works — the console
+transport prints the whole body precisely so it would — and it is the one step of the customer
+journey a person cannot walk the way a customer walks it, which `Docs/01` §8's demonstration gate
+now requires of the whole path.
+
+Mailpit is one compose service, pinned at `v1.31.0`, with its own `readyz` subcommand as the
+healthcheck so `make up -d --wait` blocks on it like everything else. Its two ports are **fixed
+rather than per-worktree**, which is the clause the row states and is the opposite of the
+`STORAGE_BUCKET` rule beside it: a bucket is asserted on by counts and listings, so two trees
+sharing one is a wrong answer, whereas a mailbox is read by a person and two trees sharing one is
+at worst untidy. Storage is in-memory, so the catcher has no volume — a restart empties it, which
+is the right state for a mailbox whose entire contents are yesterday's test registrations.
+
+**The ticket's real content is what pointing `deploy/.env.example` at the catcher breaks, and both
+would have passed review.** `make` does `-include deploy/.env` followed by a bare `export`, so
+every variable in that file reaches every recipe:
+
+1. **`make verify` reads the verification token out of the server log.**
+   `scripts/verify/40-identity.sh` greps for a record whose `msg` is `email (console, not sent)`,
+   and does the same for the OTP at `sms (console, not sent)`. With the example file naming `smtp`,
+   the registration would be delivered to Mailpit, no such line would ever be written, and the
+   section would fail reporting that no verification email was logged. **This was already a latent
+   break before the catcher existed** — a developer who set `EMAIL_TRANSPORT=http` broke
+   `make verify` and nothing said why. `verify-foundation.sh` now exports `EMAIL_TRANSPORT=console`
+   and `SMS_TRANSPORT=console` once, beside where it sources `deploy/.env`, rather than per launch:
+   five sections start a binary of their own, and a list that has to be repeated is one the sixth
+   forgets.
+
+2. **`config_test.go`'s `clearEnv` carried no `EMAIL_*` or `SMS_*` key at all.** The list already
+   carries `GOODS_CATEGORIES` and the two `RATE_LIMIT_*` scales with a comment explaining exactly
+   this hazard, so this is the third instance of a trap the file itself documents. **Established by
+   mutation rather than by reasoning**: with `EMAIL_TRANSPORT` removed from the list again and a
+   developer's settings exported, five tests fail — including `TestDevelopmentAcceptsTheDefaults`
+   and `TestLoadAppliesDocumentedDefaults`, which is "a fresh clone runs without configuration"
+   failing on a fresh clone. Restored from a copy taken beforehand and confirmed with `git diff`
+   **and** `shasum -c`, per the recipe in `CLAUDE.md`; the `SHASUMS` file was written to disk in the
+   same command as the copy.
+
+**Demonstrated end to end rather than asserted.** `make up` brought the catcher to healthy; the API
+was started with the example file's own SMTP settings; `POST /v1/auth/register` returned an account
+with `email_verified: false`; the message arrived at `localhost:8025` from `no-reply@shipper.com.au`
+with the code legible in the body; `POST /v1/auth/verify-email` with **the code read out of the
+mailbox** returned `email_verified: true`; and the server log contained **zero**
+`email (console, not sent)` records, which is the half that says the code is genuinely no longer
+there to read.
+
+**One thing to know before running it here.** This worktree's stack publishes PostgreSQL on
+**55432**, not 5432 — something else on this machine holds the default — so a hand-started binary
+needs the real port or it fails SASL auth and every endpoint answers 503. Mailpit took 1025 and 8025
+unchallenged, which is the "no port a worktree must vary" clause holding in fact rather than in
+principle.
+
+**Done when:** a registration puts the verification email in a browser-readable mailbox and an unset
+`EMAIL_TRANSPORT` still selects the console — both demonstrated above; `make check` green.
+
+### SHIP-201 — three files describing an adapter that had changed underneath them
+
+`SHIP-187a` made the messaging transport configuration and `SHIP-187b` added SMTP, and three files
+went on describing what the packages did before that. Each carried the same three false statements:
+that two implementations exist (email has three), that the choice is made in `cmd/api` from
+`SHIPPER_ENV` (it is `EMAIL_TRANSPORT` and `SMS_TRANSPORT`, in `internal/config`), and that the
+vendor would be named at SHIP-33 or SHIP-36 (both closed without naming one, and SHIP-187a then made
+naming unnecessary — the path, the credential's header and scheme and the body template are all
+configuration).
+
+`email/doc.go` now lists `console.go`, `provider.go` and `smtp.go` with the setting that picks them,
+and both package comments carry a short note saying the environment used to decide and no longer
+does — because the deleted function is the thing a reader who knows this package will look for
+first. `identity/ports.go` names the three types its `EmailSender` can be satisfied by, and its note
+about the console logging the body in full is kept and pointed at SHIP-200, which is what replaces
+it.
+
+**`sms/doc.go` still says two implementations, and that is not the stale claim.** SMS genuinely has
+`console.go` and `provider.go` and there is no third transport a gateway could want — the file now
+says so as a complete set rather than as a snapshot, so it cannot be read as the formula the other
+two were corrected for. Checked by grep across all three trees: no `SHIPPER_ENV`, no "two
+implementations exist today", no vendor deferred to SHIP-33 or SHIP-36.
 
 ## 4. Partly done — do not treat these as finished
 
