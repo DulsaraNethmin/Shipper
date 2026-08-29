@@ -400,21 +400,49 @@ type Storage struct {
 // filed a request instead. The same wall was hit twice in one wave — see [Pagination] — which is
 // what turned two parked requests into a prep ticket.
 //
-// # Why a missing base URL is not an error
+// # Which implementation is built is [Transport], and no longer the environment
 //
-// Empty means no provider is configured, and cmd/api then builds the console stub in development
-// and nil outside it. Nil is a supported state, not a degraded one: jobs.NewService documents it
-// as "addresses are stored unresolved", and every path copes because Docs/01 §4.4's SHIP-59a
+// It was geocoding.UseStub(env) — development resolved in-process, staging and production called
+// the vendor — and SHIP-192 removed that function. The environment is the wrong thing to read it
+// from, for the same reason SHIP-187a gave for email: a demonstration instance runs hardened and
+// must not spend on a metered API, and a developer checking one real address should not have to
+// claim to be production to do it. Neither case is expressible while the transport is a function
+// of Env.
+//
+// # Why a missing base URL is not an error, and when it becomes one
+//
+// [TransportStub] needs neither base URL nor credential, so both are empty in the ordinary
+// development case and nothing is wrong. Under [TransportHTTP] the base URL is required and
+// validate refuses the startup by name.
+//
+// That refusal is the whole gain. Before this field an unset GEOCODING_BASE_URL in production
+// produced a nil geocoder and one warning in the boot log, and nothing failed until somebody
+// noticed a month of jobs stored with no coordinates at all.
+//
+// Nil is still a supported state rather than a degraded one — jobs.NewService documents it as
+// "addresses are stored unresolved", and every path copes, because Docs/01 §4.4's SHIP-59a
 // requires a failed lookup not to fail the job.
 //
-// Falling back to the stub in staging was considered and rejected. The stub returns stable,
-// plausible, entirely fictional coordinates, and a staging environment quietly full of those is
-// worse than one with no coordinates at all — the first looks like it works.
+// Falling back to the stub outside development is still refused, and this is where that refusal
+// now lives. The stub returns stable, plausible, entirely fictional coordinates, and an
+// environment quietly full of those is worse than one with no coordinates at all — the first
+// looks like it works. A deployment may still choose the stub, but it has to say so.
+//
 // The field names match [Email] and [SMS] deliberately: all three are the same shape of
-// adapter — a base URL, a credential, and an implementation chosen from Env — and naming the
+// adapter — a base URL, a credential, and a transport named in configuration — and naming the
 // third one differently would invite the reader to look for a difference that is not there.
 type Geocoding struct {
-	// ProviderBaseURL is the provider's HTTP endpoint. Empty disables lookup entirely.
+	// Transport is which implementation resolves an address: stub or http (SHIP-192).
+	//
+	// Unset it is [TransportStub], in every environment including production — and staging
+	// and production then refuse to start until it is named outright. The default and the
+	// refusal are one decision read from both ends: nothing reaches a metered vendor by
+	// inheriting a string it did not recognise, and nothing serves fictional coordinates to
+	// real customers because a variable was forgotten.
+	Transport Transport
+
+	// ProviderBaseURL is the provider's HTTP endpoint. Required under [TransportHTTP], and
+	// unused under [TransportStub].
 	ProviderBaseURL string
 
 	// ProviderAPIKey authenticates to it. Empty is allowed even when the base URL is set,
@@ -787,6 +815,17 @@ type SMS struct {
 // development and http everywhere else. Choosing wrongly towards the console costs a
 // developer a puzzled minute; choosing wrongly towards the provider sends real email, and
 // real text messages cost money per send and wake a real handset.
+//
+// # Geocoding shares the type and not the default
+//
+// SHIP-192 brought the third adapter of this shape under the same variable, and it defaults
+// the other way: unset means [TransportStub], in every environment including production. The
+// asymmetry is the metering. An unsent email is noticed by whoever was waiting for it; an
+// address resolved against a vendor nobody chose is noticed on an invoice, and by then it has
+// already been charged for. So the messaging adapters may infer a transport from the
+// environment and geocoding may not — which is why staging and production have to name theirs
+// outright rather than inherit one. That rule is with the other deployment-safety rules at the
+// foot of validate.
 type Transport string
 
 const (
@@ -798,6 +837,16 @@ const (
 
 	// TransportSMTP hands the message to a mail server. Email only.
 	TransportSMTP Transport = "smtp"
+
+	// TransportStub answers in-process and reaches no vendor. Geocoding only.
+	//
+	// It is not [TransportConsole] under another name, and the difference is the reason
+	// this is a separate value rather than a reuse. The console transport declines to act
+	// and says so in the log; the stub *answers*, with a coordinate that is stable,
+	// plausible, inside Australia and entirely fictional. A deployment running it is not
+	// one that sends nothing — it is one whose jobs carry coordinates that mean nothing,
+	// and that is far harder to notice than silence.
+	TransportStub Transport = "stub"
 )
 
 // Push configures the Firebase Cloud Messaging adapter (SHIP-139), consumed by cmd/notifier.
@@ -1223,6 +1272,7 @@ func Load() (*Config, error) {
 			Credential: l.str("PUSH_CREDENTIAL", ""),
 		},
 		Geocoding: Geocoding{
+			Transport:       Transport(l.str("GEOCODING_TRANSPORT", "")),
 			ProviderBaseURL: l.str("GEOCODING_BASE_URL", ""),
 			ProviderAPIKey:  l.str("GEOCODING_API_KEY", ""),
 		},
@@ -1326,6 +1376,21 @@ func resolveTransports(cfg *Config) {
 	}
 	if cfg.SMS.Transport == "" {
 		cfg.SMS.Transport = def
+	}
+
+	// Geocoding does not read def, and the difference is deliberate rather than an omission.
+	//
+	// A messaging transport inferred wrongly is loud in one direction and free in the other:
+	// the console keeps a message from arriving, which whoever was waiting for it reports. A
+	// geocoding transport inferred wrongly towards the vendor is silent and metered — it
+	// resolves every address correctly and bills for it, so the first report is an invoice.
+	//
+	// So the stub is the default everywhere, and the deployment-safety rule in validate then
+	// refuses to let staging or production actually run on it without saying so. Defaulting
+	// safe and requiring a deliberate choice are not alternatives here; the second is what
+	// stops the first from quietly serving fictional coordinates to real customers.
+	if cfg.Geocoding.Transport == "" {
+		cfg.Geocoding.Transport = TransportStub
 	}
 }
 
@@ -2069,6 +2134,9 @@ func (l *loader) validate(cfg *Config) {
 	// swallow it in one that had asked for a provider — and both are silent.
 	switch cfg.Email.Transport {
 	case TransportConsole, TransportHTTP, TransportSMTP:
+	case TransportStub:
+		l.errf("EMAIL_TRANSPORT: stub is a geocoding transport; " +
+			"want console to log the message and send nothing")
 	default:
 		l.errf("EMAIL_TRANSPORT: %q is not a transport (want console, http, or smtp)",
 			cfg.Email.Transport)
@@ -2078,8 +2146,31 @@ func (l *loader) validate(cfg *Config) {
 	case TransportConsole, TransportHTTP:
 	case TransportSMTP:
 		l.errf("SMS_TRANSPORT: smtp is an email transport; want console or http")
+	case TransportStub:
+		l.errf("SMS_TRANSPORT: stub is a geocoding transport; " +
+			"want console to log the message and send nothing")
 	default:
 		l.errf("SMS_TRANSPORT: %q is not a transport (want console or http)", cfg.SMS.Transport)
+	}
+
+	// The geocoding transport, on the same terms and with one value in common with neither of
+	// the two above: an address is either resolved in-process or fetched, and there is no
+	// third thing to do with one.
+	switch cfg.Geocoding.Transport {
+	case TransportStub:
+	case TransportHTTP:
+		// Under the stub this is unset and correct. Under http it is where the request
+		// goes, and without it cmd/api built nil and logged a warning — which is a
+		// deployment silently storing every address unresolved, reported once at boot.
+		if cfg.Geocoding.ProviderBaseURL == "" {
+			l.errf("GEOCODING_BASE_URL: must be set when GEOCODING_TRANSPORT is http")
+		}
+	case TransportConsole, TransportSMTP:
+		l.errf("GEOCODING_TRANSPORT: %q is a messaging transport; want stub or http",
+			cfg.Geocoding.Transport)
+	default:
+		l.errf("GEOCODING_TRANSPORT: %q is not a transport (want stub or http)",
+			cfg.Geocoding.Transport)
 	}
 
 	// The smtp transport needs a host, and the failure without this is a panic out of
@@ -2090,12 +2181,13 @@ func (l *loader) validate(cfg *Config) {
 	}
 
 	// A credential with nowhere to go is the shape of a half-finished configuration, and the
-	// symptom is silence: cmd/api builds no geocoder, addresses are stored unresolved, and the
-	// key sitting in the environment suggests the opposite. The reverse — a base URL with no
-	// key — is legitimate and not checked, because a self-hosted geocoder needs no credential.
+	// symptom is silence: nothing presents the key, addresses are resolved without it or not
+	// at all, and the key sitting in the environment suggests the opposite. The reverse — a
+	// base URL with no key — is legitimate and not checked, because a self-hosted geocoder
+	// needs no credential.
 	if cfg.Geocoding.ProviderAPIKey != "" && cfg.Geocoding.ProviderBaseURL == "" {
 		l.errf("GEOCODING_API_KEY is set but GEOCODING_BASE_URL is not; " +
-			"no geocoder is built, so addresses would be stored unresolved")
+			"there is nowhere to present the credential")
 	}
 
 	// Everything below this point is a deployment-safety rule. Development is exempt by
@@ -2109,6 +2201,24 @@ func (l *loader) validate(cfg *Config) {
 			l.errf("%s: must be set explicitly when SHIPPER_ENV is %s — "+
 				"its default embeds a local development credential", key, cfg.Env)
 		}
+	}
+
+	// The geocoding transport must be a decision somebody recorded, not one inherited
+	// (SHIP-192).
+	//
+	// Unset resolves to the stub in every environment, which is the safe default for the
+	// money and the wrong one for the data: a production deployment that forgot the variable
+	// would answer every address with a stable, plausible, entirely fictional coordinate, and
+	// look exactly like one that was working. Refusing the boot is the only report that
+	// arrives before the jobs do.
+	//
+	// It is checked here rather than beside the transport switch above because it is a
+	// deployment rule and not a parse rule — GEOCODING_TRANSPORT=stub in production is
+	// permitted, and is the answer a demonstration instance gives.
+	if l.defaulted["GEOCODING_TRANSPORT"] {
+		l.errf("GEOCODING_TRANSPORT: must be set explicitly when SHIPPER_ENV is %s — "+
+			"unset it is stub, which answers every address with a fictional coordinate",
+			cfg.Env)
 	}
 
 	// Text logs outside development mean the log aggregator receives unparseable lines,

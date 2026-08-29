@@ -4,9 +4,21 @@
 // Two implementations exist today (Docs/06 §4.1):
 //
 //	provider.go   the maps provider
-//	stub.go       used in tests, and where a build must not make a network call
+//	stub.go       resolves in-process — tests, and any build that must not reach the network
 //
-// SHIP-60.
+// Which one is constructed is GEOCODING_TRANSPORT, read in cmd/api. Nothing in this package
+// knows or asks which of the two it is (SHIP-60, SHIP-192).
+//
+// # The environment used to decide, and no longer does
+//
+// This package exported UseStub(env) until SHIP-192: development resolved in-process, staging and
+// production called the vendor. It answered two cases and could not express a third — an instance
+// hardened under every deployment-safety rule that must still not spend on a metered API, which is
+// what the demonstration environment is.
+//
+// Unset, the transport is the stub in every environment including production, and staging and
+// production refuse to start until it is named outright. Both halves are in internal/config; the
+// bias and the refusal are one decision, and neither belongs to an adapter.
 //
 // # Why a stub is worth having
 //
@@ -37,9 +49,11 @@
 // GET under a configured base URL, with a bearer credential — taking base URL and key as
 // its own [Options] rather than reading internal/config.
 //
-// The vendor is named at SHIP-60, the address value object, which is the first ticket that
-// resolves anything real. Docs/11 §7 records that as decided before wave 1 rather than
-// deferred by accident. Naming it should change provider.go and nothing else.
+// The vendor is named at SHIP-193, which adds the named adapter beside this one and leaves
+// provider.go byte-for-byte unchanged — the generic contract is not bent to fit one vendor.
+// SHIP-60 was where this was expected to happen and it closed without naming anything, which
+// cost nothing: the seam had existed since wave 1, so the wait was free. Docs/11 §7 records that
+// as decided rather than deferred by accident.
 //
 // # Why the method returns five values rather than a result struct
 //

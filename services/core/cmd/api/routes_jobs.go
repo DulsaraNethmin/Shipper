@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/DulsaraNethmin/Shipper/services/core/internal/config"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/db"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/events"
 	"github.com/DulsaraNethmin/Shipper/services/core/internal/jobs"
@@ -220,48 +221,68 @@ func goodsCatalogue(d Deps) jobs.Catalogue {
 // in its own ports.go and imports nothing from internal/platform, and the adapter knows nothing
 // about jobs. Go satisfies the interface structurally, and the two meet here (Docs/06 §4.1).
 //
-// # Development uses the stub; everything else uses what is configured
+// # The transport is named in configuration, not inferred from the environment
 //
-// SHIP-15g added GEOCODING_BASE_URL and GEOCODING_API_KEY, which SHIP-60 needed and could not add
-// from a domain branch. So this now builds the real provider when one is configured, and the
-// unconfigured case is the only one that still ends in nil.
+// This read geocoding.UseStub(d.Config.Env) until SHIP-192, which deleted that function. The
+// environment answered two cases well and a third one not at all: a demonstration instance runs
+// hardened, under every deployment-safety rule, and must not spend on a metered API — and there
+// was no way to say so while "production" meant "call the vendor".
 //
-// Falling back to geocoding.Stub outside development remains refused, and the reason has not
-// changed: the stub writes coordinates that are stable, plausible, inside Australia, and entirely
-// fictional, and a fictional coordinate on a real job is far harder to notice than a missing one.
+// So GEOCODING_TRANSPORT decides, config.validate has already refused any value that is not stub
+// or http, and this switch has nothing left to judge. What it still owns is the case configuration
+// cannot see: a provider that will not build from settings that parsed.
+//
+// Note that nothing here reads d.Config.Env any more. That is the ticket, stated as an absence.
+//
+// # Why a provider that fails to build is a warning rather than a panic
 //
 // A nil geocoder stores the address exactly as the customer typed it, with no coordinate. Every
 // path through the domain copes, because SHIP-59a requires an unrecognised address not to fail the
-// job — which is also why a provider that fails to build is a warning rather than a panic: an
-// unbootable API in staging would be a regression in a deployment that works today, over a feature
-// it does not yet have.
+// job. An unbootable API would be a regression in a deployment that works today, over a feature it
+// does not yet have.
 //
-// The log line is deliberately at startup rather than per request: it is a fact about the
+// The missing-base-URL case that used to end here is now refused at startup by name, because a
+// deployment storing every address unresolved on the strength of one boot-log warning is the
+// failure that warning was supposed to prevent and did not.
+//
+// The log lines are deliberately at startup rather than per request: they are facts about the
 // deployment, and one line in the boot log is findable where one line per created job is noise.
 func newGeocoder(d Deps) jobs.Geocoder {
-	if geocoding.UseStub(d.Config.Env) {
+	switch d.Config.Geocoding.Transport {
+	case config.TransportStub:
+		// Said out loud on every boot that runs it, including in development. The stub is
+		// the one adapter in the tree whose output is indistinguishable from a working one
+		// — plausible coordinates, inside Australia, entirely invented — so the boot log is
+		// the only place a reader can find out which they are looking at.
+		d.Logger.Info("geocoding resolves in-process; every coordinate stored is fictional",
+			"transport", string(config.TransportStub))
 		return geocoding.NewStub()
-	}
 
-	if d.Config.Geocoding.ProviderBaseURL == "" {
-		d.Logger.Warn("no geocoding provider is configured; job addresses will be stored unresolved",
-			"env", string(d.Config.Env),
-			"needs", "GEOCODING_BASE_URL in deploy/.env")
+	case config.TransportHTTP:
+		provider, err := geocoding.NewProvider(geocoding.Options{
+			BaseURL: d.Config.Geocoding.ProviderBaseURL,
+			APIKey:  d.Config.Geocoding.ProviderAPIKey,
+		})
+		if err != nil {
+			d.Logger.Warn("the geocoding provider could not be built; job addresses will be stored unresolved",
+				"transport", string(config.TransportHTTP), "error", err.Error())
+			return nil
+		}
+
+		d.Logger.Info("geocoding provider configured",
+			"transport", string(config.TransportHTTP),
+			"base_url", d.Config.Geocoding.ProviderBaseURL)
+		return provider
+
+	default:
+		// Unreachable through Load, which refuses anything else by name. It is here because
+		// a Deps assembled in a test does not go through Load, and a zero-valued transport
+		// silently returning the stub is how a test comes to assert against fictional
+		// coordinates it never asked for.
+		d.Logger.Warn("no geocoding transport; job addresses will be stored unresolved",
+			"transport", string(d.Config.Geocoding.Transport))
 		return nil
 	}
-
-	provider, err := geocoding.NewProvider(geocoding.Options{
-		BaseURL: d.Config.Geocoding.ProviderBaseURL,
-		APIKey:  d.Config.Geocoding.ProviderAPIKey,
-	})
-	if err != nil {
-		d.Logger.Warn("the geocoding provider could not be built; job addresses will be stored unresolved",
-			"env", string(d.Config.Env), "error", err.Error())
-		return nil
-	}
-
-	d.Logger.Info("geocoding provider configured", "base_url", d.Config.Geocoding.ProviderBaseURL)
-	return provider
 }
 
 // jobBidders implements jobs.Bidders by asking whether this provider has ever offered on this job

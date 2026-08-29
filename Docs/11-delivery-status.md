@@ -1105,6 +1105,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-188b** | M8 | The panel gets its two searches. All four account terms answer — `q` matches address, name and phone in one predicate, and the standing is a `<select>` because the platform refuses an unrecognised one rather than ignoring it. **They are server components, not route handlers behind a client fetch, and `Docs/09`'s wording was corrected rather than the contradiction resolved in code.** The row said "route handler"; SHIP-188a had already established one file per endpoint, because `lib/administrator.ts` resolves the session in a render and a route handler for it would be a browser-reachable endpoint for nobody to call. A route handler per search would add two JSON proxies over privileged reads so a client could hold a result set; rendering on the server adds none, and the term, filters and cursor live in the URL — where a client-side slice cannot, which is the clause before it satisfied as a property rather than a claim. **Paging is the platform's own cursor, measured**: `/users` page 1 is 20 rows with a `next_cursor` href, page 2 is 20 more, and the two share no identifier. **A refusal renders and no table is drawn at all**, which is the clause the row names — `status=nonsense` gives `validation_failed` naming the field and its three values, and the permission case was proved **by mutation**, because every role holds `users.read` and no session could otherwise be short it: removing `PermissionUsersRead` from `RoleSupport` and rebuilding, a support administrator gets `admin_permission_denied` with no table and no "No account matched" anywhere in the HTML. Restored from a copy taken beforehand, confirmed by `git diff` **and** `shasum -c`. **The refusal card renders `error.details`, and the first version did not** — a mistyped standing produced "Some of the details you entered need attention" naming neither the field nor its values, so the only way forward was to guess. **`contracts/statuses.yaml` gains its second TypeScript output** rather than the panel gaining a hand-written copy of twelve strings; the generator held one path and now holds a list, with three new validation cases. **The credential is read in exactly one file** (`lib/credential.ts`, handing back a `Headers` rather than a string), so five screens did not become five entries on each of `surface.test.ts`'s two credential allow-lists — a list that grows with the application has stopped guarding and started registering. The budget invariant holds on the screen as well as the wire: seeded jobs carry 1234.56, 890.00, 2400.00 and 150.00 and none appears in any rendered job screen |
 | **SHIP-188c** | M8 | A job opens with its bids, its status history and its audit trail, and `Docs/01` §8's "an administrator finds the job and reads its audit trail" runs through the product with no database access at any point. `GET /v1/admin/jobs/{id}` answers all three in one snapshot, so the screen cannot show an `Awarded` job beside a bid list with nothing accepted. **The trail is a component rather than a section, because the row asks two things of it and the second cannot be job-scoped**: `verifications.go` records `verification.decided` against `AuditTargetUser`, so a decision is done to a *provider* and no job's trail could ever contain one — confirmed on the running platform, where every existing `verification.decided` entry carries target type `user`. So it is embedded in the job screen filtered to that job, and again at `/audit` unfiltered, which is SHIP-165's viewer and the `audit.read` section the navigation has listed since SHIP-22. One file names `/v1/admin/audit` and two screens read it. **The `/audit` action filter is a text box on purpose**: the eleven action names live in `internal/admin/audit.go` and in no shared contract — `contracts/statuses.yaml` is scoped to *status* enumerations and says so — and a `<select>` would be a hand-written second copy that falls behind the day somebody adds a twelfth. A mistake costs one refusal, which lists every valid action. **This is the only screen where anything but `platform()` reaches a `/v1/` template**, so the segment is checked before it is interpolated and `surface.test.ts` spells the hole in its allow-list — `/v1/admin/jobs/${id}` — so a path that started being built from something shows as a changed expectation rather than passing. Demonstrated on a job unpublished through the real endpoint so the audit entry is genuine rather than an `INSERT`; a segment that is not an identifier is a 404 with no upstream request at all, and an identifier naming no job renders the platform's `not_found` |
 | **SHIP-188d** | M8 | The verification queue, its evidence and its decision — and `Docs/01` §8's "a provider registers, is verified" driven end to end through **two products' own interfaces**: the provider signs in to the mobile API, mints a pre-signed PUT, uploads a JPEG straight to MinIO with the API in neither direction, submits it as a licence; the reviewer opens it in the panel through a URL carrying `X-Amz-Signature`, records Verified with a reason; and `GET /v1/provider/verification` then reports Verified with that reason and a `decided_at`. **`state` is never defaulted here** — `/verifications` with none redirects to `?state=Pending`, so the reviewer's starting point is chosen and visible rather than assumed. **The idempotency key is *held* for a decision rather than minted per click, which is the opposite of `lib/keys.ts`'s rule for sign-in and is what the clause actually requires.** Two clicks with two keys are two actions: one decision plus a refusal. Measured both ways — the same key twice returns the identical body and writes one decision row and one audit entry, while a fresh key for the same decision is refused `409 admin_verification_unchanged`. The key is dropped whenever the outcome or the reason changes, because the middleware fingerprints the body. **Two findings from measurement.** Next serves a dynamic route `Cache-Control: no-cache, must-revalidate`, which permits *storing* and forbids only reuse without revalidation, and carries no `private` — so a screen showing a provider's licence photograph could sit in a shared support machine's disk cache after they signed out. `next.config.ts` now sets `private, no-store` and `Referrer-Policy: same-origin` on every path but the content-hashed build output; it is overridden by the dev server, so it was measured against `next build && next start`. And adding the decision route to *both* credential allow-lists failed the guard: it spends the credential and never names the cookie, because it reads the token through `sessionTokenFrom` — the two lists are not the same list, which is what an allow-list asserted by name is for. **The object key does appear in the HTML** and the honest statement is narrower than the row's wording: it is the path of the pre-signed URL and inseparable from showing the image. What the panel does not do is *keep* either — no browser storage anywhere, `no-store` on the response, and the platform sends no key as a field. The decision form is replaced by the reason it cannot be used for a role without `verifications.decide` (`Docs/07` §3's hide-or-disable), at the cost of a second `GET /v1/admin/me` on that screen alone |
+| **SHIP-192** | M9 | The geocoding transport is named in `deploy/.env` rather than inferred from `SHIPPER_ENV`, and `geocoding.UseStub` is **deleted** rather than deprecated. **The default and the refusal are one decision read from both ends.** Unset is the stub in *every* environment including production, so nothing reaches a metered vendor by inheriting a string it did not recognise — and staging and production then **refuse to boot** until `GEOCODING_TRANSPORT` is named outright, because a deployment that forgot it would answer every address with a stable, plausible, entirely fictional coordinate and look exactly like one that works. **`Docs/09`'s row asked only for the first half**, and the first half alone reverses a position `routes_jobs.go` and the `Geocoding` doc comment both existed to hold — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -16736,6 +16737,86 @@ exemption list is the work item.
 | SHIP-17b | `cmd/api/contract_surface_test.go` — the fixture world (customer, provider, administrator and driver credentials; job, bid, two vehicles, a signed-in device and a signed upload key, seeded through the API wherever the API can do it), `contractCases` at 63 routes, `contractUnreached` at 23 with a reason each, `TestEveryRouteIsDrivenOrNamed`, `TestResponsesMatchTheContract` rewritten to drive the registry, and `TestRequestBodiesAreClosed` in its two-assertion form. `exercisable()` deleted from `contract_test.go`, and that file's history paragraph corrected to describe what replaced it |
 | SHIP-17c | `cmd/api/contract_surface_test.go` — a job-state builder (`contractJobLadder` walked through `jobs.Service.Transition`, one transaction per rung, because 000402 refuses a status set any other way), `makeProviderEligible` for fleet's four-part bidding predicate, `submitBid`, `awardBid`, `assignDriver` (which rebinds the driver token to the assignment the response carries), `deliveryUnderWay` and `raiseDispute`; a `setup` hook on `contractCase`. `contractCases` 63 → 81 routes, `contractUnreached` 23 → 5, each remaining one named with a reason that is not a job status |
 | SHIP-17d | `cmd/api/contract_surface_test.go` — the last five routes. `contractStore`, an object store served by `httptest` and wired into `Deps.Config.Storage.Endpoint` **before** `newRouter`, because `cmd/api` builds its signers during attach and a `setup` hook runs after; `suspensionAwaitingApproval` (files as the world's owner, creates and signs in a second **moderator** — `support` lacks `users.restrict` — and reassigns `adminToken`); `seedEmailVerificationToken` (plain unkeyed SHA-256, row `email` citext and equal to `users.email`) and `seedPhoneCode` (argon2id, so the code is chosen and hashed, never read back); `contractCustomerPhone` named because `users.phone` and `phone_otps.phone` are one fact twice. An `assert` hook on `contractCase` for a route whose status does not prove the handler found anything, used once. **`contractCases` 81 → 86, `contractUnreached` 5 → 0** |
+
+### SHIP-192 — the transport is a decision somebody records, and the safe default needed a second half
+
+`geocoding.UseStub(env)` answered two questions well and a third one not at all. Development resolved
+in-process; staging and production called the vendor. What it could not express is the case the
+demonstration environment is: an instance hardened in every other respect, running under every
+deployment-safety rule with real signing keys, that must still not spend on a metered API. SHIP-187a
+had already made exactly this argument for email and moved the messaging transports into
+configuration. This is the same move for the third adapter of the same shape, and the function is
+deleted rather than left beside the setting — two places deciding one thing is how they come to
+disagree.
+
+**The ticket's *Done when* asked for a default this repository had twice written down as forbidden,
+and the resolution is the finding.** The row says an unset `GEOCODING_TRANSPORT` selects the stub in
+every environment including production. Its stated reason is sound and is about money: nothing should
+start spending on a metered API by inheriting a string. But `newGeocoder` carried the opposite
+position in a comment — *"falling back to `geocoding.Stub` outside development remains refused … a
+fictional coordinate on a real job is far harder to notice than a missing one"* — and the `Geocoding`
+doc comment carried it again, in nearly the same words. Taken literally the row reverses both, and a
+production deployment that forgot one variable would store a stable, plausible, entirely fictional
+coordinate for every address it was given.
+
+**Neither document is wrong; each states one half.** The default protects the money and the refusal
+protects the data, and they compose:
+
+    GEOCODING_TRANSPORT unset
+      development   → stub
+      staging/prod  → refused at startup, naming the variable
+    GEOCODING_TRANSPORT=stub → stub, in any environment — a choice, and a supported one
+    GEOCODING_TRANSPORT=http → requires GEOCODING_BASE_URL, refused by name without it
+
+So no environment inherits a vendor, and no environment inherits a fiction either. A demonstration
+instance still runs the stub in production; it says `stub` and means it. `CLAUDE.md` forbids
+resolving a contradiction between a document and the code silently, and this was put to the
+repository owner as a decision before any of it was written — the synthesis above is the answer that
+came back, and `Docs/09`'s row is left as it stands because both of its clauses are now true.
+
+**`GEOCODING_TRANSPORT=google` is refused, and the row's example is what SHIP-193 will make work.**
+The row illustrates the startup refusal with `google` and no key. There is no google adapter until
+SHIP-193, which is itself blocked on X-12, so `google` is refused here as an unrecognised transport —
+at startup, naming the variable, and without degrading to a fictional coordinate, which is what the
+clause is protecting. Accepting a value nothing can construct would have put the validator and the
+composition root into disagreement about which transports exist, and that is the shape SHIP-193 has
+to add a file to rather than unpick.
+
+**`stub` is a fourth `Transport` value and not a reuse of `console`, and the distinction is worth the
+constant.** The console transport declines to act and says so in the log. The stub *answers* — and
+its answers are indistinguishable in shape from a working vendor's. A deployment on the console is
+one that sends nothing, which somebody reports; a deployment on the stub is one whose jobs carry
+coordinates that mean nothing, which nobody does. Because the three adapters now share one type, a
+value valid for one is syntactically valid for all, so each refuses the others by name —
+`EMAIL_TRANSPORT=stub` is told stub is a geocoding transport and that it wanted `console`, the same
+shape as SMS refusing `smtp` since SHIP-187a. `newGeocoder` logs the stub on every boot that runs it,
+including in development, because the boot log is the only place a reader can find out which of the
+two they are looking at.
+
+**Two things moved rather than changed.** SHIP-59a's "provider-backed in staging, stub in tests" was
+asserted in `geocoding/stub_test.go` against `UseStub`; the rule is now `GEOCODING_TRANSPORT` and the
+test is in `internal/config`, where the rule lives — the same argument SHIP-187a's comment makes for
+the messaging transports. And the "key with no base URL" refusal kept its variable name and lost its
+reason: it said *no geocoder is built*, which stopped being true the moment the stub became the
+default.
+
+**`newGeocoder` no longer reads `d.Config.Env` at all**, which is the ticket stated as an absence. Its
+`default` branch returns nil rather than the stub, deliberately: `Load` refuses every other value, so
+the branch is unreachable in a running service and exists only for a `Deps` assembled in a test — and
+a zero-valued transport quietly returning the stub is how a test comes to assert against fictional
+coordinates it never asked for.
+
+**Two existing tests had to name a transport, and finding them is the demonstration.**
+`TestLoadReadsEveryValueFromTheEnvironment` and `TestTransportCanBeChosenAgainstTheEnvironment` both
+load a staging configuration and neither set the variable, so both failed on the new rule with the
+message a forgetful deployment would get. That is the guard working before it was asked to: the
+second of those tests is the demonstration instance, and `stub` is the honest answer for it.
+
+**Done when:** `GEOCODING_TRANSPORT` selects the implementation with no code change and
+`geocoding.UseStub` no longer exists — verified by `TestGeocodingDefaultsToTheStubInEveryEnvironment`,
+`TestGeocodingHTTPRefusesAMissingBaseURL`, `TestGeocodingRefusesAnUnrecognisedTransport`,
+`TestTransportsRefuseEachOthersValues`, and `TestDeploymentGuards`'s two new subtests. `make check`
+green on the branch tip.
 
 ## 4. Partly done — do not treat these as finished
 
