@@ -178,9 +178,12 @@ printf '  remaining %d tickets, %d points\n\n' \
 # heading on its own, so a milestone added to Docs/09 is counted in the totals immediately and is
 # invisible here until its name is added below. That asymmetry is the failure mode — the headline
 # would move while the breakdown silently omitted the rows that moved it. M8 was added with the
-# demonstration track; whoever adds M9 adds it here in the same change.
+# demonstration track and M9 with maps and mail, each in the same change as its rows; whoever adds
+# M10 does the same. **The list is the only place a milestone must be named by hand**, so the check
+# is one line: `make status` must print one milestone row per `## M` heading in Docs/09, plus one for
+# Track X, which has a `## Track X` heading and is counted here as `X`.
 printf '  %sby milestone%s\n' "$bold" "$off"
-for m in X M0 M1 M2 M3 M4 M5 M6 M7 M8; do
+for m in X M0 M1 M2 M3 M4 M5 M6 M7 M8 M9; do
     m_total=$(awk -F'\t' -v m="$m" '$3 == m {n++} END {print n+0}' <<<"$backlog")
     [[ "$m_total" -gt 0 ]] || continue
     m_done=0
