@@ -6,10 +6,18 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**249 tickets, 776 points.** Counted from the rows on 2026-08-29, on a branch whose base is
-`develop` at `f65cf7b`. The previous figure — 248 and 774 — was correct for the tree it was written
-on; this pass adds **X-11**, the domain name and the DNS records the demonstration environment
-resolves at, which takes Track X to eleven rows and thirty-one points.
+**265 tickets, 831 points.** Counted from the rows on 2026-08-29, on a branch whose base is
+`develop` at `806b933`. The previous figure — 249 and 776 — was correct for the tree it was written
+on; this pass adds **four M8 rows** that build the admin panel, **X-12** for the maps account the
+plan has always assumed, and **M9** — eleven rows covering map-based locations and readable mail.
+
+**Track X's `Size:` line was already wrong when this pass opened, and that is the more useful
+finding.** It read ten rows and twenty-nine points against a table of eleven worth thirty-one: X-11
+was added at `9dc4aad`, the milestone table and both headline totals were recounted, and the Size
+line under the heading was not. `Docs/11` §1 had it right, so the two documents disagreed for one
+commit. **This is exactly the drift the enumeration below was rewritten to prevent, recurring on the
+very row whose pass rewrote it** — which is the argument for recounting all eight figures
+mechanically rather than editing the ones a change appears to touch.
 
 **Both rows were written because a deployment could not be built without them, which is the same
 way X-10 was found.** Attempting SHIP-188 established by running it that the API refuses to start
@@ -73,7 +81,7 @@ whenever a row is added rather than left for a later pass to reconcile.
 
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
-| **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 11 | 31 |
+| **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 12 | 34 |
 | **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 41 | 117 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 29 | 83 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 28 | 84 |
@@ -82,15 +90,16 @@ whenever a row is added rather than left for a later pass to reconcile.
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 14 | 48 |
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 22 | 69 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 24 | 72 |
-| **M8** — Demonstration | The marketplace runs at a stable address and a buyer can drive the whole journey unaided. | 8 | 27 |
-| | | **249** | **776** |
+| **M8** — Demonstration | The marketplace runs at a stable address and a buyer can drive the whole journey unaided. | 12 | 44 |
+| **M9** — Maps and mail | A customer drops a pin where the goods actually are, and every message the platform sends can be opened rather than inferred from a log. | 11 | 35 |
+| | | **265** | **831** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
 ## Track X — External dependencies
 
 **Goal:** Unblock everything that depends on a third party. None of this is code; all of it is slow.  
-**Size:** 10 tickets, 29 points
+**Size:** 12 tickets, 34 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -105,6 +114,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | X-9 | Finalise the prohibited-goods list | 3 | Category list approved and ready to load as reference data | X-4 |
 | X-10 | Create the Firebase project and issue its push credentials | 3 | A Firebase project exists; a service-account key is in the CI secret store and in no commit; `google-services.json` and `GoogleService-Info.plist` are available to the mobile build; and a push sent with the platform's own credential arrives on a real handset | — |
 | X-11 | Register the demonstration hostname and point its records at the host | 2 | Three names — the API, the object store and the mailbox — resolve to the demonstration host's public IPv4, and ports 80 and 443 reach it from the public internet | — |
+| X-12 | Create the maps project and issue its API keys | 3 | A cloud project exists with the Android and iOS map SDKs, the geocoding API and the places API enabled; a billing account is attached with a budget alert set, because these are metered and a runaway client is a bill rather than an error; **two** keys exist — one restricted to the Android signing certificate and the iOS bundle identifier for map tiles, one restricted by server address for the platform's own lookups — and neither is in a commit; and a request from the server key returns a coordinate for a real Australian address, while the same key used from a browser is refused | — |
 
 **X-10 was written at the wave-11 reconciliation, eleven waves after the work behind it started, and the reason it stayed invisible is worth more than the row.** `Docs/11` §5 lists only work blocked on a Track-X ticket, and **this was blocked on nothing** — there was no row to be blocked on. So SHIP-139 built the Firebase adapter against a fake FCM server, SHIP-143 shipped a `PushTokenSource` seam with a test asserting the absence, both said in their own write-ups that no project exists, and neither could do anything about it. **A prerequisite the backlog assumed and never wrote down is invisible to every instrument here**: `make status` counts rows, `make verify` exercises endpoints, and neither can report a thing that is missing from the plan itself. It is the same shape as the SHIP-153 gap the wave-10 reconciliation found, and the same answer — write the row.
 
@@ -113,6 +123,12 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 **It depends on nothing and can be done this week, which is the operationally important half.** Creating the project, downloading the two client configuration files and issuing a service-account key need no third-party approval and no enrolment. **The one part that does wait is the iOS leg**: FCM reaches an iPhone through APNs, which needs an authentication key from the Apple Developer Program, so that half arrives with X-2. Split the ticket if the Android leg is wanted sooner; do not let the iOS half hold the project.
 
 **Four rows take the dependency and a fifth deliberately does not.** SHIP-144 and SHIP-145 are open and take it in the column below, which is what makes them stop reading as startable. SHIP-139 and SHIP-143 are **done in reduced form** and carry the gap in `Docs/11` §4 instead, with X-10 as the named owner — a done ticket with an unmet dependency in this column would misreport the graph, and §4 is the instrument for a shipped ticket whose *Done when* is partly met. **SHIP-140 takes neither**, and that is measured rather than assumed: its *Done when* is "tokens bind to a device session and clear on sign-out", a push token is an opaque string to the platform, and `make verify` demonstrates the whole of it today.
+
+**X-12 is the fourth instance of the shape X-10 named, and the first found by reading the plan rather than by running it.** `internal/platform/geocoding/provider.go` has spoken a generic HTTP contract since SHIP-15g, `GEOCODING_BASE_URL` and `GEOCODING_API_KEY` are documented in `deploy/.env.example`, and **no row in this file ever asked anybody to obtain one.** The difference from X-10 and X-11 is the reason it took four instances to see: those two announced themselves by failing — a push that could not be sent, a harness that "exits 1 at the hostname because no DNS name exists yet". `geocoding.UseStub` returns true for every environment but staging and production, so this one never failed at all. Every locally created job resolves to a deterministic fiction hashed onto Australia's bounding box: stable, plausible, inside the country and entirely made up. A Melbourne address resolves to the outback and nothing reports it. **A prerequisite that degrades into a working fiction is worse than one that degrades into an error**, because `make status` counts rows and `make verify` exercises endpoints, and a fiction satisfies both.
+
+**It depends on nothing and needs no third-party approval — only a card.** Unlike X-10 there is no half that waits on Apple: restricting a key to an iOS bundle identifier needs the identifier, not the enrolment, and `apps/mobile/ios/Runner` already has one. What it needs that no earlier X row did is **a billing account** — the maps platform will not serve a tile without one, which makes this the first Track X row carrying a recurring cost rather than a one-off approval. That is why the budget alert is in the criterion rather than in a note beside it.
+
+**Two keys rather than one, and it is not defence in depth.** A key that renders map tiles must ship inside the application binary — there is no way to draw a tile without it — so it is restricted by signing certificate and bundle identifier and is *expected* to be extractable. A key that geocodes and autocompletes lives only in `deploy/.env`, is restricted by server address, and is never sent to a device. One key doing both would be an extractable credential with the platform's own metered quota behind it, which is a bill rather than a leak and is worse for being neither obviously.
 
 ## M0 — Foundation
 
@@ -509,7 +525,7 @@ What does work is an endpoint the app reads **while it still has signal** and ke
 ## M8 — Demonstration
 
 **Goal:** The marketplace runs at a stable address and a buyer can drive the whole journey unaided.  
-**Size:** 8 tickets, 27 points
+**Size:** 12 tickets, 44 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -518,7 +534,11 @@ What does work is an endpoint the app reads **while it still has signal** and ke
 | SHIP-187a | Messaging vendor as configuration | 5 | An email or SMS vendor differing in path, credential header and body shape is reachable by configuration alone, and the transport is chosen by setting rather than by environment | SHIP-32, SHIP-35 |
 | SHIP-187b | SMTP email transport | 3 | A message sent over SMTP is accepted by a mail server with its headers and body intact, and a credential is refused over an unencrypted connection | SHIP-187a |
 | SHIP-188 | Demonstration environment | 5 | The API answers /health over HTTPS at a stable hostname, with migrations and the topic set applied by the same deployment | SHIP-187, SHIP-187b, X-11 |
-| SHIP-189 | Deploy the admin panel and the driver portal | 2 | Both are reachable over HTTPS and talk to the demonstration API; a driver link opens on a handset with no account | SHIP-188 |
+| SHIP-188a | Admin panel sign-in, and a session the browser cannot read | 5 | An administrator signs in with a password at the panel and reaches the shell showing their name, role and permissions; the session token is set as an httpOnly cookie by a route handler and appears in no response body, no `localStorage`, no `sessionStorage` and no script-readable cookie, held by a guard test over `app/`, `components/` and `lib/`; signing out ends the platform session, so replaying the same cookie answers 401; an absent or expired cookie lands on the sign-in form rather than a blank screen; and `make web-check` runs that guard, which it does not today because `apps/admin/package.json` has no `test` script | SHIP-22, SHIP-23a, SHIP-147, SHIP-148 |
+| SHIP-188b | Admin user and job search | 3 | A term typed into the panel finds an account by email, phone, name or status and a job by identifier, status or party; both page through the platform's own cursor rather than a client-side slice; each upstream endpoint is named in exactly one route handler as a literal template with one hole; and a search made by a session without the permission renders the platform's refusal rather than an empty table | SHIP-188a, SHIP-30a, SHIP-151, SHIP-152 |
+| SHIP-188c | Admin job detail with its audit trail | 3 | Opening a job from the search shows its status history, its bids and its parties, and beneath it the audit entries naming the actor, the action, the target and the time — so `Docs/01` §8's "an administrator finds the job and reads its audit trail" runs through the product with no database access at any point; and the entry SHIP-188d's decision writes appears in that trail | SHIP-188b, SHIP-150, SHIP-152, SHIP-165 |
+| SHIP-188d | Admin verification queue, evidence and decision | 5 | The queue lists providers awaiting review oldest first, with `state` sent explicitly rather than defaulted; a reviewer opens `Docs/04` §3's document images through the short-lived signed URLs the platform issues, and the panel keeps neither a URL nor an object key; a decision of Verified, Restricted, Rejected or Suspended is recorded with its reason under an `Idempotency-Key` minted in the browser, so a double-click records one decision; and the provider's own app then reports the new state — so `Docs/01` §8's "a provider registers, is verified" runs end to end through two products' own interfaces | SHIP-188a, SHIP-153, SHIP-154, SHIP-155 |
+| SHIP-189 | Deploy the admin panel and the driver portal | 3 | Each surface builds to an image that starts from environment configuration alone and is served over HTTPS at its own name under the one X-11 registered; an administrator signs in at the panel and reads a job's audit trail against the demonstration API; a driver link opens on a handset with no account; and neither bundle carries a compiled-in API host, because both read `SHIPPER_API_BASE_URL` server-side at request time | SHIP-188, SHIP-188c, SHIP-188d, X-11 |
 | SHIP-190 | Demonstration build of the mobile app | 2 | An installable Android build talks to the demonstration API with no change to any source file | SHIP-188 |
 | SHIP-191 | Demonstration walkthrough | 2 | A written script drives every step of Docs 01 §8's demo gate against the hosted instance, unaided, with no direct database access | SHIP-186, SHIP-189, SHIP-190 |
 
@@ -538,6 +558,87 @@ rehearsal.** Those are M7's, they are unchanged, and a demonstration needs none 
 strike in `Docs/11` §6 reads *"needs a deployed environment"* — SHIP-188 supplies one, so that
 strike lifts even though the ticket stays deferred. The strike lifting and the ticket moving are
 different events and only the first has happened.
+
+**SHIP-188a to SHIP-188d were added because two of the demo gate's seven steps cannot be walked, and
+the gate is the only instrument that could have said so.** `Docs/01` §8 requires one person to drive
+the marketplace "through its own interfaces, with no direct database access at any point"; two of
+its steps are *"A provider registers, is verified"* and *"An administrator finds the job and reads
+its audit trail"*. **Every endpoint both steps need is finished and served** — all 24 of `/v1/admin/*`
+— and **`apps/admin` cannot reach one of them.** It is the SHIP-22 scaffold still: no `app/api/`, no
+upstream helper, no `/v1/` reference in any file, and a navigation of inert `<span>`s labelled with
+the ticket numbers that were meant to fill them. `Docs/11` §3 has said so plainly since M6 closed —
+*"every one of those is reachable today only with curl. Nothing has drawn a screen over any of
+it."* **A milestone that is 22 rows and 69 points of finished API is not the same as a gate that can
+be walked**, and nothing in this file was counting the difference.
+
+**They are `SHIP-188a`…`SHIP-188d` rather than `SHIP-192`… and the reason is the forward-edge count
+above.** SHIP-189 deploys the panel, so it must depend on the rows that build it. Numbered in the
+190s those four edges would point *forward*, taking the count from ten across nine to twelve across
+ten and requiring the paragraph that names each one to be rewritten. Lettered, they sort after
+SHIP-188 and before SHIP-189, every edge stays backward, and the count is untouched — the same
+argument `SHIP-57a` established and the same one that put M8 at `SHIP-186` rather than at a track
+letter of its own.
+
+**Five of M6's queues stay API-only and their navigation entries stay inert, deliberately.** Reported
+content, delivery exceptions, post-award cancellations, expiring documents and disputes are not on
+the demo gate's path, and a panel is the wrong place to discover that: SHIP-156 has no endpoint at
+all and no row that builds one. **SHIP-166's two-person suspension control is the one where the
+missing screen most nearly defeats the control's own purpose**, and it is still not here — worth a
+row when moderation becomes real rather than when a demonstration needs it.
+
+## M9 — Maps and mail
+
+**Goal:** A customer drops a pin where the goods actually are, and every message the platform sends can be opened rather than inferred from a log.  
+**Size:** 11 tickets, 35 points
+
+| ID | Ticket | Pts | Done when | Depends on |
+|---|---|---|---|---|
+| SHIP-192 | Geocoding transport as configuration, not as environment | 3 | A development stack that resolves addresses against a real vendor is one setting in `deploy/.env` and no code change; an unset `GEOCODING_TRANSPORT` selects the stub in **every** environment including production, so nothing starts spending on a metered API by inheriting a string it did not recognise; `GEOCODING_TRANSPORT=google` with no key is refused at startup by variable name rather than degrading to a fictional coordinate; and `geocoding.UseStub` no longer exists, because a transport chosen from `SHIPPER_ENV` is what this row removes | SHIP-59a, SHIP-187a |
+| SHIP-193 | The named geocoding adapter | 3 | An Australian address resolves to a coordinate within a hundred metres of where it is — against a recorded response fixture in CI, and once by hand against the live API; the vendor's "no results" is reported as not-found with a nil error and its "request denied" as an error, so a refused credential can never be read as the rural address SHIP-59a requires the platform to shrug at; the key travels in the query string the vendor requires and appears in no log line and no error; and `provider.go` is byte-for-byte unchanged, which is what says the generic contract was not bent to fit one vendor | SHIP-192, X-12 |
+| SHIP-194 | Reverse lookup: a coordinate to an address | 3 | A coordinate anywhere in Australia answers with the four address parts and the vendor's formatted line, and a coordinate in the Tasman Sea answers with an empty result rather than an error; the endpoint requires a user session, carries a rate-limit class recorded in `Docs/12`, and is the only way a client can turn a point into an address — so no vendor key reaches a handset; and the address it returns is offered to the customer rather than imposed, because `Docs/07` §2 puts every rule on the platform and none of them is "this is where you meant" | SHIP-193, SHIP-47 |
+| SHIP-195 | Address suggestions through the platform | 5 | Typing three or more characters of an Australian street address returns suggestions the platform fetched, not a vendor the client can see; choosing one resolves to the four address parts and a coordinate in a second call; the suggestion request carries a session token so a resolved address is billed once rather than once per keystroke; and `grep -ri` over `apps/mobile/lib` finds no vendor name, no vendor hostname and no vendor key | SHIP-193, SHIP-194 |
+| SHIP-196 | A pinned coordinate, and what "resolved" means once there is one | 5 | A job created with a customer-pinned coordinate stores it with its provenance recorded, and does not overwrite it with a forward geocode of the typed address; a job created without one is geocoded exactly as it is today and records the platform as the source; replacing an address discards a pinned coordinate as readily as a geocoded one, so no coordinate outlives the address it belonged to; a client cannot set the provenance, because the field is absent from the request schema and `additionalProperties: false` refuses it; and the provider-facing shape still carries neither the street line nor the coordinate, proved by the open-job feed's existing exclusion test passing unchanged | SHIP-60, SHIP-63, SHIP-194 |
+| SHIP-197 | Flutter map picker for pickup and drop-off | 5 | A customer drags a pin on a map, the four address fields fill from the platform's reverse lookup, and the coordinate the job stores is the one the customer placed; the eight existing field keys still drive the form, so `job_locations_screen_test.dart` passes without being edited; **no location permission is declared on either platform**, so `permission_copy_test.dart`'s runtime-permission set is untouched; `nothing_captured_reaches_the_gallery_test.dart` passes with the new dependency; and a build with no map key renders a named "map unavailable" panel with all four fields still working, so a missing key degrades to today's screen rather than to a grey rectangle | SHIP-71, SHIP-194, SHIP-196, X-12 |
+| SHIP-198 | Flutter address autocomplete on the locations step | 3 | Typing part of an address offers suggestions from the platform, and choosing one moves the pin and fills all four fields; a customer can ignore it entirely and type the four fields by hand, because a suggestion is a convenience and `Docs/07` §2 keeps every rule server-side; no request is made before three characters and no more than one is in flight at a time; and the eight field keys are unchanged | SHIP-195, SHIP-197 |
+| SHIP-199 | The map stops at the customer's side of the marketplace | 2 | A test names the screens that may render a map, the provider's job feed and open-job screen are not among them, and adding the widget to either fails the test rather than review; the same test fails a provider-facing screen that geocodes a suburb to draw an approximate one; and the reasoning — a pickup coordinate is the street line written as two numbers — is in the file that fails, not in a review comment | SHIP-197 |
+| SHIP-200 | A mail catcher in the development stack | 2 | `make up && make run`, then a registration through the app, puts the verification email in a mailbox a browser opens with its code readable — so no developer reads a verification code out of the API log again; the catcher runs on the one shared stack every worktree uses and needs no port a worktree must vary; and an unset `EMAIL_TRANSPORT` still selects the console, so a machine that does not run the stack is unchanged | SHIP-2, SHIP-187b |
+| SHIP-201 | The mail adapter's documentation says what the package does | 1 | No file under `internal/platform/email`, `internal/platform/sms` or `internal/identity` claims two implementations, a transport chosen from `SHIPPER_ENV`, or a vendor deferred to a ticket that has since closed; `doc.go` names all three transports and the setting that picks them; and a reader who has just read the package can say which transport a given deployment is using without opening the configuration | SHIP-187a, SHIP-187b |
+| SHIP-202 | A verification link that works, served same-origin | 3 | The verification email carries a clickable link when a public base URL is configured and its code alone when one is not, so an unconfigured deployment sends exactly what it sends today; the link resolves at the demonstration's own hostname and is served by the same reverse proxy as the API, so the page confirms the address in one call it can make same-origin and needs no CORS header the service does not serve; and a buyer watching the walkthrough opens the message in the mailbox and follows the link without leaving the browser | SHIP-33, SHIP-188, SHIP-200, X-11 |
+
+**M9 exists because driving the product for the first time found three things, and only one of them
+was the feature that was asked for.** The request was map-based locations, a working admin panel and
+readable email. **The panel turned out to be a demo-gate requirement rather than an improvement**, so
+it went to M8 above. **Email turned out to be nearly finished** — SHIP-187a and SHIP-187b made the
+transport configuration and added SMTP — leaving a two-point gap nobody had written down: the
+development stack runs postgres, redis, kafka and minio and no mail catcher, so a developer reads
+verification codes out of the API log. Maps is the only one of the three that is genuinely new work,
+and it is the reason this milestone is not simply four more rows on M8.
+
+**Every dependency here points backwards, and the two that look forward are not.** SHIP-196 depends
+on SHIP-63 and SHIP-197 on SHIP-71, both of which sit in M2 — earlier in build order, so backward.
+SHIP-193 and SHIP-197 depend on **X-12**, and an edge into Track X is never forward for the reason
+the count above records. The forward-edge count is unchanged at ten across nine tickets.
+
+**The coordinate is the decision in this milestone, and SHIP-196 is where it is taken.** The wire
+refuses a client-supplied coordinate today and does so deliberately: the job contract's address
+carries four strings under `additionalProperties: false`, and the Flutter client keeps a separate
+input type whose comment says *"a client that could construct one would be a client that could claim
+a coordinate."* **Accepting a customer's pin is a narrowing of that rule and must be written as
+one** — the customer is describing their own job, the provider still never sees the result, and the
+provenance is recorded so that a later consumer cannot mistake a pin for a platform assertion.
+**What makes it cheap to do now is that nothing consumes the coordinate yet**: it is stored,
+returned to the customer who supplied it, and feeds no eligibility filter, no distance and no price,
+because SHIP-79 settled the provider feed as set membership with no coordinate and no radius. The
+first consumer that treats it as platform-asserted will arrive without knowing the question was ever
+open, which is the same argument SHIP-91 records for building against a constraint that already
+exists.
+
+**And the map stops at the customer's side of the marketplace, which is why SHIP-199 is a row rather
+than a review note.** A pickup coordinate is the street line written as two numbers, and `Docs/01`
+§4.3 withholds the street line from a provider until award. The realistic breach is not somebody
+putting a pin on the open-job feed — that shape carries no coordinate to draw — but a provider-side
+screen geocoding suburb-and-state to render an approximate one. That is the same disclosure with a
+rounding error, and a test is the only thing that catches it every time.
 
 ## Sequencing notes
 
@@ -565,21 +666,21 @@ Worth stating plainly rather than discovering in month four.
 
 | Working pattern | Points per week | Elapsed |
 |---|---|---|
-| Full-time, focused | 20–25 | **31–38 weeks** (roughly 7–9 months) |
-| Full-time, with interruptions | 15 | **~51 weeks** |
-| Evenings and weekends | 6–8 | **97–129 weeks** (around two years) |
+| Full-time, focused | 20–25 | **33–41 weeks** (roughly 8–10 months) |
+| Full-time, with interruptions | 15 | **~55 weeks** |
+| Evenings and weekends | 6–8 | **103–138 weeks** (around two and a half years) |
 
-**The three rows are `floor(776 / rate)` and nothing else, and the total they divide is the one the rows carry.** They read 23, 29, 39, 74 and 99 two passes ago, which is `floor(599 / rate)` exactly — so the table was not merely stale, it was arithmetic over a total the plan stopped having long ago, and the 599 was still printed under *If you need to cut scope* where it was easiest to read as current. Recompute all five figures whenever the point total moves — now 31, 38, 51, 97 and 129 — together with the 776 under *If you need to cut scope*, which is the same total wearing prose. They are derived, not estimated.
+**The three rows are `floor(831 / rate)` and nothing else, and the total they divide is the one the rows carry.** They read 23, 29, 39, 74 and 99 three passes ago, which is `floor(599 / rate)` exactly — so the table was not merely stale, it was arithmetic over a total the plan stopped having long ago, and the 599 was still printed under *If you need to cut scope* where it was easiest to read as current. Recompute all five figures whenever the point total moves — now 33, 41, 55, 103 and 138 — together with the 831 under *If you need to cut scope*, which is the same total wearing prose. They are derived, not estimated.
 
-**M8 moved them for the first time since that correction, and it is the cheap case rather than the instructive one.** Nineteen points is under three weeks at any of these rates, so every row moved by one or two and none of the prose around them stopped being true. **The figure to distrust is the one that did not move**: a derived table is at its most dangerous when the total changes by little, because nothing about the page looks wrong.
+**M8's first pass moved them by one or two and this one moves them by four to nine, which is the difference worth recording.** That pass called itself the cheap case and observed that none of the prose around the table stopped being true; it also wrote **"the figure to distrust is the one that did not move"**, and then left a nineteen-point claim about M8's own size in this paragraph while M8 grew to 27. **It has now grown to 44 and the claim is deleted rather than corrected**, because a milestone's size restated here is a fourth hand-maintained copy of a figure the Size line already carries. Fifty-five points across three milestones moves every row in the table above, so this is the instructive case the cheap one was contrasted against.
 
 These assume the point scale above and one experienced developer who already knows Flutter. They do **not** assume time spent learning Go, AWS, or Kafka — if any of those are new, add to M0 and M5 specifically.
 
-Two things move this number more than working faster does: cutting scope (below), and not building the admin panel and driver portal yourself. Those two web surfaces are roughly 90 points of the total and are the most separable work in the plan.
+Two things move this number more than working faster does: cutting scope (below), and not building the admin panel and driver portal yourself. **Those two web surfaces are 110 points of the total, and the basis matters more than the figure**: M6 entire (69), the driver portal's four screens in M4 — SHIP-120 to SHIP-123 (16) — the two scaffolds and their shared CI, SHIP-22, SHIP-23 and SHIP-23a (6), and M8's four panel rows with the deployment that serves them (19). The previous figure read *"roughly 90"* with no basis written down; recomputed on the basis just stated it was 91 before this pass, which is how the basis was checked rather than guessed. **State the basis whenever this number is restated** — a figure whose derivation is not written beside it is the shape every correction in this file has had.
 
 ## If you need to cut scope
 
-776 points is a substantial solo build. These are the honest levers, in the order I would pull them:
+831 points is a substantial solo build. These are the honest levers, in the order I would pull them:
 
 | Cut | Saves | What you lose |
 |---|---|---|
@@ -589,6 +690,8 @@ Two things move this number more than working faster does: cutting scope (below)
 | SHIP-142 — notification preferences | 3 | Everyone gets everything. Acceptable at pilot volume, irritating beyond it |
 | SHIP-159 — verification expiry queue | 3 | Manual tracking of expiring documents until Phase 2 |
 | SHIP-184 — load smoke test | 3 | You find your limits in production. Only acceptable because pilot volume is small |
+| SHIP-195, SHIP-198 — address autocomplete | 8 | The pin and the reverse lookup still remove the typing that matters; a customer picks the place on a map instead of choosing it from a list |
+| SHIP-202 — the verification link | 3 | The code still arrives and still works; a buyer copies six characters instead of clicking |
 
 **Do not cut:** SHIP-91 to SHIP-95 (award correctness), SHIP-167 to SHIP-173 (store prerequisites — these block submission outright), SHIP-149 and SHIP-150 (audit — impossible to backfill), or SHIP-131 (permission fallback, which is what stops a driver being stranded).
 
