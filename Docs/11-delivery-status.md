@@ -89,14 +89,26 @@ question.
 | | Tickets | Points |
 |---|---|---|
 | **Done** | 208 | 648 |
-| Remaining | 41 | 128 |
-| **Total** | 249 | 776 |
+| Remaining | 57 | 183 |
+| **Total** | 265 | 831 |
 
-**Measured on `ship-15as-x11-domain-row`, whose base is `develop` at `f65cf7b`.** `make status` on
-this branch prints **208 / 249 and 648 / 776** with both guards green. **It closes no ticket**: the
-done column is unchanged and the whole of the movement is `Docs/09` gaining **X-11**, the domain
-name and the DNS records the demonstration resolves at, at two points. Track X goes to eleven rows
-and thirty-one points, and **1 of 11**.
+**Measured on `ship-15at-m8-m9-backlog-rows`, whose base is `develop` at `806b933`.** `make status`
+on this branch prints **208 / 265 and 648 / 831** with both guards green, and the figures above were
+read off that run rather than added up beside it. **It closes no ticket**: the done column is
+unchanged and the whole of the movement is fourteen new rows and fifty-five points in `Docs/09` —
+**SHIP-188a to SHIP-188d**, the admin panel the demo gate needs and no row built; **X-12**, the maps
+account the geocoding adapter has assumed since SHIP-15g; and **M9**, eleven rows covering
+map-based locations and readable mail. SHIP-189 is re-pointed 2 → 3 and re-worded, which is the
+fifty-fifth point. Track X goes to **1 of 12**, M8 to **3 of 12**, and M9 enters at **0 of 11**.
+
+**Two figures were already wrong before this pass began, and only one of them was in the file it
+belonged to.** `Docs/09`'s Track X **Size:** line read ten rows and twenty-nine points against a
+table of eleven worth thirty-one — X-11 was added at `9dc4aad`, the milestone table and both
+headline totals were recounted, and the Size line was not, so this file and that one disagreed for
+one commit. And `Docs/09`'s calendar section still carried *"nineteen points is under three weeks"*
+about an M8 that had been 27 since SHIP-187a and SHIP-187b landed. **Both were found by recounting
+every hand-maintained figure rather than the ones this change appeared to touch**, which is the only
+method that finds the second kind.
 
 **The row exists because SHIP-188 could not finish without it and had nothing to be blocked on.**
 Its *Done when* has always required "/health over HTTPS **at a stable hostname**"; the branch built
@@ -16630,6 +16642,7 @@ exemption list is the work item.
 | **SHIP-120** | The token landing at `/j/<job-id>#<token>` — the credential in the **fragment**, which no server receives, moved to `sessionStorage` and stripped from the address bar, with the job identifier carried independently of it. The six fields `GET /v1/driver/jobs/{id}` serves, and SHIP-121's controls over them | **The delivery detail its *Done when* names.** "Opening the link shows only that job's delivery detail" — the *only that job's* half is demonstrated, and the *delivery detail* half is not: the endpoint serves **no pickup, no drop-off, no goods and no contact**, so a driver cannot see where to go. `Docs/03` §3's Prepare stage puts all four on this screen — *"views pickup/delivery, goods notes, contact guidance"* — which makes this a product gap rather than only a bookkeeping one. **Recorded in place on both sides and owned by nobody**: `internal/delivery/http.go:1168` says the fields are SHIP-120's to add and that the lane could touch no Go, and `apps/driver-portal/lib/delivery.ts:55` calls the same absence *"a gap rather than a decision"*. The shape is small and additive, so no route moves — `driverJobResponse` gains the two locations, the goods description and a contact, from a port into `jobs` that `delivery` does not yet declare. **This is the seventh instance of the shape `Docs/09` names at SHIP-121a** — a client ticket whose real precondition is a route on the served surface, which no dependency column records — and the only one of the seven with no `<n>a` row. See below |
 | ~~**SHIP-118**~~ | ~~`Delivered` recordable and refused without evidence~~ | **Closed by SHIP-123 — see §3.** `000607` adds `recipient_name` and `delivery_note`, required on `Delivered` and refused on every other milestone, in the domain and in `ck_milestones_delivery_details`. `Docs/01` §4.4's field set is closed end to end |
 | ~~**SHIP-151**~~ | ~~`GET /v1/admin/users` — search by **email**, **phone** and **status**~~ | **Closed by SHIP-30a — see §3.** `000006` adds `users.name`, registration requires it, and the search matches it, so all four of the *Done when*'s terms answer on the wire. An account created before the migration has no name and is found by its address; a name cannot be backfilled, which is why the closing ticket sits in M1 |
+| **SHIP-22** | The Next.js scaffold — the route group, Tailwind, the shadcn component set, the navigation, and `make web-dev app=admin` serving it at :3001 | **The authenticated shell its *Done when* names.** "A placeholder **authenticated** shell" — and the shell renders *"Not signed in"*, because SHIP-147 built admin authentication nine waves after this ticket shipped and nothing has been drawn over the result. `apps/admin` has no `app/api/`, no upstream helper and **no `/v1/` reference in any file**, so it can reach none of the 24 `/v1/admin/*` routes the platform serves; its navigation is inert `<span>`s labelled with the ticket numbers meant to fill them. **The same shape as SHIP-120's and SHIP-139's** — a client ticket whose real precondition landed later — and, unlike the four rows added at the last pass, this one arrives with its owner already written: **`Docs/09`'s new SHIP-188a**, which supplies the sign-in, the httpOnly session and the guard test, with SHIP-188b to SHIP-188d drawing the screens. **Do not reopen the ticket** — §10 records that a ticket can be both done and partly done, and this table is the instrument for exactly that |
 | **SHIP-102** | The comparison screen over `GET /v1/jobs/{id}/bids/received`: **price**, **timing** and **vehicle** served in full, laid out side by side, with a geometry assertion holding the layout | **The gap moved from data to presentation at wave 11 and did not close.** Its named owner SHIP-79a landed, so `display_name` and `operates_as` are now on the wire — `internal/bidding/http.go:1350` and `:1351`. **No client reads them**: `git grep -n 'display_name\|displayName\|operates_as\|operatesAs' -- apps/mobile` returns **nothing at all** on `5a3b8d7`, so the comparison screen still renders `verified` and `member_since` and the *Done when*'s profile clause is still met in reduced form. **This is two fields on one Flutter screen and it is owned by nobody.** See below |
 | **SHIP-139** | The Firebase adapter, `Pusher`'s two-value return, `000702`'s fourth notification status, and the whole rejection matrix asserted against a fake FCM server | **A Firebase project.** Its *Done when* is "push dispatches to iOS and Android and handles token rejection", and **nothing has ever dispatched to a device** — there is no project, no service-account key and no credential exchange. The ticket said so in its own §3 entry and could do nothing about it, because no row asked anybody to create one. **Owner: `Docs/09`'s new X-10.** See §5 |
 | **SHIP-143** | Both requests, their bodies, their idempotency keys, the credential the deregistration carries, when each fires, token rotation, and the `notifications_no_device_session` path | **The token.** `PushTokenSource` is a seam with nothing behind it, and `push_registration_wiring_test.dart` **asserts the absence** — which is the honest form and is not the thing existing. `firebase_messaging` needs `firebase_core`, which needs a `google-services.json` and a `GoogleService-Info.plist` that do not exist, so the dependency is deliberately not in `pubspec.yaml`. On a device today nothing registers. **Owner: `Docs/09`'s new X-10.** See §5 |
@@ -16641,19 +16654,21 @@ but for the budget for two waves, and SHIP-67 closed it with the column and the 
 §10's note that a ticket can be both done and partly done still stands. **SHIP-118 left this table at
 wave 9**, closed by SHIP-123 exactly as SHIP-65 was closed by SHIP-67.
 
-**The live rows are now seven — SHIP-158, SHIP-77, SHIP-120, SHIP-102, SHIP-139, SHIP-143 and
-SHIP-79a — and for the first time in four passes the sentence counting them was *right* when the
-pass arrived.** It read *"the live rows are now six — SHIP-158, SHIP-77, SHIP-102, SHIP-139,
-SHIP-143 and SHIP-79a"*, and that measured correctly against the table. **Adding SHIP-120 is what
-made it wrong, and it is corrected in the same commit that adds the row** — which is the only
-discipline that has ever held this pair together, and it is cheap exactly once: at the moment the
-row goes in. The three earlier failures are why it is worth a sentence at all. Two passes ago it
-read *"the live rows are now three — SHIP-77, SHIP-151 and SHIP-102"*; wave 11 struck SHIP-151 and
-added SHIP-158, so the **count** stayed right by coincidence while the **names** went wrong, which
-is worse than an obviously stale number because it survives a glance. §10's parallel sentence was
-wrong in the same way, and it is updated in this commit too, both re-read against the table rather
-than restated. **A table read by a human and a sentence counting its rows are a semantic pair no
-merge tool and no gate checks** — §7c's second merge finding, now with four passes behind it.
+**The live rows are now eight — SHIP-158, SHIP-77, SHIP-120, SHIP-22, SHIP-102, SHIP-139,
+SHIP-143 and SHIP-79a — and for the second consecutive pass the sentence counting them was *right*
+when the pass arrived.** It read seven and named those seven, which measured correctly against the
+table. **Adding SHIP-22 is what makes it wrong, and it is corrected in the same commit that adds the
+row** — the discipline the paragraph below was written to record, now applied twice running.
+
+**The earlier failures are why it is worth a sentence at all.** The pass before this one found *"the
+live rows are now six — SHIP-158, SHIP-77, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a"*, which
+measured correctly too until SHIP-120 was added beside it. Two passes before that it read *"the live
+rows are now three — SHIP-77, SHIP-151 and SHIP-102"*; wave 11 struck SHIP-151 and added SHIP-158,
+so the **count** stayed right by coincidence while the **names** went wrong, which is worse than an
+obviously stale number because it survives a glance. §10's parallel sentence was wrong in the same
+way, and it is updated in this commit too, both re-read against the table rather than restated.
+**A table read by a human and a sentence counting its rows are a semantic pair no merge tool and no
+gate checks** — §7c's second merge finding, now with five passes behind it.
 
 **Four rows were added at this pass and three of them are the same shape as SHIP-118's.** SHIP-139
 and SHIP-143 owe their missing half to **X-10**, written into `Docs/09` here; SHIP-102's owner
@@ -16947,17 +16962,24 @@ still governs the next proposal: §9 has the entry, the two measured blockers an
 
 ## 6. Ready to start now
 
-**Recomputed on `ship-15ar-demo-rescope` over `develop` at `01eb04c`**, by the same discipline every
-pass here uses: a parser over `Docs/09`'s dependency column and `Docs/11-done.txt` that reproduced
-`make status` cell for cell — 246 rows, 766 points, 205 done, 637 points, and all ten milestone
-denominators — before a figure below was written.
+**Recomputed on `ship-15at-m8-m9-backlog-rows` over `develop` at `806b933`**, by the same discipline
+every pass here uses: a parser over `Docs/09`'s dependency column and `Docs/11-done.txt` that
+reproduced `make status` cell for cell — 265 rows, 831 points, 208 done, 648 points, and all eleven
+milestone denominators — before a figure below was written.
 
-**Eleven rows have every dependency met: 34 points, and for the first time in two passes the code
-half is not empty.**
+**Sixteen rows have every dependency met: 47 points.** The same parser re-derived the forward-edge
+count from the dependency column and it is **unchanged at ten across nine tickets**, which is the
+claim `Docs/09` makes and the reason the four panel rows were lettered rather than numbered into the
+190s.
 
 | Ticket | Pts | Area | In scope for the demonstration? |
 |---|---|---|---|
-| **SHIP-187** | 3 | **Container images for the API, worker and notifier.** Depends on SHIP-20 alone, which landed in M0. There is **no Dockerfile anywhere in this repository** — `deploy/` holds local infrastructure and nothing that packages the application | **Yes — start here** |
+| **SHIP-188a** | 5 | **Admin panel sign-in and its session.** SHIP-22, SHIP-23a, SHIP-147 and SHIP-148 are all done, so this is startable today — and it is the row two of the demo gate's seven steps wait on. SHIP-188b, SHIP-188c and SHIP-188d unlock behind it, 11 more points | **Yes — start here** |
+| **X-11** | 2 | Demonstration hostname. No third party beyond a registrar; releases SHIP-188 and the whole M8 chain behind it | **Yes — it blocks SHIP-188** |
+| **SHIP-200** | 2 | **Mail catcher in the development stack.** Depends on SHIP-2 and SHIP-187b, both done. Pays for itself on the next ticket that needs a verification code | Not required, but cheap and immediate |
+| **SHIP-192** | 3 | **Geocoding transport as configuration.** Depends on SHIP-59a and SHIP-187a, both done. Removes `UseStub`, so a real coordinate stops requiring `SHIPPER_ENV=staging` | No — M9, and gated behind it by SHIP-193 |
+| **SHIP-201** | 1 | Email package documentation. Depends on SHIP-187a and SHIP-187b, both done | No — an hour, whenever |
+| **X-12** | 3 | Maps project and its two API keys. No third party approval; needs a card | No — releases SHIP-193 and SHIP-197 |
 | X-5 | 2 | Pilot metro area. No third party | Yes — SHIP-186 needs a city and a radius |
 | X-10 | 3 | Firebase project. No third party; Android half is an hour | Yes — releases 3 rows, 10 points |
 | X-4 | 3 | Legal brief | Only through X-9, and X-9 should be taken in reduced form instead. §5 |
@@ -16968,11 +16990,14 @@ half is not empty.**
 | ~~SHIP-178~~ | 3 | Struck — needs store-console access, which is X-2 and X-3 | Deferred |
 | ~~SHIP-182~~ | 5 | **The strike lifts and the ticket stays deferred, which are different events.** It was struck for "needs a deployed environment"; SHIP-188 builds one. A demonstration still does not need a restore rehearsal | Deferred |
 
-**SHIP-187 is the answer to the sentence this section carried one pass ago** — *"the
-startable-and-sensible set is empty, and that is a first for this file"*. That was true, and it was
-true because every row left was pointed at a release nobody was making. **Changing the destination
-produced buildable work out of rows that depend only on things already finished**, which is worth
-noticing as a property of re-scoping rather than as a fact about this wave.
+**SHIP-187 headed this table one pass ago and has since landed with SHIP-187a and SHIP-187b behind
+it; SHIP-188a replaces it at the head for the same reason.** Both are rows whose dependencies were
+all finished long before anybody noticed the row was missing — SHIP-187 because the destination
+changed, SHIP-188a because the demo gate was read against `apps/admin` rather than against M6's
+done column. **The startable set is only as good as the rows in the file**, and neither of these was
+in it: a parser over the dependency column cannot report a ticket nobody has written. That is the
+same limitation §5 records for external blockers and the reason SHIP-156's strike has survived ten
+passes.
 
 ### The demonstration's build order, which is not the backlog's
 
@@ -16984,16 +17009,29 @@ signing. The order below replaces it *for this phase only* and the rule resumes 
 | Order | Work | Pts | Waiting on |
 |---|---|---|---|
 | 1 | **X-9 in reduced form**, X-10, X-5 | 8 | The owner. None needs a third party |
-| 2 | SHIP-187 → SHIP-188 → SHIP-189, SHIP-190 | 12 | Nothing. Can run in parallel with everything below |
+| 2 | **SHIP-188a → 188b → 188c → 188d** | 16 | Nothing. Touches `apps/admin` only, so it runs beside every other row here |
+| 2a | SHIP-188 → SHIP-189, SHIP-190 | 10 | X-11 for SHIP-188; SHIP-188c and SHIP-188d for SHIP-189 |
 | 3 | SHIP-58 → SHIP-59 → **SHIP-63** | 10 | X-9 |
 | 4 | SHIP-72 → 73 → 74 → 75 | 12 | X-9, and SHIP-63 for the publish call |
 | 5 | SHIP-144, 145, 146 | 10 | X-10 |
 | 6 | SHIP-186 → SHIP-191 | 7 | SHIP-63 exists; the rest of M8 deployed |
 
-**59 points in scope, 70 deferred, and the split is measured rather than judged**: 41 open rows at
-129 points, less the 70 points §5's table and this one strike out. **SHIP-63 is the single row that
-matters most** — 5 points, and until it exists no job reaches `Open`, no provider sees one, and none
-of the 205 finished tickets can be reached through the product at all.
+**75 points in scope, and the split is measured rather than judged**: 57 open rows at 183 points,
+less the 70 points §5's table and this one strike out, less the 38 points of maps and mail that are
+new work the demonstration does not need — X-12 and the whole of M9. The demonstration's own path
+grew by 17: SHIP-188a to SHIP-188d, and SHIP-189's re-pointing from 2 to 3.
+
+**Re-deriving that split found a one-point error in the sentence it replaces.** It read *"41 open
+rows at 129 points"* while §1 on the same tree read **41 and 128**, and 776 less 648 is 128, so the
+129 was an overcount of one — carried since the re-scope and never divided by anything, which is why
+no figure downstream of it was wrong. It is recorded rather than quietly fixed because **the two
+sentences were maintained by different passes and neither reads the other**, which is the condition
+every arithmetic error in this file has been written under. Reconciled: 58 in scope before this pass
+plus 17 is 75, and 183 less 70 less 38 is 75 — the two roads meet only once the 129 is corrected.
+
+**SHIP-63 is still the single row that matters most** — 5 points, and until it exists no job reaches
+`Open`, no provider sees one, and none of the 208 finished tickets can be reached through the
+product at all.
 
 ### What this section said before the re-scope, kept for its reasoning
 
@@ -20924,11 +20962,12 @@ still updated in the same change that finishes a ticket — it has simply moved 
 document. `make status` reads it, counts it against the backlog, and cross-checks it against
 what commit subjects claim.
 
-A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is in the list**, and its seven live rows — **SHIP-158, SHIP-77, SHIP-120, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a** — are all in it, which is
+A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is in the list**, and its eight live rows — **SHIP-158, SHIP-77, SHIP-120, SHIP-22, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a** — are all in it, which is
 not a contradiction to be tidied away. **This sentence was wrong at three consecutive
 reconciliations and it is right at this one, because it was re-read rather than restated**: §4's
-non-struck first cells were listed off the tree and each of the seven checked against
-`Docs/11-done.txt` by name. It named SHIP-149, SHIP-77 and SHIP-118 three passes ago and SHIP-77 and
+non-struck first cells were listed off the tree and each of the eight checked against
+`Docs/11-done.txt` by name — SHIP-22 included, which is in the list because it is done and partly
+done at once. It named SHIP-149, SHIP-77 and SHIP-118 three passes ago and SHIP-77 and
 SHIP-151 two passes ago, each time correctly at the moment of writing and wrongly by the next merge.
 **The reason the pattern is worth keeping rather than the sentence**: neither this nor §4's parallel
 sentence is checked by anything, both are maintained by hand, and both name a *set* rather than a
