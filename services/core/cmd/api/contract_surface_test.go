@@ -1031,6 +1031,12 @@ var contractCases = map[string]contractCase{
 	"GET /v1/app/minimum-version": {auth: asAnonymous, want: 200},
 	"GET /v1/app/policy":          {auth: asAnonymous, want: 200},
 
+	// SHIP-58. Anonymous like the two above and for the same reason — the app renders the
+	// job form from it, which it may do before anybody has signed in. The catalogue it
+	// answers with is testGoodsConfig()'s rather than the shipped one; what is driven here
+	// is the wire shape, and internal/jobs is where the list's contents are exercised.
+	"GET /v1/goods-categories": {auth: asAnonymous, want: 200},
+
 	// Bidding — every one of these needs the job past Draft (SHIP-17c).
 	"POST /v1/jobs/{id}/bids": {auth: asProvider, want: 201,
 		setup: func(t *testing.T, w *contractWorld) { w.openToBidding(t) },

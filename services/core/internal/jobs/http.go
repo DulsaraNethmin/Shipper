@@ -122,6 +122,14 @@ type draftRequest struct {
 	HeightCm         *int     `json:"height_cm"`
 	WeightKg         *float64 `json:"weight_kg"`
 
+	// GoodsCategory is a code from GET /v1/goods-categories (SHIP-58).
+	//
+	// The code, never the label. A client that sent "General freight" would be sending
+	// wording that changes; the code is the half that does not. An unknown code is
+	// `validation_failed` on `goods_category`, and the client's move is to re-fetch the
+	// catalogue — see [Service.checkDraftCategory].
+	GoodsCategory *string `json:"goods_category"`
+
 	VehicleRequirement *string `json:"vehicle_requirement"`
 	HandlingNotes      *string `json:"handling_notes"`
 
@@ -178,6 +186,7 @@ func (b draftRequest) fields() (DraftFields, error) {
 
 	f := DraftFields{
 		GoodsDescription:   b.GoodsDescription,
+		GoodsCategory:      b.GoodsCategory,
 		LengthCm:           b.LengthCm,
 		WidthCm:            b.WidthCm,
 		HeightCm:           b.HeightCm,
@@ -294,6 +303,13 @@ type jobResponse struct {
 
 	GoodsDescription string `json:"goods_description,omitempty"`
 
+	// GoodsCategory is the catalogue code, not the label (SHIP-58).
+	//
+	// The code alone, and the client resolves it against GET /v1/goods-categories. Returning
+	// the label here would put a second copy of the wording on every job response, which is
+	// the copy that is stale the day somebody corrects a typo in the catalogue.
+	GoodsCategory string `json:"goods_category,omitempty"`
+
 	LengthCm int     `json:"length_cm,omitempty"`
 	WidthCm  int     `json:"width_cm,omitempty"`
 	HeightCm int     `json:"height_cm,omitempty"`
@@ -331,6 +347,7 @@ func jobFrom(j Job) jobResponse {
 		Dropoff: locationFrom(j.Dropoff),
 
 		GoodsDescription: j.GoodsDescription,
+		GoodsCategory:    j.GoodsCategory,
 
 		LengthCm: j.Dimensions.LengthCm,
 		WidthCm:  j.Dimensions.WidthCm,
@@ -389,6 +406,83 @@ func timestamp(t time.Time) string {
 		return ""
 	}
 	return t.UTC().Format("2006-01-02T15:04:05.000Z07:00")
+}
+
+// categoriesResponse is the body of GET /v1/goods-categories (SHIP-58).
+//
+// An object with one key rather than a bare JSON array, and that is Docs/07 §6 rather than taste:
+// responses stay additive — fields are added, never repurposed or removed — and a top-level array
+// is the one shape that cannot gain a field. The first thing this will want is the catalogue's
+// own revision or a `provisional` summary, and neither is expressible without breaking every
+// client at once.
+type categoriesResponse struct {
+	Categories []categoryResponse `json:"categories"`
+}
+
+// categoryResponse is one served category.
+//
+// Every field of [Category] appears, including the refused ones' — see [Category.Carried] for why
+// a category the platform will not take is served at all.
+type categoryResponse struct {
+	Code        string `json:"code"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+
+	// Carried says whether a job in this category may be published.
+	//
+	// Always present, never omitted — `omitempty` would drop it from exactly the entries where
+	// it is false, which is to say from every entry whose answer matters. A client reading a
+	// missing field as "unknown, assume yes" would offer the customer dangerous goods.
+	Carried bool `json:"carried"`
+
+	// Provisional says the entry has not been through X-4's legal review (Docs/11 §4).
+	//
+	// Served rather than kept internal because Docs/11 §5's reduced-form acceptance turns on
+	// it: the list may ship before a legal adviser has seen it precisely because it says so,
+	// and a flag nobody can read is not a disclosure. Never omitted, for [categoryResponse]'s
+	// reason above and one more — the interesting value here is `true`, and the day it is
+	// false for everything is the day X-4 closed.
+	Provisional bool `json:"provisional"`
+}
+
+// Categories handles GET /v1/goods-categories (SHIP-58).
+//
+// # Public, and reading configuration on every request
+//
+// The same two properties GET /v1/app/policy has, for the same two reasons. Nothing in the answer
+// is about the caller — it is one list, identical for everybody — and the app needs it to render
+// the job form, which it may do before anyone has signed in. And it is read per request rather
+// than captured at startup so that changing the catalogue is changing the environment and
+// restarting, which is what CLAUDE.md means by a category list living server-side.
+//
+// # It carries no cache header, deliberately
+//
+// The obvious optimisation is a long max-age on a list that changes twice a year. It is left out
+// because the one time the list changes in a hurry is the time it matters — a category withdrawn
+// on legal advice — and a cache is exactly what would keep serving it. The client caches this for
+// offline use anyway (Docs/07 §4), which is the copy that should be stale, because it is the copy
+// that knows it might be.
+func (h *Handler) Categories() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		catalogue, err := h.svc.Categories()
+		if err != nil {
+			return apiError(err)
+		}
+
+		out := categoriesResponse{Categories: make([]categoryResponse, 0, len(catalogue))}
+		for _, c := range catalogue {
+			out.Categories = append(out.Categories, categoryResponse{
+				Code:        c.Code,
+				Label:       c.Label,
+				Description: c.Description,
+				Carried:     c.Carried,
+				Provisional: c.Provisional,
+			})
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, out)
+		return nil
+	})
 }
 
 // Create handles POST /v1/jobs (SHIP-61).

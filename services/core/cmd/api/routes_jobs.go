@@ -32,8 +32,29 @@ import (
 // refused by the domain, which reads users.role rather than trusting the token's claim — 000400
 // says the customer-account rule is enforced where the draft is created, and that is one place
 // rather than two that can disagree.
+//
+// # One route here is public, and it is the exception that shows the rule
+//
+// GET /v1/goods-categories (SHIP-58) needs no credential, because the paragraph above does not
+// apply to it: it names no job, has no owner, and its answer is the same for everybody. It is
+// registered in this file rather than beside /v1/app/policy — which it otherwise resembles
+// exactly — because the catalogue is not a fact about the app, it is the vocabulary jobs are
+// written in, and the code that validates a category against it is in this domain. A route
+// declared away from the handler it serves is the drift Docs/10 §9.2 is about.
 func init() {
 	register(
+		Route{
+			// Public and unauthenticated: the app renders the job form from this, which
+			// it may do before anybody has signed in, and nothing in the answer is about
+			// the caller. LimitPublicRead for the same reason /v1/app/policy has it —
+			// there is no subject to key a limit on. See jobs.Handler.Categories.
+			Method:  http.MethodGet,
+			Pattern: "/goods-categories",
+			Group:   GroupV1,
+			Auth:    Public,
+			Limit:   LimitPublicRead,
+			Handler: func(d Deps) http.Handler { return jobsHandler(d).Categories() },
+		},
 		Route{
 			Method:  http.MethodGet,
 			Pattern: "/jobs",
@@ -138,13 +159,46 @@ func init() {
 // answer 503 for as long as it lasts.
 func jobsHandler(d Deps) *jobs.Handler {
 	svc := jobs.NewService(events.NewOutbox(), d.Clock, newGeocoder(d),
-		jobs.WithBidders(jobBidders{}))
+		jobs.WithBidders(jobBidders{}),
+		jobs.WithCatalogue(goodsCatalogue(d)))
 
 	handler, err := jobs.NewHandler(svc, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: jobs handler: " + err.Error())
 	}
 	return handler
+}
+
+// goodsCatalogue translates the configured category list into the domain's own (SHIP-58).
+//
+// This is cmd/api doing the one job that is only its own. internal/config may not import a domain
+// and internal/jobs may not import infrastructure's shapes, so config.GoodsCategory and
+// jobs.Category are two structurally identical types that no file but this one may mention
+// together — the same arrangement the geocoder has, and the same one Verification.ExpiryLeadTimes
+// has for profiles' document kinds.
+//
+// It panics on a catalogue the domain refuses, exactly as jobsHandler panics on a handler it
+// cannot build, and for the same reason: this runs during attach, and every failure it can report
+// is a configuration mistake that will still be there after a restart. [loader.goods] has already
+// refused the same conditions at load, so reaching this panic means a Config was built by
+// something other than Load — which is to say a test, which is exactly who should be told.
+func goodsCatalogue(d Deps) jobs.Catalogue {
+	cs := make([]jobs.Category, 0, len(d.Config.Goods.Categories))
+	for _, c := range d.Config.Goods.Categories {
+		cs = append(cs, jobs.Category{
+			Code:        c.Code,
+			Label:       c.Label,
+			Description: c.Description,
+			Carried:     c.Carried,
+			Provisional: c.Provisional,
+		})
+	}
+
+	catalogue, err := jobs.NewCatalogue(cs)
+	if err != nil {
+		panic("cmd/api: goods catalogue: " + err.Error())
+	}
+	return catalogue
 }
 
 // newGeocoder picks the geocoding implementation for this environment (SHIP-59a, SHIP-60).

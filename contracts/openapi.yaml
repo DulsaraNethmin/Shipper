@@ -270,6 +270,8 @@ paths:
     $ref: './paths/fleet.yaml#/DeactivateVehicle'
   /v1/fleet/vehicles/{id}/reactivate:
     $ref: './paths/fleet.yaml#/ReactivateVehicle'
+  /v1/goods-categories:
+    $ref: './paths/jobs.yaml#/GoodsCategories'
   /v1/jobs:
     $ref: './paths/jobs.yaml#/Jobs'
   /v1/jobs/{id}:

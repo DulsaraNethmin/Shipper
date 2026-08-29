@@ -11,9 +11,15 @@
 # # The budget is here, and it is here because every operation in this document is owner-only
 #
 # Docs/01 §4.3 keeps the customer's maximum private from providers — not as an amount, not as a
-# band, and not as a "budget supplied" indicator. Every path below requires a credential and
-# answers only about the caller's own jobs, so `budget_cents` is safe on these specifically
-# (SHIP-67).
+# band, and not as a "budget supplied" indicator. Every path below that describes a *job* requires
+# a credential and answers only about the caller's own jobs, so `budget_cents` is safe on these
+# specifically (SHIP-67).
+#
+# **GoodsCategories is the one public operation in this document and it describes no job at all**
+# — it is the reference data a job's `goods_category` is drawn from (SHIP-58), so it carries no
+# amount, no owner and nothing about any caller. It is here rather than in `app.yaml`, which it
+# otherwise resembles, because the catalogue is the vocabulary jobs are written in and the code
+# that validates against it is in this domain.
 #
 # **A provider-facing operation must not describe it.** SHIP-82's job feed and SHIP-83's provider
 # job detail get schemas of their own rather than a variant of `Job` with one field removed,
@@ -1114,6 +1120,114 @@ Coordinate:
         customer typed. Useful for confirming the platform understood the address; omitted when
         the provider supplied none.
       example: 12 Smith Street, Newtown NSW 2042
+
+GoodsCategories:
+  get:
+    operationId: listGoodsCategories
+    summary: The goods categories a job may name
+    tags: [Jobs]
+    description: |
+      The catalogue a customer chooses a job's `goods_category` from (SHIP-58), and the list the
+      platform checks a publication against (SHIP-59).
+
+      ## It is configuration, and that is the point of the endpoint
+
+      `CLAUDE.md` names category lists first among the things that live server-side because they
+      move under operational pressure, and Flutter has no over-the-air path for Dart code. A
+      category withdrawn on legal advice has to stop being offered without an app release, so the
+      list is served rather than compiled into any client. One environment variable replaces it
+      whole.
+
+      ## Every entry is served, including the ones Shipper will not carry
+
+      A refused category is in the list with `carried: false` rather than left out. That is what
+      lets a client show a customer what Shipper does not take, and what lets the platform refuse
+      a publication **by name** — `jobs_prohibited_category`, quoting the catalogue's own wording
+      — rather than with a generic validation failure.
+
+      `Docs/07` §3 still applies: the app may hide or disable, and the platform decides. A draft
+      may name a refused category; publishing one is refused.
+
+      ## `provisional` says which answer you are reading
+
+      X-9 asked for a finalised prohibited-goods list and depends on X-4, the legal brief, which
+      is unanswered. `Docs/11` §5 records the reduced form this ships in: the repository owner
+      approved a provisional list, **the reference data says so**, and X-4 stays open. An entry
+      with `provisional: true` has not been through legal review.
+
+      It is per entry rather than per catalogue because a reviewer is far likelier to confirm most
+      of a list and query two entries than to bless or reject all of it at once — so the answer can
+      land incrementally, and a client can see it as it does.
+
+      ## Public and unauthenticated
+
+      For the reason `GET /v1/app/policy` is: **nothing here is about the caller.** It is one list,
+      identical for everybody, and the app renders the job form from it — which it may do before
+      anyone has signed in.
+
+      Read from configuration on every request, so changing the catalogue is changing the
+      environment and restarting rather than cutting a release.
+    responses:
+      '200':
+        description: The catalogue currently in force, in the order it is configured.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [categories]
+              additionalProperties: false
+              description: |
+                An object with one key rather than a bare array. `Docs/07` §6 keeps responses
+                additive — fields are added, never repurposed or removed — and a top-level array
+                is the one shape that cannot gain a field.
+              properties:
+                categories:
+                  type: array
+                  items:
+                    $ref: '#/GoodsCategory'
+      '405':
+        $ref: '../openapi.yaml#/components/responses/MethodNotAllowed'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+
+GoodsCategory:
+  type: object
+  required: [code, label, carried, provisional]
+  additionalProperties: false
+  description: One entry in the goods catalogue.
+  properties:
+    code:
+      type: string
+      pattern: '^[a-z0-9]+(_[a-z0-9]+)*$'
+      description: |
+        The stored form, and the value a client sends as a job's `goods_category`. Lower snake
+        case and stable: it is written onto every job that names it, so it is the half that does
+        not change when the wording does. Never send the label.
+      example: general_freight
+    label:
+      type: string
+      description: The short human name, in Australian English.
+      example: General freight
+    description:
+      type: string
+      description: |
+        A one-line explanation shown beneath the label. Omitted when the catalogue gives none.
+      example: Palletised or boxed goods needing no special handling.
+    carried:
+      type: boolean
+      description: |
+        Whether a job in this category may be published. Never omitted — a missing field read as
+        "assume yes" would offer a customer dangerous goods.
+      example: true
+    provisional:
+      type: boolean
+      description: |
+        Whether the entry still awaits the legal review X-4 owns. True for every entry in the
+        list shipping today. Never omitted.
+      example: true
 
 TimeWindowResponse:
   type: object

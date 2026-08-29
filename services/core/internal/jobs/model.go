@@ -229,6 +229,19 @@ type Job struct {
 	Dimensions       Dimensions
 	WeightKg         float64
 
+	// GoodsCategory is the catalogue code the customer chose (SHIP-58).
+	//
+	// A code rather than a [Category], and deliberately: the catalogue is configuration that
+	// changes, so a job holding a copy of a label would show the wording that was current when
+	// it was drafted. The code is the stable half — see [Category.Code] — and the rest is
+	// looked up when it is needed.
+	//
+	// Empty means not chosen, which a Draft is allowed to be. ck_jobs_goods_category refuses
+	// the empty string, so the zero value and a stored value cannot be confused, and 000410's
+	// column is deliberately unconstrained as to *which* codes are valid — the catalogue is one
+	// place, not two that drift.
+	GoodsCategory string
+
 	// What the customer believes the job needs, and anything the driver has to know —
 	// access constraints, stairs, gate codes.
 	VehicleRequirement string
@@ -303,6 +316,18 @@ type DraftFields struct {
 	HeightCm         *int
 	WeightKg         *float64
 
+	// GoodsCategory is a code from the served catalogue (SHIP-58).
+	//
+	// Validated against the catalogue as soon as it is supplied, so a code the platform does
+	// not serve is refused at the draft rather than surviving to publication — a customer who
+	// mistypes should hear about it while they are looking at the form.
+	//
+	// **A category that is served but not carried is accepted here**, and that is the split
+	// SHIP-58 and SHIP-59 are divided along: choosing "dangerous goods" in a draft is a
+	// legitimate thing to do and to save, and Docs/09 puts the refusal "on publish". A pointer
+	// to the empty string clears the choice, like every other field here.
+	GoodsCategory *string
+
 	VehicleRequirement *string
 	HandlingNotes      *string
 
@@ -321,7 +346,7 @@ type DraftFields struct {
 // 200 to it would tell that client everything is fine.
 func (f DraftFields) IsEmpty() bool {
 	return f.Pickup == nil && f.Dropoff == nil &&
-		f.GoodsDescription == nil &&
+		f.GoodsDescription == nil && f.GoodsCategory == nil &&
 		f.LengthCm == nil && f.WidthCm == nil && f.HeightCm == nil && f.WeightKg == nil &&
 		f.VehicleRequirement == nil && f.HandlingNotes == nil &&
 		f.PickupWindow == nil && f.DropoffWindow == nil &&

@@ -958,6 +958,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-56a** | M2 | `contracts/statuses.yaml` produces the Go, Dart and TypeScript forms of all three status vocabularies, and a test fails when any of the seven generated files is stale — *see below* |
 | **SHIP-57** | M2 | The transition guard — and the database refuses a status change that did not come through it — *see below* |
 | **SHIP-57a** | M2 | `job_status_history` — actor, reason and both clocks, append-only |
+| **SHIP-58** | M2 | The goods catalogue — thirteen categories from **one environment variable**, served at `GET /v1/goods-categories` and stored on the job as a code. **Refused categories are served too**, with `carried: false`, which is what lets a client say what Shipper will not take and lets SHIP-59 refuse a publication by name; a *draft* may still name one, because `Docs/09` puts the prohibition on publish. `000410` deliberately has **no `CHECK` naming the categories** — a list in a constraint would make X-4's answer a migration. Every entry carries `provisional: true`, which is §5's condition for X-9's reduced form — *see §4* |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
 | **SHIP-60** | M2 | The address value object — validated, normalised, and resolved where the platform can; a failed lookup never fails the job — *see below* |
 | **SHIP-61** | M2 | `POST /v1/jobs` — the first authenticated state-changing endpoint in the service — *see below* |

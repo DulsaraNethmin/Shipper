@@ -51,6 +51,7 @@ GET    /v1/fleet/vehicles/{id}                  user         read         v1
 PATCH  /v1/fleet/vehicles/{id}                  user         write        v1
 POST   /v1/fleet/vehicles/{id}/deactivate       user         write        v1
 POST   /v1/fleet/vehicles/{id}/reactivate       user         write        v1
+GET    /v1/goods-categories                     public       public-read  v1
 GET    /v1/jobs                                 user         read         v1
 POST   /v1/jobs                                 user         write        v1
 GET    /v1/jobs/{id}                            user         read         v1

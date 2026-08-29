@@ -63,7 +63,7 @@ const jobColumns = `
 	COALESCE(dropoff_line, ''), COALESCE(dropoff_suburb, ''),
 	COALESCE(dropoff_state, ''), COALESCE(dropoff_postcode, ''),
 	dropoff_latitude, dropoff_longitude, COALESCE(dropoff_formatted, ''),
-	COALESCE(goods_description, ''),
+	COALESCE(goods_description, ''), COALESCE(goods_category, ''),
 	COALESCE(length_cm, 0), COALESCE(width_cm, 0), COALESCE(height_cm, 0),
 	COALESCE(weight_kg, 0),
 	COALESCE(vehicle_requirement, ''), COALESCE(handling_notes, ''),
@@ -97,7 +97,7 @@ func scanJob(row pgx.Row) (Job, error) {
 		&pickupLat, &pickupLng, &j.Pickup.Formatted,
 		&j.Dropoff.Line, &j.Dropoff.Suburb, &j.Dropoff.State, &j.Dropoff.Postcode,
 		&dropoffLat, &dropoffLng, &j.Dropoff.Formatted,
-		&j.GoodsDescription,
+		&j.GoodsDescription, &j.GoodsCategory,
 		&j.Dimensions.LengthCm, &j.Dimensions.WidthCm, &j.Dimensions.HeightCm,
 		&j.WeightKg,
 		&j.VehicleRequirement, &j.HandlingNotes,
@@ -215,6 +215,12 @@ func draftArgs(j Job) []any {
 		nullTime(j.PickupWindow.Start), nullTime(j.PickupWindow.End),
 		nullTime(j.DropoffWindow.Start), nullTime(j.DropoffWindow.End),
 		nullCents(j.BudgetCents),
+
+		// Last rather than beside goods_description, which is where it belongs by meaning.
+		// Appending keeps every placeholder below its existing number; slotting it into the
+		// middle would renumber twelve of them across three statements, which is the edit
+		// that silently shifts a value into the wrong column.
+		nullText(j.GoodsCategory),
 	)
 }
 
@@ -232,7 +238,7 @@ const draftColumns = `
 	vehicle_requirement, handling_notes,
 	pickup_window_start, pickup_window_end,
 	dropoff_window_start, dropoff_window_end,
-	budget`
+	budget, goods_category`
 
 // draftValues is insertDraft's VALUES list, one entry per name in draftColumns and in the same
 // order. $1 and $2 are the id and the customer, so the draft's own values start at $3.
@@ -252,7 +258,7 @@ const draftValues = `
 	$22, $23,
 	$24, $25,
 	$26, $27,
-	($28::bigint)::numeric / 100`
+	($28::bigint)::numeric / 100, $29`
 
 // isCustomer reports whether the account exists and is a customer account.
 //
@@ -321,7 +327,8 @@ func (postgresStore) updateDraft(ctx context.Context, r db.Runner, j Job) (Job, 
 			weight_kg = $20, vehicle_requirement = $21, handling_notes = $22,
 			pickup_window_start = $23, pickup_window_end = $24,
 			dropoff_window_start = $25, dropoff_window_end = $26,
-			budget = ($27::bigint)::numeric / 100
+			budget = ($27::bigint)::numeric / 100,
+			goods_category = $28
 		WHERE id = $1
 		RETURNING ` + jobColumns
 

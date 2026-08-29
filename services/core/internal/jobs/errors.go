@@ -134,6 +134,29 @@ var (
 	// code, which is why the mapping is not made from the general sentinel at the transport
 	// edge: one code per intent, not one code per guard failure.
 	ErrJobNotCancellable = errors.New("jobs: this job can no longer be cancelled")
+
+	// ErrCatalogueUnusable means [NewCatalogue] was handed a list it will not serve — empty,
+	// carrying a duplicate or blank code, or refusing every category (SHIP-58).
+	//
+	// A startup error rather than a request-time one. It reaches nobody through an endpoint:
+	// cmd/api builds the catalogue once and refuses to start without it, which is where a
+	// configuration mistake should be found.
+	ErrCatalogueUnusable = errors.New("jobs: that goods catalogue cannot be served")
+
+	// ErrNoCatalogue means the service was built with no catalogue and was asked about a
+	// category (SHIP-58).
+	//
+	// A wiring defect rather than a condition a caller can act on, and the twin of
+	// [ErrNoBidderLookup] in every respect — see [WithCatalogue] for why neither possible
+	// default is safe. It maps to an opaque 500 through [apiError]'s default branch.
+	ErrNoCatalogue = errors.New("jobs: this service was built with no goods catalogue")
+
+	// ErrUnknownCategory means a category code the configured catalogue does not contain.
+	//
+	// Distinct from [ErrProhibitedCategory] in Go and on the wire. This one is a field the
+	// client got wrong — a stale catalogue on a phone, or a typo — and the client's move is to
+	// re-fetch the list. See [Catalogue.Lookup].
+	ErrUnknownCategory = errors.New("jobs: not a goods category this platform serves")
 )
 
 // The error codes this domain's endpoints answer with (Docs/10 §4.4).
