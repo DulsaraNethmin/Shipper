@@ -59,6 +59,8 @@ const MAY_REQUEST = [
   "lib/administrator.ts",
   "app/api/admin/sessions/route.ts",
   "app/api/admin/sessions/current/route.ts",
+  "app/(panel)/users/page.tsx",
+  "app/(panel)/jobs/page.tsx",
 ];
 
 /**
@@ -67,7 +69,18 @@ const MAY_REQUEST = [
  * The driver portal's rule is "only a route handler may name one". This panel's is one file per
  * endpoint, because `lib/administrator.ts` resolves the session during a server render and adding a
  * route handler for it would be creating a browser-reachable endpoint for nobody to call. It cannot
- * become a client module: it imports `next/headers`, which Next refuses to bundle into one.
+ * become a client module: it imports `lib/credential.ts`, which imports `next/headers`, which Next
+ * refuses to bundle into one.
+ *
+ * **SHIP-188b made that the rule for screens as well as for `me`, and it is worth saying why the
+ * obvious alternative was refused.** A route handler per search — `app/api/admin/users/route.ts`
+ * called by a client component — is what `Docs/09`'s row literally describes, and it would add two
+ * browser-reachable JSON endpoints that forward a privileged read, so that a client could hold a
+ * result set and page through it. Rendering the search on the server instead means the panel adds no
+ * such endpoint, the cursor lives in the URL where a slice cannot, and a refusal is rendered by the
+ * component that received it. `Docs/09`'s wording was corrected rather than the contradiction being
+ * resolved in silence; the property that sentence was protecting — one file, one endpoint, one
+ * literal — is unchanged and is what this test enforces.
  *
  * **The count below is the count of endpoints this origin can reach**, and it is the number to read
  * at review. It moves when somebody teaches the panel a new destination, which is exactly when
@@ -77,6 +90,8 @@ const ENDPOINTS: Record<string, string[]> = {
   "lib/administrator.ts": ["/v1/admin/me"],
   "app/api/admin/sessions/route.ts": ["/v1/admin/sessions"],
   "app/api/admin/sessions/current/route.ts": ["/v1/admin/sessions/current"],
+  "app/(panel)/users/page.tsx": ["/v1/admin/users"],
+  "app/(panel)/jobs/page.tsx": ["/v1/admin/jobs"],
 };
 
 /**
@@ -86,17 +101,24 @@ const ENDPOINTS: Record<string, string[]> = {
  * can be sent to a browser, so there is nothing in a bundle for an injected script to look for —
  * which is a smaller claim than "httpOnly stops it being read" and is true for a different reason,
  * so the two do not fail together.
+ *
+ * **These two lists stayed at their length while the panel grew five screens, and that is what
+ * `lib/credential.ts` is for** (SHIP-188b). Every server render needs the cookie; if each read it
+ * for itself, both lists would gain an entry per screen — and a list that grows with the
+ * application has stopped being a guard and become a register of who has the credential. One file
+ * reads it, and hands on a `Headers` rather than a string, so no screen holds a value it could log
+ * or render.
  */
 const MAY_NAME_THE_COOKIE = [
   "lib/session.ts",
-  "lib/administrator.ts",
+  "lib/credential.ts",
   "app/api/admin/sessions/route.ts",
   "app/api/admin/sessions/current/route.ts",
 ];
 
 /** The files that may hold a bearer credential on its way to the platform. */
 const MAY_SPEND_THE_CREDENTIAL = [
-  "lib/administrator.ts",
+  "lib/credential.ts",
   "app/api/admin/sessions/current/route.ts",
 ];
 
@@ -291,5 +313,36 @@ test("every route handler checks that the request came from this panel", () => {
 
   for (const handler of handlers) {
     assert.match(code.get(handler) ?? "", /isSameOrigin\s*\(/, `${handler} does not check the origin`);
+  }
+});
+
+/**
+ * **Every screen that asks the platform for something can render its refusal** (SHIP-188b).
+ *
+ * `Docs/09`'s SHIP-188b row names this outright: "a search made by a session without the permission
+ * renders the platform's refusal rather than an empty table". It is a rendering failure rather than
+ * a security one — the platform refused correctly either way — and it is the kind that is invisible
+ * to everybody who happens to hold the permission. An administrator whose role is short `users.read`
+ * sees a table with no rows, searches again for something that was never going to be shown to them,
+ * and concludes the account does not exist.
+ *
+ * So it is asserted per file rather than trusted per author, exactly as the origin check is. A screen
+ * that names an endpoint and cannot render a refusal fails here on the day it is written, which is
+ * the only day anybody would have thought to test it by hand.
+ */
+test("every screen that names an endpoint can render the platform's refusal", () => {
+  const code = sources();
+  const screens = [...code.keys()]
+    .filter((file) => /^app\/.*page\.tsx$/.test(file) && /\/v1\//.test(code.get(file) ?? ""))
+    .sort();
+
+  assert.deepEqual(screens, ["app/(panel)/jobs/page.tsx", "app/(panel)/users/page.tsx"]);
+
+  for (const screen of screens) {
+    assert.match(
+      code.get(screen) ?? "",
+      /PlatformRefusal/,
+      `${screen} would show an empty table where the platform refused`,
+    );
   }
 });
