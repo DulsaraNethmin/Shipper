@@ -238,8 +238,11 @@ new_draft() {
 
 # move_job <job-id> <from> <to> — put a job into a state no endpoint can reach yet.
 #
-# SHIP-63 publishes and SHIP-92 awards, and neither exists. The only way to reach Open or
-# Awarded is therefore the protocol 000402's trigger demands: a job_status_history row written
+# SHIP-92 awards and does not exist. **SHIP-63 now publishes, so Open is reachable through the
+# product**, and the section at the end of this file gets there that way. This fixture stays for
+# two reasons: Awarded and everything past it are still unreachable, and a cancellation check wants
+# a job in a given state without also satisfying publication's four preconditions. The only way to
+# reach a status no endpoint serves is the protocol 000402's trigger demands: a job_status_history row written
 # in the same transaction, naming this job and this exact move, pointed at by a
 # transaction-local setting. A bare `UPDATE jobs SET status` is refused — which is the point.
 # This fixture cannot bypass the guard even deliberately, so a check that runs after it is
@@ -1336,3 +1339,218 @@ ok "GET /v1/jobs/open answers 400 — the {id} slot holds an identifier again, w
 
 unset history_job history_path missing_job absent_status jobs_history_provider_id
 unset -f jobs_get
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-58  GET /v1/goods-categories serves the catalogue from configuration"
+
+# Public: no credential, because the app renders the job form from this before anybody has signed
+# in, and nothing in the answer is about the caller.
+status="$(curl -s -o "$WORKDIR/jobs-categories.json" -w '%{http_code}' \
+  "http://localhost:$VERIFY_PORT/v1/goods-categories")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-categories.json"; fail "GET /v1/goods-categories returned $status, want 200"; }
+ok "the catalogue is served without a credential"
+
+python3 - "$WORKDIR/jobs-categories.json" <<'CATALOGUE' || fail "the served catalogue is not what SHIP-58 and X-9 describe"
+import json, sys
+
+categories = json.load(open(sys.argv[1]))["categories"]
+if not categories:
+    print("the catalogue is empty", file=sys.stderr)
+    sys.exit(1)
+
+# Every entry carries both booleans explicitly. `omitempty` on either would drop it from exactly
+# the entries whose answer matters, and a client reading a missing `carried` as "assume yes" would
+# offer the customer dangerous goods.
+for c in categories:
+    for field in ("code", "label", "carried", "provisional"):
+        if field not in c:
+            print(c.get("code", "?"), "has no", field, file=sys.stderr)
+            sys.exit(1)
+
+if not [c for c in categories if c["carried"]]:
+    print("nothing is carried; every publication would be refused", file=sys.stderr)
+    sys.exit(1)
+
+# A refused category is *served*, not filtered out — that is what lets a client say what Shipper
+# will not take and lets the platform refuse a publication by name.
+if not [c for c in categories if not c["carried"]]:
+    print("no refused category is served, so a refusal could not name one", file=sys.stderr)
+    sys.exit(1)
+
+# X-9 was accepted in reduced form and Docs/11 §4 makes this flag the condition of that.
+unmarked = [c["code"] for c in categories if not c["provisional"]]
+if unmarked:
+    print("not marked provisional:", unmarked, "- X-4 has not been answered", file=sys.stderr)
+    sys.exit(1)
+CATALOGUE
+ok "every entry names its code, label, carried and provisional; refused categories are served, not hidden"
+
+# The two the rest of this section needs, read off the served list rather than assumed. A harness
+# that hard-coded `general_freight` would fail the day operations renamed it, reporting a defect in
+# the platform rather than in itself.
+jobs_carried_category="$(python3 -c '
+import json, sys
+for c in json.load(open(sys.argv[1]))["categories"]:
+    if c["carried"]:
+        print(c["code"]); break' "$WORKDIR/jobs-categories.json")"
+jobs_refused_category="$(python3 -c '
+import json, sys
+for c in json.load(open(sys.argv[1]))["categories"]:
+    if not c["carried"]:
+        print(c["code"]); break' "$WORKDIR/jobs-categories.json")"
+[[ -n "$jobs_carried_category" && -n "$jobs_refused_category" ]] \
+  || fail "could not read a carried and a refused category off the served catalogue"
+ok "the harness reads its categories off the catalogue rather than hard-coding them"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-63  POST /v1/jobs/{id}/publish refuses what Docs/04 §2 and the required fields refuse"
+
+# publishable_draft <name> <category> — a draft with everything publication requires.
+publishable_draft() {
+  local out="$WORKDIR/jobs-$1.json"
+  local body
+  body="$(python3 -c '
+import json, sys
+print(json.dumps({
+  "pickup":  {"line": "12 Smith Street",  "suburb": "Newtown",   "state": "NSW", "postcode": "2042"},
+  "dropoff": {"line": "40 Bourke Street", "suburb": "Melbourne", "state": "VIC", "postcode": "3000"},
+  "goods_description": "Two-seater sofa, wrapped",
+  "goods_category": sys.argv[1],
+  "pickup_window": {"start": "2027-03-01T09:00:00Z"},
+}))' "$2")"
+  [[ "$(job_request POST "$jobs_customer_token" "verify-jobs-$1-$$" /v1/jobs "$body" "$out")" == "201" ]] \
+    || { cat "$out"; fail "could not create the draft for $1"; }
+  json "$out" '["id"]'
+}
+
+# Docs/04 §2 requires email and phone verified before publishing and is explicit that an account
+# may create drafts without them. This account registered at the top of the file and has verified
+# neither, so the refusal below is the document's first row rather than a fixture artefact.
+publish_job="$(publishable_draft publish-draft "$jobs_carried_category")"
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-pub-unverified-$$" \
+  "/v1/jobs/$publish_job/publish" '{"accepts_terms":true}' "$WORKDIR/jobs-pub-unverified.json")"
+[[ "$status" == "403" ]] || { cat "$WORKDIR/jobs-pub-unverified.json"; fail "publishing unverified returned $status, want 403"; }
+[[ "$(json "$WORKDIR/jobs-pub-unverified.json" '["error"]["code"]')" == "jobs_customer_not_verified" ]] \
+  || { cat "$WORKDIR/jobs-pub-unverified.json"; fail "the refusal does not name jobs_customer_not_verified"; }
+ok "an unverified customer cannot publish — Docs/04 §2, and the code says which screen to send them to"
+
+# Verified straight in the database rather than through the two verification endpoints. Those are
+# 40-identity.sh's to demonstrate and it does; repeating the token-and-OTP dance here would make
+# this section fail for reasons that belong to another one.
+"$PSQL" "$DATABASE_URL" -q -c \
+  "update users set email_verified_at = now(), phone_verified_at = now() where id = '$jobs_customer_id';" \
+  || fail "could not verify the job customer"
+
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-pub-noterms-$$" \
+  "/v1/jobs/$publish_job/publish" '{"accepts_terms":false}' "$WORKDIR/jobs-pub-noterms.json")"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/jobs-pub-noterms.json"; fail "publishing without the declaration returned $status, want 422"; }
+[[ "$(json "$WORKDIR/jobs-pub-noterms.json" '["error"]["code"]')" == "jobs_terms_not_accepted" ]] \
+  || { cat "$WORKDIR/jobs-pub-noterms.json"; fail "the refusal does not name jobs_terms_not_accepted"; }
+ok "the terms and goods declaration is required, and false is refused rather than ignored"
+
+# An empty draft, to show every missing field is reported at once rather than one request at a time.
+empty_job="$(new_draft publish-empty)"
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-pub-empty-$$" \
+  "/v1/jobs/$empty_job/publish" '{"accepts_terms":true}' "$WORKDIR/jobs-pub-empty.json")"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/jobs-pub-empty.json"; fail "publishing an empty draft returned $status, want 422"; }
+python3 - "$WORKDIR/jobs-pub-empty.json" <<'INCOMPLETE' || fail "the refusal does not report every missing field at once"
+import json, sys
+
+error = json.load(open(sys.argv[1]))["error"]
+if error["code"] != "validation_failed":
+    print("code is", error["code"], file=sys.stderr)
+    sys.exit(1)
+
+reported = {d["field"] for d in error.get("details", [])}
+missing = {"pickup", "dropoff", "goods_description", "goods_category", "pickup_window.start"} - reported
+if missing:
+    print("not reported:", sorted(missing), "- got", sorted(reported), file=sys.stderr)
+    sys.exit(1)
+INCOMPLETE
+ok "an incomplete job names every missing field in one answer, not one round trip each"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-59  a job in a prohibited category cannot be published, and the refusal explains why"
+
+refused_job="$(publishable_draft publish-refused "$jobs_refused_category")"
+ok "a draft may name a category the platform does not carry — the prohibition is on publish"
+
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-pub-refused-$$" \
+  "/v1/jobs/$refused_job/publish" '{"accepts_terms":true}' "$WORKDIR/jobs-pub-refused.json")"
+[[ "$status" == "422" ]] || { cat "$WORKDIR/jobs-pub-refused.json"; fail "publishing prohibited goods returned $status, want 422"; }
+[[ "$(json "$WORKDIR/jobs-pub-refused.json" '["error"]["code"]')" == "jobs_prohibited_category" ]] \
+  || { cat "$WORKDIR/jobs-pub-refused.json"; fail "the refusal does not name jobs_prohibited_category"; }
+ok "publishing it is refused with jobs_prohibited_category rather than a generic validation failure"
+
+# "Explains why": the message carries the catalogue's own wording for that category, so it moves
+# when operations change the policy and needs no release.
+python3 - "$WORKDIR/jobs-categories.json" "$WORKDIR/jobs-pub-refused.json" "$jobs_refused_category" <<'EXPLAINS' \
+  || fail "the refusal does not quote the catalogue's own wording"
+import json, sys
+
+catalogue = json.load(open(sys.argv[1]))["categories"]
+message = json.load(open(sys.argv[2]))["error"]["message"]
+code = sys.argv[3]
+
+entry = next(c for c in catalogue if c["code"] == code)
+if entry["label"].lower() not in message.lower():
+    print("the message does not name", entry["label"], "-", message, file=sys.stderr)
+    sys.exit(1)
+if entry.get("description") and entry["description"] not in message:
+    print("the message does not carry the catalogue's description -", message, file=sys.stderr)
+    sys.exit(1)
+EXPLAINS
+ok "and the explanation is the catalogue's own label and description, not a sentence compiled into the service"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select status from jobs where id = '$refused_job';")" == "Draft" ]] \
+  || fail "the refused job moved"
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select terms_accepted_at is null from jobs where id = '$refused_job';")" == "t" ]] \
+  || fail "the refused publication recorded a declaration"
+ok "the refused job is still a Draft and no declaration was recorded"
+
+# ---------------------------------------------------------------------------------------
+ticket "SHIP-63  a complete job published by a verified customer reaches Open"
+
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-pub-$$" \
+  "/v1/jobs/$publish_job/publish" '{"accepts_terms":true}' "$WORKDIR/jobs-pub.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-pub.json"; fail "publishing returned $status, want 200"; }
+[[ "$(json "$WORKDIR/jobs-pub.json" '["status"]')" == "open" ]] \
+  || { cat "$WORKDIR/jobs-pub.json"; fail "the published job is not open"; }
+ok "the job is Open — the first time in this platform's history that a job has been published through the product"
+
+# The transition went through the guard: 000402 refuses a status write without a job_status_history
+# row written in the same transaction, so a row here is proof the route to Open was not a shortcut.
+history_rows="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$publish_job' and from_status = 'Draft' and to_status = 'Open';")"
+[[ "$history_rows" == "1" ]] || fail "there are $history_rows Draft-to-Open history rows, want 1"
+ok "one job_status_history row records Draft to Open, so the transition passed the guard"
+
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select terms_accepted_at is not null from jobs where id = '$publish_job';")" == "t" ]] \
+  || fail "no declaration was recorded"
+ok "the declaration is recorded against the job, per Docs/04 §2's 'required for every job'"
+
+# 000406's trigger derives the deadline as the job becomes Open. Nothing in Go computes it, so this
+# is the only place the trigger's part in publication is demonstrated end to end.
+[[ "$("$PSQL" "$DATABASE_URL" -tAc "select expires_at is not null from jobs where id = '$publish_job';")" == "t" ]] \
+  || fail "expires_at was not set as the job became Open"
+ok "expires_at is set by 000406's trigger, so the listing period starts at publication"
+
+# A retry with a fresh idempotency key is absorbed rather than refused or duplicated.
+status="$(job_request POST "$jobs_customer_token" "verify-jobs-pub-again-$$" \
+  "/v1/jobs/$publish_job/publish" '{"accepts_terms":true}' "$WORKDIR/jobs-pub-again.json")"
+[[ "$status" == "200" ]] || { cat "$WORKDIR/jobs-pub-again.json"; fail "republishing returned $status, want 200"; }
+history_rows="$("$PSQL" "$DATABASE_URL" -tAc \
+  "select count(*) from job_status_history where job_id = '$publish_job';")"
+[[ "$history_rows" == "1" ]] || fail "publishing twice wrote $history_rows history rows, want 1"
+ok "publishing again under a fresh key is absorbed — one transition, one event, one declaration"
+
+# A stranger's publication is the same 404 as a job that does not exist.
+stranger_job="$(publishable_draft publish-stranger "$jobs_carried_category")"
+status="$(job_request POST "$jobs_other_token" "verify-jobs-pub-stranger-$$" \
+  "/v1/jobs/$stranger_job/publish" '{"accepts_terms":true}' "$WORKDIR/jobs-pub-stranger.json")"
+[[ "$status" == "404" ]] || { cat "$WORKDIR/jobs-pub-stranger.json"; fail "a stranger publishing returned $status, want 404"; }
+ok "somebody else's job answers 404, exactly as editing and cancelling do"
+
+unset publish_job empty_job refused_job stranger_job history_rows
+unset jobs_carried_category jobs_refused_category
+unset -f publishable_draft
