@@ -6,6 +6,12 @@
     "skipLibCheck": true,
     "strict": true,
     "noEmit": true,
+    // Lets lib/*.test.ts import ./session.ts by its real name (SHIP-188a). Node 22 strips the
+    // types itself and resolves ESM by exact filename, so the tests need no build step and no
+    // test framework in this application's dependencies. Legal only with noEmit, which is set
+    // above, and nothing Next bundles uses the form. The driver portal carries the same line
+    // for the same reason (SHIP-120).
+    "allowImportingTsExtensions": true,
     "esModuleInterop": true,
     "module": "esnext",
     "moduleResolution": "bundler",
