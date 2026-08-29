@@ -535,12 +535,31 @@ What does work is an endpoint the app reads **while it still has signal** and ke
 | SHIP-187b | SMTP email transport | 3 | A message sent over SMTP is accepted by a mail server with its headers and body intact, and a credential is refused over an unencrypted connection | SHIP-187a |
 | SHIP-188 | Demonstration environment | 5 | The API answers /health over HTTPS at a stable hostname, with migrations and the topic set applied by the same deployment | SHIP-187, SHIP-187b, X-11 |
 | SHIP-188a | Admin panel sign-in, and a session the browser cannot read | 5 | An administrator signs in with a password at the panel and reaches the shell showing their name, role and permissions; the session token is set as an httpOnly cookie by a route handler and appears in no response body, no `localStorage`, no `sessionStorage` and no script-readable cookie, held by a guard test over `app/`, `components/` and `lib/`; signing out ends the platform session, so replaying the same cookie answers 401; an absent or expired cookie lands on the sign-in form rather than a blank screen; and `make web-check` runs that guard, which it does not today because `apps/admin/package.json` has no `test` script | SHIP-22, SHIP-23a, SHIP-147, SHIP-148 |
-| SHIP-188b | Admin user and job search | 3 | A term typed into the panel finds an account by email, phone, name or status and a job by identifier, status or party; both page through the platform's own cursor rather than a client-side slice; each upstream endpoint is named in exactly one route handler as a literal template with one hole; and a search made by a session without the permission renders the platform's refusal rather than an empty table | SHIP-188a, SHIP-30a, SHIP-151, SHIP-152 |
+| SHIP-188b | Admin user and job search | 3 | A term typed into the panel finds an account by email, phone, name or status and a job by identifier, status or party; both page through the platform's own cursor rather than a client-side slice; each upstream endpoint is named in exactly one file as a literal template whose only hole is where the platform is; and a search made by a session without the permission renders the platform's refusal rather than an empty table | SHIP-188a, SHIP-30a, SHIP-151, SHIP-152 |
 | SHIP-188c | Admin job detail with its audit trail | 3 | Opening a job from the search shows its status history, its bids and its parties, and beneath it the audit entries naming the actor, the action, the target and the time — so `Docs/01` §8's "an administrator finds the job and reads its audit trail" runs through the product with no database access at any point; and the entry SHIP-188d's decision writes appears in that trail | SHIP-188b, SHIP-150, SHIP-152, SHIP-165 |
 | SHIP-188d | Admin verification queue, evidence and decision | 5 | The queue lists providers awaiting review oldest first, with `state` sent explicitly rather than defaulted; a reviewer opens `Docs/04` §3's document images through the short-lived signed URLs the platform issues, and the panel keeps neither a URL nor an object key; a decision of Verified, Restricted, Rejected or Suspended is recorded with its reason under an `Idempotency-Key` minted in the browser, so a double-click records one decision; and the provider's own app then reports the new state — so `Docs/01` §8's "a provider registers, is verified" runs end to end through two products' own interfaces | SHIP-188a, SHIP-153, SHIP-154, SHIP-155 |
 | SHIP-189 | Deploy the admin panel and the driver portal | 3 | Each surface builds to an image that starts from environment configuration alone and is served over HTTPS at its own name under the one X-11 registered; an administrator signs in at the panel and reads a job's audit trail against the demonstration API; a driver link opens on a handset with no account; and neither bundle carries a compiled-in API host, because both read `SHIPPER_API_BASE_URL` server-side at request time | SHIP-188, SHIP-188c, SHIP-188d, X-11 |
 | SHIP-190 | Demonstration build of the mobile app | 2 | An installable Android build talks to the demonstration API with no change to any source file | SHIP-188 |
 | SHIP-191 | Demonstration walkthrough | 2 | A written script drives every step of Docs 01 §8's demo gate against the hosted instance, unaided, with no direct database access | SHIP-186, SHIP-189, SHIP-190 |
+
+**SHIP-188b's third clause said "route handler" and was corrected to "file" when the ticket was
+built, rather than the contradiction being resolved in code.** The property that sentence protects is
+one endpoint per file, named as a literal, so a shared `forward(path, …)` cannot appear — and that
+property is unchanged. What changed is the mechanism the panel uses to reach a read: SHIP-188a had
+already established one file per endpoint rather than the driver portal's stricter "only a route
+handler may name one", because `lib/administrator.ts` resolves the session during a server render and
+a route handler for it would have been a browser-reachable endpoint for nobody to call. The searches
+are the same shape. Rendering them on the server means the panel adds no JSON proxy over a privileged
+read, and the cursor lives in the URL where a client-side slice cannot — which is the clause before it
+satisfied as a property rather than as a claim. `Docs/11` §11 records the correction.
+
+**SHIP-188b has a fourth dependency the column does not carry: SHIP-188c.** Its "finds … a job by
+identifier" clause has no endpoint behind it — `GET /v1/admin/jobs` matches `q` against
+`goods_description` and nothing else — so the panel recognises an identifier and takes the operator to
+the job, and the job's screen is SHIP-188c's. The clause is therefore not demonstrable until 188c
+lands. It is recorded here rather than added to the column because it is an edge between two rows that
+are built together on one branch, and a forward edge would change the count in *How to read this*
+above for no gain.
 
 **Every dependency here points backwards and that is why this milestone sits last rather than
 first.** Demonstration work wraps finished code: SHIP-186 cannot seed a published job until SHIP-63
