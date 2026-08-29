@@ -5,8 +5,12 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"image"
-	"image/color"
 	"image/png"
+
+	// Aliased to the Australian spelling so that the twelve uses below read the way the rest of
+	// this repository writes, and the American form appears exactly once — here, on an import
+	// path nobody chose the spelling of.
+	colour "image/color" // spelling:ok — standard library import path
 )
 
 // The proof photograph, drawn rather than photographed (SHIP-186).
@@ -52,20 +56,20 @@ func proofPhotograph(seedFrom string) ([]byte, error) {
 	// The palette is derived from the caller's string so that two jobs' photographs are
 	// distinguishable at a glance. Only the hue moves; the composition does not.
 	digest := sha256.Sum256([]byte(seedFrom))
-	accent := color.RGBA{R: 60 + digest[0]/2, G: 70 + digest[1]/2, B: 90 + digest[2]/2, A: 255}
+	accent := colour.RGBA{R: 60 + digest[0]/2, G: 70 + digest[1]/2, B: 90 + digest[2]/2, A: 255}
 
 	horizon := proofHeight * 58 / 100
 
 	// Background: a vertical gradient down to the horizon, then a flat floor. Two flat regions
 	// would read as a flag; the gradient is what makes it read as a space.
 	for y := range proofHeight {
-		var row color.RGBA
+		var row colour.RGBA
 		switch {
 		case y < horizon:
 			shade := uint8(200 - (y * 45 / horizon))
-			row = color.RGBA{R: shade - 20, G: shade - 8, B: shade, A: 255}
+			row = colour.RGBA{R: shade - 20, G: shade - 8, B: shade, A: 255}
 		default:
-			row = color.RGBA{R: 96, G: 98, B: 104, A: 255}
+			row = colour.RGBA{R: 96, G: 98, B: 104, A: 255}
 		}
 		for x := range proofWidth {
 			canvas.SetRGBA(x, y, row)
@@ -74,13 +78,13 @@ func proofPhotograph(seedFrom string) ([]byte, error) {
 
 	// The crate, centred on the floor line.
 	crate := image.Rect(proofWidth/2-230, horizon-210, proofWidth/2+230, horizon+150)
-	fill(canvas, crate, color.RGBA{R: 168, G: 130, B: 84, A: 255})
+	fill(canvas, crate, colour.RGBA{R: 168, G: 130, B: 84, A: 255})
 
 	// Its lid and its shadow, which is all it takes to stop the rectangle reading as a hole.
 	fill(canvas, image.Rect(crate.Min.X, crate.Min.Y, crate.Max.X, crate.Min.Y+46),
-		color.RGBA{R: 190, G: 150, B: 98, A: 255})
+		colour.RGBA{R: 190, G: 150, B: 98, A: 255})
 	fill(canvas, image.Rect(crate.Min.X-40, crate.Max.Y, crate.Max.X+40, crate.Max.Y+26),
-		color.RGBA{R: 74, G: 76, B: 82, A: 255})
+		colour.RGBA{R: 74, G: 76, B: 82, A: 255})
 
 	// Two straps in the derived accent, so the per-job colour lands somewhere structural.
 	fill(canvas, image.Rect(crate.Min.X+96, crate.Min.Y, crate.Min.X+140, crate.Max.Y), accent)
@@ -89,8 +93,8 @@ func proofPhotograph(seedFrom string) ([]byte, error) {
 	// A label plate on the crate's face. Blank on purpose: a drawn rectangle where a consignment
 	// note would be, carrying nothing that could identify anybody.
 	plate := image.Rect(crate.Min.X+176, crate.Min.Y+150, crate.Max.X-176, crate.Min.Y+264)
-	fill(canvas, plate, color.RGBA{R: 246, G: 244, B: 238, A: 255})
-	outline(canvas, plate, 4, color.RGBA{R: 120, G: 96, B: 62, A: 255})
+	fill(canvas, plate, colour.RGBA{R: 246, G: 244, B: 238, A: 255})
+	outline(canvas, plate, 4, colour.RGBA{R: 120, G: 96, B: 62, A: 255})
 
 	var encoded bytes.Buffer
 	if err := png.Encode(&encoded, canvas); err != nil {
@@ -100,7 +104,7 @@ func proofPhotograph(seedFrom string) ([]byte, error) {
 }
 
 // fill paints one rectangle, clipped to the canvas.
-func fill(canvas *image.RGBA, area image.Rectangle, shade color.RGBA) {
+func fill(canvas *image.RGBA, area image.Rectangle, shade colour.RGBA) {
 	area = area.Intersect(canvas.Bounds())
 	for y := area.Min.Y; y < area.Max.Y; y++ {
 		for x := area.Min.X; x < area.Max.X; x++ {
@@ -110,7 +114,7 @@ func fill(canvas *image.RGBA, area image.Rectangle, shade color.RGBA) {
 }
 
 // outline draws a border of the given thickness inside area.
-func outline(canvas *image.RGBA, area image.Rectangle, thickness int, shade color.RGBA) {
+func outline(canvas *image.RGBA, area image.Rectangle, thickness int, shade colour.RGBA) {
 	fill(canvas, image.Rect(area.Min.X, area.Min.Y, area.Max.X, area.Min.Y+thickness), shade)
 	fill(canvas, image.Rect(area.Min.X, area.Max.Y-thickness, area.Max.X, area.Max.Y), shade)
 	fill(canvas, image.Rect(area.Min.X, area.Min.Y, area.Min.X+thickness, area.Max.Y), shade)

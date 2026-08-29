@@ -88,11 +88,32 @@ question.
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 224 | 697 |
-| Remaining | 41 | 134 |
+| **Done** | 225 | 702 |
+| Remaining | 40 | 129 |
 | **Total** | 265 | 831 |
 
-**Measured on `ship-15au-status-gate-and-reconciliation`, whose base is `develop` at `8f553cd`.**
+**Measured on `ship-186-demo-seed-dataset`, whose base is `develop` at `3f9b8af`.** `make status` on
+this branch prints **225 / 265 and 702 / 831** with both guards green, and the figures above were read
+off that run rather than added up beside it.
+
+**The movement is SHIP-186, and it is the demonstration's content rather than its plumbing.** M8 goes
+to **8 of 12**; the totals move 224 → **225** and 697 → **702**. `make seed` populates a marketplace by
+driving the public API — the shape was chosen by the schema rather than by preference, and §3 carries
+the argument and the four things the run found that no reading would have.
+
+**It empties §6's startable set again, one pass after X-5 filled it.** SHIP-186 was the only startable
+code row in the backlog for exactly one pass. Every remaining row now waits on a decision, and **four
+of the five are the owner's to take rather than a third party's to grant** — X-10 needs nobody outside
+the building, and SHIP-156 and SHIP-174 need a `Docs/09` row that does not exist.
+
+**The gate that caught this pass's own mistake was `Docs/11-done.txt`.** The commit landed, `make
+status` exited 1 naming SHIP-186 as *landed in git but not in Docs/11-done.txt*, and the totals above
+were wrong by one ticket and five points until the list was edited. Worth recording because it is the
+opposite failure from wave 21's: that one printed correct totals behind a non-zero exit, and this one
+printed *stale* totals behind a non-zero exit. Both are only visible in `$?`.
+
+**The pass beneath it, measured on `ship-15au-status-gate-and-reconciliation`, whose base is `develop`
+at `8f553cd`.**
 `make status` on this branch prints **224 / 265 and 697 / 831** with both guards green, and the
 figures above were read off that run rather than added up beside it. A parser over `Docs/09`'s
 dependency column and `Docs/11-done.txt`, written for this pass, reproduced those counts and all
@@ -17090,6 +17111,23 @@ range, two jobs given one goods description, a bidder's postcodes moved off the 
 job put in a category Shipper refuses. Restored from a file copy and confirmed with `shasum -c` against a
 manifest written before the first mutation — `git diff` proves nothing here, because the package is
 untracked and every file in it reads as clean whatever was done to it.
+
+#### `make check` gave a false pass for as long as the package was untracked
+
+**`make lint-spelling` is `git grep`, and `git grep` does not see untracked files.** `make check` ran
+green three times on this branch while `services/core/cmd/seed/` held twelve uses of the standard
+library's RGBA type and one HTTP authorisation header, both spelled the American way because neither
+spelling was ours to choose. The first `git add` turned the same tree red.
+
+This is the same class as the wave-5 false pass and it needs no fix to the script — searching tracked
+files is the right behaviour for a linter, and `.gitignore` exists precisely so that build output is not
+linted. What is worth carrying is the working rule: **a new package's first `make check` means nothing
+until `git add`.** Every other gate in this repository reads the working tree, which is what makes this
+one's blindness invisible; `make test` and `make vet` compiled and ran the same files perfectly happily.
+
+Both matches were the documented case — a standard library import path and a header name fixed by
+RFC 9110 — and both are marked on the line, with the imported package aliased to `colour` so the
+American form appears exactly once in the file rather than thirteen times.
 
 #### What is deliberately not here
 

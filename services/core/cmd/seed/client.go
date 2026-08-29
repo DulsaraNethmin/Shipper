@@ -183,7 +183,7 @@ func (c *client) do(ctx context.Context, method, path string, body, out any) err
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if c.token != "" {
-		req.Header.Set("Authorization", c.header+" "+c.token)
+		req.Header.Set("Authorization", c.header+" "+c.token) // spelling:ok — HTTP header name, RFC 9110
 	}
 	if method != http.MethodGet {
 		req.Header.Set("Idempotency-Key", uuid.NewString())
