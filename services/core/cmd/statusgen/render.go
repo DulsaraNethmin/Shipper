@@ -23,7 +23,13 @@ func Render(s *Spec) []Output {
 	for _, e := range s.Enums {
 		out = append(out, Output{Path: e.Dart.File, Body: renderDart(e)})
 	}
-	out = append(out, Output{Path: s.TypeScript.File, Body: renderTypeScript(s)})
+
+	// One body, written to every surface that needs it. See Spec.TypeScript for why that is a
+	// copy per surface rather than a workspace package, and why two copies cannot drift.
+	body := renderTypeScript(s)
+	for _, f := range s.TypeScript.Files {
+		out = append(out, Output{Path: f, Body: body})
+	}
 	return out
 }
 

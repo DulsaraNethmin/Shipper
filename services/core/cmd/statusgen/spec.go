@@ -20,8 +20,22 @@ type Spec struct {
 	// TypeScript is one module for every enumeration, unlike Go and Dart. The reason is in the
 	// specification's own header: TypeScript has no equivalent of a Go package or a Flutter
 	// feature folder to put a single enumeration in.
+	//
+	// **Several files, all with the same body, and that is deliberately not a workspace
+	// package** (SHIP-188b). Go and Dart each get one file per enumeration because a package
+	// and a feature folder are places a single enumeration can live; TypeScript gets one module
+	// per *surface*, because a surface is the unit that has a place to put one. The admin panel
+	// and the driver portal are separate pnpm packages, and the alternative — publishing
+	// `@shipper/statuses` for two consumers in one repository — buys a build step, a version to
+	// keep in step and an entry in two `package.json` files, in exchange for deleting a
+	// generated file that nobody edits. Both surfaces run `node --test` over TypeScript with no
+	// build; a workspace package is the first thing that would end that.
+	//
+	// A copy per surface is safe for exactly the reason a hand-written one is not: the staleness
+	// test renders the specification and compares every path, so two copies cannot disagree
+	// without failing `make check`.
 	TypeScript struct {
-		File string `yaml:"file"`
+		Files []string `yaml:"files"`
 	} `yaml:"typescript"`
 
 	Enums []Enum `yaml:"enums"`
@@ -155,8 +169,8 @@ func (s *Spec) Validate() error {
 	if s.Version != 1 {
 		return fmt.Errorf("version: want 1, got %d", s.Version)
 	}
-	if s.TypeScript.File == "" {
-		return fmt.Errorf("typescript.file is required")
+	if len(s.TypeScript.Files) == 0 {
+		return fmt.Errorf("typescript.files: none")
 	}
 	if len(s.Enums) == 0 {
 		return fmt.Errorf("enums: none")
@@ -165,6 +179,21 @@ func (s *Spec) Validate() error {
 	seenEnum := map[string]bool{}
 	seenFile := map[string]string{}
 	seenTSType := map[string]bool{}
+
+	// The TypeScript outputs go into the same map as the Go and Dart ones, so a path repeated
+	// in the list — or one colliding with an enumeration's file — is refused rather than
+	// written twice. Two entries naming one path is the mistake a list invites and a single
+	// field could not make: the generator would write it, report it written, and the second
+	// write would be indistinguishable from the first.
+	for _, f := range s.TypeScript.Files {
+		if strings.TrimSpace(f) == "" {
+			return fmt.Errorf("typescript.files: a path is empty")
+		}
+		if _, ok := seenFile[f]; ok {
+			return fmt.Errorf("typescript.files: %s is listed twice", f)
+		}
+		seenFile[f] = "typescript"
+	}
 
 	for _, e := range s.Enums {
 		if e.Name == "" {

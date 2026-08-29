@@ -65,14 +65,29 @@ version: 1
 # package or a Flutter feature folder to put them in — and because the driver portal is a single
 # surface that will read a job status, a bid status and a proof exception reason on one screen.
 #
-# It lives in the driver portal rather than in a shared workspace package, and the admin panel
-# does not have a copy. pnpm-workspace.yaml anticipated that both would "eventually share the
-# same status enumeration"; eventually is not this ticket. The portal is the surface that shows a
-# driver where a job has reached, so it is the one with a use for the module — and a second
-# output is one line in this file when the admin panel grows a screen that needs one. Publishing
-# a workspace package for a consumer that does not exist would be the larger guess.
+# One module **per surface**, and SHIP-188b is the ticket that made it two. SHIP-56a wrote this
+# block saying "a second output is one line in this file when the admin panel grows a screen that
+# needs one", and the admin panel has now grown three: the job search filters on a status, the job
+# detail renders one beside a list of bid statuses, and both take the *stored* form because that is
+# what GET /v1/admin/jobs both accepts and returns. Without this line the panel would carry a
+# hand-written copy of twelve strings — which is the exact duplication this file was created to end,
+# and would be the third copy rather than the first.
+#
+# **It stayed one line, and the generator gained a list rather than the panel gaining a package.**
+# pnpm-workspace.yaml anticipated the two surfaces "eventually sharing the same status
+# enumeration" and a workspace package is the obvious way to do it. It was refused: @shipper/statuses
+# would buy a build step, a version to keep in step and an entry in two package.json files, in
+# exchange for deleting a generated file nobody edits. Both surfaces run their tests as `node --test`
+# over TypeScript directly, with no build, and a workspace package is the first thing that would end
+# that.
+#
+# **Two copies cannot disagree**, which is the property that makes copying acceptable here and would
+# not make a hand-written second copy acceptable: TestGeneratedFilesAreCurrent renders this
+# specification and compares every path, so an edit to one file and not the other fails `make check`.
 typescript:
-  file: apps/driver-portal/lib/statuses.gen.ts
+  files:
+    - apps/driver-portal/lib/statuses.gen.ts
+    - apps/admin/lib/statuses.gen.ts
 
 enums:
   - name: job_status
