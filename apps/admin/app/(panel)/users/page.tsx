@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { platformHeaders } from "@/lib/credential";
 import { instant, shortIdentifier } from "@/lib/format";
-import { href, one } from "@/lib/query";
+import { href, isIdentifier, one } from "@/lib/query";
 import { answered, type Answer, type Page, platform } from "@/lib/upstream";
 
 /**
@@ -179,8 +179,22 @@ export default async function UsersPage(props: PageProps<"/users">) {
             <tbody>
               {rows.length === 0 ? (
                 <EmptyRow span={7}>
-                  No account matched. Every account is searchable here, so this is an absence rather
-                  than a limit on what you may see.
+                  {/*
+                    An identifier gets its own sentence, because the empty table would otherwise be
+                    a lie by omission. `GET /v1/admin/users` matches an address, a name or a phone
+                    number and never an identifier, and there is no `GET /v1/admin/users/{id}` among
+                    the twenty-four routes — so an account identifier finds nothing here, and the
+                    honest thing is to say that rather than let somebody read it as "no such
+                    account". The job search can send an identifier to the job it names; this one
+                    has nowhere to send it. Docs/11 §4 carries the gap.
+                  */}
+                  {isIdentifier(term)
+                    ? "That is an account identifier, and this search does not match one — it " +
+                      "matches an email address, a name or a phone number. The platform serves no " +
+                      "endpoint that opens an account by its identifier, so this is a gap in the " +
+                      "product rather than an account that does not exist."
+                    : "No account matched. Every account is searchable here, so this is an " +
+                      "absence rather than a limit on what you may see."}
                 </EmptyRow>
               ) : (
                 rows.map((account) => (

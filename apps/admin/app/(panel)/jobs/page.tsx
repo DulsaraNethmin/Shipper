@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { platformHeaders } from "@/lib/credential";
 import { instant, shortIdentifier } from "@/lib/format";
-import { href, one } from "@/lib/query";
+import { href, isIdentifier, one } from "@/lib/query";
 import { jobStatusLabels, jobStatusValues } from "@/lib/statuses.gen";
 import { answered, type Answer, type Page, platform } from "@/lib/upstream";
 
@@ -38,6 +38,23 @@ import { answered, type Answer, type Page, platform } from "@/lib/upstream";
  * So the options are the labels of `lib/statuses.gen.ts` rather than its values, and the module is
  * generated from `contracts/statuses.yaml` rather than typed here — which is the whole of SHIP-56a
  * and is why this panel got a second output rather than a hand-written list of twelve strings.
+ *
+ * # A term that is an identifier is the job, and not a description to match against
+ *
+ * The last of `Docs/09`'s SHIP-188b terms — "finds … a job by identifier" — and the platform serves
+ * nothing for it: `SearchJobs` matches `q` against `goods_description` and only that. An operator who
+ * pastes a job identifier out of a log line, an audit entry or another screen would otherwise read an
+ * empty table, which is the single most misleading answer this screen can give — it says the job does
+ * not exist, about a job they are holding the identifier of.
+ *
+ * So an identifier is recognised and the browser is sent to the job. The alternative was a new `id`
+ * filter on an endpoint SHIP-152 already closed — platform work inside a panel ticket, and a second
+ * way of asking a question `GET /v1/admin/jobs/{id}` already answers exactly.
+ *
+ * **It is `redirect` rather than a link offered beside the table**, so the URL a person ends on is
+ * the job's own and can be pasted into a ticket. Nothing is lost: the detail screen renders the
+ * platform's `not_found` for an identifier that names no job, which is a better answer than a search
+ * that quietly found nothing.
  */
 
 /** One job as `adminJobResponse` serves it. Nothing commercial and nothing locating. */
@@ -68,6 +85,10 @@ export default async function JobsPage(props: PageProps<"/jobs">) {
   const status = one(params.status);
   const customer = one(params.customer);
   const cursor = one(params.cursor);
+
+  // Before the credential is even read: this is navigation rather than a search, and the job's own
+  // screen asks the platform for what it needs. See the file note.
+  if (isIdentifier(term)) redirect(`/jobs/${term}`);
 
   const headers = await platformHeaders();
   if (headers === null) redirect("/sign-in");
@@ -105,19 +126,19 @@ export default async function JobsPage(props: PageProps<"/jobs">) {
         <h1 className="text-2xl font-semibold tracking-tight">Jobs and bids</h1>
         <p className="text-muted-foreground mt-1 text-sm">
           Search every job by what is being sent, and narrow by status or by the customer who
-          published it. Requires <code className="font-mono text-xs">jobs.read</code>, which every
-          role holds.
+          published it. Paste a job identifier and you are taken straight to it. Requires{" "}
+          <code className="font-mono text-xs">jobs.read</code>, which every role holds.
         </p>
       </div>
 
       <form method="get" action="/jobs" className="flex flex-wrap items-end gap-3">
         <div className="flex min-w-64 flex-1 flex-col gap-2">
-          <Label htmlFor="q">Goods description</Label>
+          <Label htmlFor="q">Goods description, or a job identifier</Label>
           <Input
             id="q"
             name="q"
             defaultValue={term}
-            placeholder="two-seater sofa"
+            placeholder="two-seater sofa, or 0198f2c1-…"
             autoCapitalize="none"
             spellCheck={false}
           />
