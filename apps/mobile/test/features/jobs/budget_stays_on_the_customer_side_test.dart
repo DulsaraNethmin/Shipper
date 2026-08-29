@@ -64,6 +64,21 @@ const _allowed = <String, String>{
   // separate screen reading a separate type, exactly as the platform writes a second response
   // shape rather than redacting this one.
   'lib/features/jobs/job_detail_screen.dart': 'the owner’s own job, in full',
+
+  // The review step of the job wizard (SHIP-74), which is where the budget is entered. Every job
+  // it can reach is one the caller is *creating*, and `PATCH /v1/jobs/{id}` answers `404` to
+  // anybody else byte-identically to a job that does not exist — so the answer needs no "when" in
+  // it. The amount is typed into a field private to this file and read back only from `Job`, the
+  // owner-only schema; the summary this screen draws is explicit that the budget is the one thing
+  // on it no provider sees.
+  'lib/features/jobs/job_review_screen.dart': 'the owner entering their own maximum',
+
+  // `budgetBody`, which builds `{'budget_cents': …}` for `PATCH /v1/jobs/{id}` (SHIP-74). This is
+  // the budget travelling **to** the platform on the owner's own request, which is the direction
+  // Docs/01 §4.3 does not constrain — the rule is about what reaches a provider. The file's
+  // provider-facing sibling is `open_jobs_repository.dart`, which is not on this list and reads
+  // `OpenJob`, a type held to a closed key set below.
+  'lib/features/jobs/jobs_repository.dart': 'the owner’s own write, not a provider’s read',
 };
 
 /// What a reference to the budget looks like in Dart or on the wire.

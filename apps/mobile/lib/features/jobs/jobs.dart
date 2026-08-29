@@ -5,7 +5,7 @@
 /// - `job.dart` — the `Job` schema from `contracts/paths/jobs.yaml`, and `AddressInput`, which is
 ///   an address on its way *to* the platform.
 /// - `job_status.dart` — the twelve states of `Docs/02` §1, in their wire form.
-/// - `jobs_repository.dart` — the five endpoints a customer screen calls.
+/// - `jobs_repository.dart` — the six endpoints a customer screen calls.
 /// - `job_locations_screen.dart` and its controller — the first step of publishing (SHIP-71).
 /// - `job_wizard.dart` — the four steps of describing a delivery, and the chrome they share.
 /// - `job_draft_controller.dart` — the spine of the wizard: one draft, read once and edited a
@@ -16,6 +16,8 @@
 ///   unauthenticated, and describes no job.
 /// - `job_goods_screen.dart` — the second step: what is being moved (SHIP-72).
 /// - `job_schedule_screen.dart` — the third step: when it moves and what it needs (SHIP-73).
+/// - `job_review_screen.dart` — the fourth step: the optional budget, the whole job read back, and
+///   `POST /v1/jobs/{id}/publish` (SHIP-74). The end of the journey the marketplace waited on.
 /// - `date_field.dart` — a date-only picker. `features/bidding`'s `InstantField` is the same shape
 ///   and the wrong control: a bid promises a time, and a job's window only constrains a day.
 /// - `customer_job_list.dart` and its controller — the customer's own jobs (SHIP-76).

@@ -5,6 +5,7 @@ import 'package:freezed_annotation/freezed_annotation.dart';
 
 import 'package:shipper/core/api/idempotency_key.dart';
 import 'package:shipper/core/errors/api_failure.dart';
+import 'package:shipper/features/jobs/customer_jobs_controller.dart';
 import 'package:shipper/features/jobs/job.dart';
 import 'package:shipper/features/jobs/jobs_repository.dart';
 
@@ -81,6 +82,15 @@ class JobDraftController extends Notifier<JobDraftState> {
 
   final _saveKey = ActionKey();
 
+  /// A second key, because publishing is a different action from saving.
+  ///
+  /// One [ActionKey] would fingerprint the two bodies apart and mint different keys anyway, so
+  /// this is not about correctness of the key — it is about the *retention* rule. A save that
+  /// failed unknown-outcome retains its key so the retry replays; a publish that follows it must
+  /// not be able to inherit that retention, and keeping them apart is how that is guaranteed
+  /// rather than reasoned about.
+  final _publishKey = ActionKey();
+
   @override
   JobDraftState build() {
     // Reading the repository is synchronous and the request is not: `_load` suspends at its first
@@ -121,6 +131,51 @@ class JobDraftController extends Notifier<JobDraftState> {
       // kept as an unknown outcome: nothing here establishes whether the platform stored the edit.
       const failure = ApiMalformedResponse(statusCode: 0);
       _saveKey.settled(failure);
+      _failedSaving(failure);
+      return false;
+    }
+  }
+
+  /// Publishes the draft, and returns `true` when the platform opened it to providers.
+  ///
+  /// **The status is not set here and cannot be.** `POST /v1/jobs/{id}/publish` is a verb under
+  /// the resource: the client names an intent, the platform runs `publishable` and the transition
+  /// guard, and answers with the job as it now is (`Docs/02` §2). There is no `status` field in
+  /// any request body in this API.
+  ///
+  /// A refusal is left on [JobDraftState.failure] for the screen to render, because the four the
+  /// platform can give want four different things from the customer: a category Shipper will not
+  /// carry, an unverified account, a declaration that was not made, and a list of missing fields
+  /// that live on earlier steps.
+  Future<bool> publish({required bool acceptsTerms}) async {
+    final body = publicationBody(acceptsTerms: acceptsTerms);
+    final key = _publishKey.forRequest(body);
+
+    state = state.copyWith(saving: true, failure: null);
+
+    try {
+      final published = await ref.read(jobsRepositoryProvider).publish(
+            jobId: jobId,
+            acceptsTerms: acceptsTerms,
+            idempotencyKey: key,
+          );
+
+      _publishKey.settled(null);
+      if (ref.mounted) {
+        // The customer's own list now has a job in a different status, and it is read on arrival
+        // rather than pushed to — so it is invalidated here rather than left to go stale until
+        // something else happens to refresh it.
+        ref.invalidate(customerJobsProvider);
+        state = state.copyWith(saving: false, draft: published, failure: null);
+      }
+      return true;
+    } on ApiFailure catch (failure) {
+      _publishKey.settled(failure);
+      _failedSaving(failure);
+      return false;
+    } catch (error) {
+      const failure = ApiMalformedResponse(statusCode: 0);
+      _publishKey.settled(failure);
       _failedSaving(failure);
       return false;
     }

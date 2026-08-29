@@ -385,6 +385,68 @@ void main() {
     });
   });
 
+  group('the budget body', () {
+    test('is one key, in cents', () {
+      // Minor units as a whole number, because money is never a float and a JSON number written as
+      // `1500.50` is one (`Docs/10` §3.3).
+      expect(budgetBody(cents: 150050), <String, Object?>{'budget_cents': 150050});
+    });
+
+    test('a budget nobody gave is the value that clears it', () {
+      expect(budgetBody(), <String, Object?>{'budget_cents': 0});
+    });
+  });
+
+  group('the publication body', () {
+    test('is the one field the contract requires', () {
+      expect(publicationBody(acceptsTerms: true), <String, Object?>{'accepts_terms': true});
+    });
+
+    test('sends what the customer actually did, rather than always true', () {
+      // `false` is refused with `jobs_terms_not_accepted` rather than ignored. A client that
+      // hard-coded `true` would record an acceptance nobody made — which is the whole point of
+      // asking for a declaration.
+      expect(publicationBody(acceptsTerms: false), <String, Object?>{'accepts_terms': false});
+    });
+
+    test('carries no status, and there is no field for one', () {
+      final body = publicationBody(acceptsTerms: true);
+
+      // Publishing is the one request in this API a client might expect to carry a status, and it
+      // is a verb under the resource precisely so that it does not. `Docs/02` §2 and `CLAUDE.md`:
+      // job status is never a settable field.
+      expect(body.containsKey('status'), isFalse);
+      expect(jsonEncode(body), isNot(contains('status')));
+      expect(body.keys, hasLength(1));
+    });
+  });
+
+  group('publishing', () {
+    test('POSTs the verb under the resource with the idempotency key it was given', () async {
+      final stub = _repoReturning(_draft);
+
+      await stub.repo.publish(jobId: 'job-1', acceptsTerms: true, idempotencyKey: 'key-1');
+
+      final sent = stub.adapter.requests.single;
+      expect(sent.method, 'POST');
+      expect(sent.path, '/v1/jobs/job-1/publish');
+      expect(sent.headers['Idempotency-Key'], 'key-1');
+      expect(_sentBody(sent), <String, Object?>{'accepts_terms': true});
+    });
+
+    test('a publication with no idempotency key is refused before it is sent', () async {
+      final stub = _repoReturning(_draft);
+
+      // The middleware fails closed, and so does the client: a state-changing request without a
+      // key is refused rather than sent and rejected.
+      await expectLater(
+        stub.repo.publish(jobId: 'job-1', acceptsTerms: true, idempotencyKey: ''),
+        throwsA(isA<StateError>()),
+      );
+      expect(stub.adapter.requests, isEmpty);
+    });
+  });
+
   group('cancelling', () {
     test('POSTs the verb under the resource, and sends no status', () async {
       // Job status is never a settable field (`Docs/02` §2, `CLAUDE.md`). A client naming the

@@ -82,6 +82,31 @@ abstract interface class JobsRepository {
   /// exist. That is the platform's decision and this client neither softens nor explains it.
   Future<Job> job({required String jobId});
 
+  /// `POST /v1/jobs/{id}/publish` (SHIP-63) — makes the caller's draft visible to providers.
+  ///
+  /// **A verb under the resource, because status is never a settable field** (`Docs/02` §2,
+  /// `CLAUDE.md`). The client names an intent; the platform decides what the status becomes.
+  ///
+  /// [acceptsTerms] is the declaration `Docs/04` §2 requires **for every job** rather than once
+  /// per account — it is about these goods, made by a customer who has just described them. It is
+  /// sent as what the customer actually did: `false` is refused with `jobs_terms_not_accepted`
+  /// rather than ignored, because a client sending it has said the customer declined and a `200`
+  /// would record an acceptance nobody made.
+  ///
+  /// The refusals want different responses from a screen and are worth naming here:
+  /// `jobs_prohibited_category` (422) — Shipper does not carry these goods, quoted in the
+  /// catalogue's own words; `jobs_customer_not_verified` (403) — the email address or the phone
+  /// number is outstanding; `validation_failed` (422) — a required field is missing, every one of
+  /// them listed at once; `jobs_not_publishable` (409) — the job is not a draft.
+  ///
+  /// **Publishing a job that is already open answers `200`** and records nothing further, which is
+  /// a phone that lost its connection, restarted and generated a fresh key for the same intent.
+  Future<Job> publish({
+    required String jobId,
+    required bool acceptsTerms,
+    required String idempotencyKey,
+  });
+
   /// `POST /v1/jobs/{id}/cancel` (SHIP-64) — ends a job the caller owns, before it is awarded.
   ///
   /// **A verb under the resource, because status is never a settable field** (`Docs/02` §2,
@@ -154,6 +179,21 @@ final class ApiJobsRepository implements JobsRepository {
   @override
   Future<Job> job({required String jobId}) async {
     return Job.fromJson(await _client.getJson('$_base/$jobId'));
+  }
+
+  @override
+  Future<Job> publish({
+    required String jobId,
+    required bool acceptsTerms,
+    required String idempotencyKey,
+  }) async {
+    return Job.fromJson(
+      await _client.postJson(
+        '$_base/$jobId/publish',
+        idempotencyKey: idempotencyKey,
+        body: publicationBody(acceptsTerms: acceptsTerms),
+      ),
+    );
   }
 
   @override
@@ -269,6 +309,37 @@ Map<String, Object?> scheduleBody({
     'vehicle_requirement': vehicleRequirement,
     'handling_notes': handlingNotes,
   };
+}
+
+/// The body of the budget step (SHIP-74).
+///
+/// One key, always sent, and `0` is how a customer clears a budget they had set — which the
+/// contract names explicitly and which is why this is a function rather than a literal at the call
+/// site.
+///
+/// **In cents, never dollars** (`Docs/10` §3.3). Money is never a float and a JSON number written
+/// as `1500.50` is one; `centsFromAud` does the conversion on the text rather than through a
+/// `double`, so no amount is ever a cent adrift from what somebody typed.
+///
+/// **Never disclosed to a provider, in any form** (`Docs/01` §4.3). Not as an amount, not as a
+/// band, and not as a "budget supplied" flag. It travels to the platform on the customer's own
+/// request and comes back only on the customer's own view of the job.
+Map<String, Object?> budgetBody({int? cents}) {
+  return <String, Object?>{'budget_cents': cents ?? 0};
+}
+
+/// The body of a publication (SHIP-63, SHIP-74).
+///
+/// One field, and the contract marks it required: `Docs/04` §2 asks for the terms and the goods
+/// declaration "for every job", so it is asked every time rather than remembered against the
+/// account. The declaration is about *these* goods, made by a customer who has just described
+/// them.
+///
+/// The value sent is what the customer actually did. `false` is refused with
+/// `jobs_terms_not_accepted` rather than quietly ignored — a client that sent it has said the
+/// customer declined, and answering `200` would record an acceptance nobody made.
+Map<String, Object?> publicationBody({required bool acceptsTerms}) {
+  return <String, Object?>{'accepts_terms': acceptsTerms};
 }
 
 /// The body of a cancellation (SHIP-77).

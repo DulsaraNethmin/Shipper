@@ -112,9 +112,10 @@ class _ScheduleFormState extends ConsumerState<_ScheduleForm> {
     if (!mounted) return;
 
     if (saved) {
-      // The review step is SHIP-74 and does not exist yet, so this returns to the customer's own
-      // jobs rather than to a route that is not registered. The draft is waiting there.
-      context.go(Routes.home);
+      // Pushed rather than gone to, so the earlier steps stay on the stack: the review step names
+      // any field the platform still wants, and Back is how the customer reaches the step that
+      // owns it.
+      unawaited(context.push(Routes.jobReviewFor(widget.jobId)));
       return;
     }
 
