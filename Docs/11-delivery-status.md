@@ -975,6 +975,10 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-70** | M2 | `POST /v1/jobs/{id}/extend` — an empty body, because the platform computes the deadline. **Not a status transition**, and the pickup date still bounds it — *see below* |
 | **SHIP-70a** | M2 | Both expiry sweeps see a job with live offers. **The document changed first**: `Docs/02` §2's expiry row now reads `Open / Negotiating → Cancelled`, and the two claims, the write behind the warning, `000409`'s two partial indexes and the extend endpoint all follow it. The product question the backlog left open — what expiry does to the offers on the job — is answered **nothing**, and the reason is that SHIP-89 already answers it. `SHIP-70` had to be widened too, or the warning would have pointed at an action that refused — *see below* |
 | **SHIP-71** | M2 | Flutter locations step — the platform validates and normalises, and an unrecognised address is an outcome the customer walks past, not an error — *see below* |
+| **SHIP-72** | M2 | Flutter goods step — the category list is **fetched, never compiled in**, and there is deliberately no fallback: a guessed catalogue would offer exactly the category somebody had just withdrawn. Refused entries are shown and may be chosen, because `Docs/01` §4.1 lets a customer sketch a job and `Docs/07` §3 leaves the refusal to publication. The chosen code is seeded **from the draft rather than from the catalogue**, so a resume on a bad connection cannot silently clear a category — *see below* |
+| **SHIP-73** | M2 | Flutter schedule and vehicle step — a **date** control of its own rather than `features/bidding`'s `InstantField`, because a bid is a commitment and a job's window is a constraint. A window closes at the **last second of its day**, which is the off-by-one that would turn "collect by Friday" into Thursday night. Handling notes are captured here and the ticket does not name them: they are in `Docs/01` §4.1 and were in no step of the wizard — *see below* |
+| **SHIP-74** | M2 | Flutter budget and review step, and **the end of the journey nothing in the product could walk**. The summary is the whole job rather than this step's fields; the declaration is unticked every time because `Docs/04` §2 asks per job rather than per account; the budget is saved **only when it changed**, so a retry after a refused publication cannot `PATCH` a job that is by then open. The four refusals publication can give are drawn four different ways. `budget_stays_on_the_customer_side_test.dart` fired on the change and two files were added to its allow list with the argument it asks for — *see below* |
+| **SHIP-75** | M2 | Flutter draft save and resume — **nothing on the device had to survive**, because the draft has lived on the platform since SHIP-71. What was missing was the way back in, so this adds no local cache and none can go stale. A draft reopens at the first step that is not finished, which needed a **second locations route**: `/jobs/new` carries no id, so a draft saved with empty addresses could be reopened at no step at all — *see below* |
 | **SHIP-76** | M2 | Flutter customer job list — read once and grouped client-side, and a test keeps the budget out of every widget a provider could reach — *see below* |
 | **SHIP-77** | M2 | Flutter customer job detail — the timeline is derived from the current status, because the transition history the database records is served by no endpoint; and sign-out finally tells the platform — *see below* |
 | **SHIP-78** | M3 | `vehicles` and the six routes under `/v1/fleet/vehicles` — deactivated, never deleted, and one live plate per provider held by a partial unique index — *see below* |
@@ -2889,6 +2893,99 @@ development and `NewStub()` is constructed with no unknown list, so a local API 
 a missing coordinate. The path is covered by the screen tests and by the platform's own
 `location_test.go`; a live demonstration needs either a staging deployment with no geocoder
 configured or a stub built with an unknown address, and neither belongs in a Flutter ticket.
+
+### SHIP-72 to SHIP-75 — the wizard that finishes the journey, and the resume that needed a second route
+
+Four tickets on one branch, because they are one reviewable change: the three steps after the
+locations step, and the resume that reaches any of them. **SHIP-74 is the one that matters** — it
+is the screen that calls `POST /v1/jobs/{id}/publish`, which is the endpoint §1 records as the row
+the whole marketplace was waiting on. Until this branch, a job created through the app could not be
+published through the app.
+
+**Each step is its own route carrying the draft's id**, matching `/jobs/{id}/offers` and
+`/jobs/{id}/tracking` rather than being one screen with an internal step counter. That is what
+makes the wizard resumable at all: a step whose id is in the path is a location the customer's own
+job list can send them back to. The steps are `push`ed rather than `go`ne to, so the previous step
+stays mounted and stays listening — which is why moving from goods to schedule issues **no second
+read** of the draft, and why Back reaches the step that owns a field the review step says is
+missing.
+
+`JobDraftController` is the spine: one draft, read once, edited a step at a time. SHIP-71 kept its
+own controller because that step is the one that *creates* the draft and has no id to key a family
+by; everything after it is the same `PATCH /v1/jobs/{id}` with the fields that step can see.
+
+**The category catalogue has no compiled fallback, and that is the ticket rather than a detail.**
+`CLAUDE.md` puts category lists server-side because they move under operational pressure and
+Flutter has no over-the-air path for Dart code. A client that guessed the list when the fetch
+failed would offer exactly the category somebody had just withdrawn on legal advice, which is the
+one outcome `GET /v1/goods-categories` exists to prevent. So a catalogue that will not load leaves
+a retry where the picker was, and the rest of the form stays usable.
+
+**The chosen code is seeded from the draft, not from the catalogue**, and that ordering is
+load-bearing. Every save sends `goods_category`, and the empty string clears it — so seeding the
+other way round would mean a customer resuming a draft on a bad connection silently losing the
+category they chose last week. There is a test for it.
+
+**A window closes at the last second of its day.** The obvious implementation closes it at
+midnight *on* the chosen day, which ends before that day has happened: "collect by Friday" sent as
+`Friday T00:00:00` means Thursday night. Off by a day, in the direction that refuses a delivery,
+and nothing on either side would report it — the platform would store exactly what it was sent.
+
+**One thing SHIP-73 captured that its row does not name: handling notes.** `Docs/01` §4.1 lists
+them among what a customer may put on a job, and no step of the wizard collected them, so the field
+was reachable by no screen in the product. They sit beside the vehicle requirement because both ask
+what carrying this actually takes. Recorded here rather than folded in silently.
+
+**The budget-privacy guard fired on SHIP-74, which is the guard working.**
+`budget_stays_on_the_customer_side_test.dart` refuses any file naming `budgetCents` or
+`budget_cents` that is not on an allow list whose entries have to be argued for. Two were added:
+`job_review_screen.dart`, where the owner enters their own maximum, and `jobs_repository.dart`,
+which builds the body for the owner's own write — the direction `Docs/01` §4.3 does not constrain,
+because the rule is about what reaches a *provider*. Neither is provider-facing, and
+`open_jobs_repository.dart` is still not on the list.
+
+**SHIP-75's finding is that nothing on the device had to survive.** `POST /v1/jobs` has stored the
+draft since SHIP-71, so a half-finished job already outlived the process, a reinstall, and a change
+of handset. What was missing was the way back in. So this adds **no local cache**, and none can go
+stale — which is worth stating because the ticket's wording ("survives app restart") reads like a
+persistence ticket and is not one.
+
+**It needed a second locations route, and the reason is easy to miss.** `/jobs/new` deliberately
+carries no id, because the draft does not exist until that step saves. But `POST /v1/jobs` accepts
+an empty body and `Docs/01` §4.1 lets a customer start a job and come back — so a draft with no
+addresses at all is legitimate, and `firstIncompleteFor` can answer `locations` for a row in
+somebody's job list. Without `/jobs/{id}/locations` that draft could be reopened at no step at all,
+and reopening it at `/jobs/new` would create a **second** job the customer would then find in their
+own list with nothing to explain it. `JobLocationsEditScreen` patches where `JobLocationsScreen`
+posts; they share the eight inputs through `AddressSection` and share nothing else.
+
+**`firstIncompleteFor` is a copy of `publishable`'s required set, and it is allowed to be wrong in
+one direction.** It decides which step to *open* and nothing else; `Docs/07` §3 keeps the decision
+on the platform, and `POST /v1/jobs/{id}/publish` re-checks the whole set and lists everything
+missing at once. So a disagreement costs a customer one screen they had already finished — never a
+job wrongly published, and never one wrongly refused. **Size is deliberately not in the set**,
+mirroring the platform, and a test states that mirrored set so the copy fails loudly if the owner
+revisits the §9 decision.
+
+**Two test failures on this branch were the test being wrong rather than the code**, and both are
+the kind worth recording. A window fixture written as `2026-09-03T00:00:00+10:00` is the **2nd** on
+a UTC runner and the 3rd on a machine in Australia, because the app renders a stored instant in the
+device's own zone — deliberately, and `dayFirstDate` documents why. The fixture is midday UTC now,
+which is the 3rd in every zone from UTC-11 to UTC+11. And a "restart" written as a second
+`pumpWidget` of the same app **is not a restart**: `ProviderScope` is a `StatefulWidget`, so a new
+instance of the same type reuses the mounted `State` and the whole container with it. An empty
+frame between the two is what makes it one, and without it the test proved nothing while passing.
+
+**A third failure was Riverpod's retry, and it is the trap `app_policy_controller.dart` and
+`version_gate.dart` both already record.** A `switch` on `AsyncError()` never matches a provider
+whose fetch failed, because while Riverpod retries the state is `AsyncLoading` *carrying* an error
+— so the catalogue picker sat on a spinner that would never resolve. Matching on what is *there*
+(`hasValue`, then `hasError`) is the form that works. **That is now the third file to pay for it**,
+which makes it a shape rather than an incident.
+
+What it does not build: a link from a missing field on the review step straight to the step that
+owns it. The step is named in the message and Back reaches it, because the wizard is pushed. Making
+each entry a link is a small follow-up and is not in any row.
 
 ### SHIP-76 — the customer's jobs, and the budget widget that is private on purpose
 

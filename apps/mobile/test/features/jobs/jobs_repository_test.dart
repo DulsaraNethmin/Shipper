@@ -13,6 +13,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shipper/core/api/api_client.dart';
 import 'package:shipper/core/api/idempotency_interceptor.dart';
+import 'package:shipper/features/jobs/goods_categories_repository.dart';
 import 'package:shipper/features/jobs/job.dart';
 import 'package:shipper/features/jobs/job_status.dart';
 import 'package:shipper/features/jobs/jobs_repository.dart';
@@ -117,6 +118,148 @@ void main() {
       const typed = AddressInput(state: 'new south wales');
 
       expect(typed.toJson()['state'], 'new south wales');
+    });
+  });
+
+  group('the goods body', () {
+    test('is the six keys the contract names, with the category as a code', () {
+      expect(
+        goodsBody(
+          category: 'general_freight',
+          description: 'Two-seater sofa, wrapped, no legs attached',
+          lengthCm: 190,
+          widthCm: 90,
+          heightCm: 85,
+          weightKg: 45.5,
+        ),
+        <String, Object?>{
+          // The `code` from GET /v1/goods-categories, never the `label`. The label is wording and
+          // changes; a client that sent 'General freight' would be refused as `not_allowed`.
+          'goods_category': 'general_freight',
+          'goods_description': 'Two-seater sofa, wrapped, no legs attached',
+          'length_cm': 190,
+          'width_cm': 90,
+          'height_cm': 85,
+          'weight_kg': 45.5,
+        },
+      );
+    });
+
+    test('an absent measurement is sent as the value that clears it, never omitted', () {
+      // `PATCH` touches only the fields present, so omitting a measurement means "keep whatever is
+      // there" — which is not what a box the customer just emptied means. The contract names `0`
+      // as the clearing value for all four, and the empty string for the two strings.
+      final body = goodsBody(category: '', description: '');
+
+      expect(body['goods_category'], '');
+      expect(body['goods_description'], '');
+      expect(body['length_cm'], 0);
+      expect(body['width_cm'], 0);
+      expect(body['height_cm'], 0);
+      expect(body['weight_kg'], 0);
+      expect(body.keys, hasLength(6));
+    });
+
+    test('carries no status, and there is no field for one', () {
+      final body = goodsBody(category: 'general_freight', description: 'A pallet');
+
+      expect(body.containsKey('status'), isFalse);
+      expect(jsonEncode(body), isNot(contains('status')));
+    });
+  });
+
+  group('the schedule body', () {
+    test('is the four keys the step owns, with both windows always present', () {
+      final body = scheduleBody(
+        pickupFrom: DateTime(2026, 9, 3),
+        pickupTo: DateTime(2026, 9, 5),
+        dropoffBy: DateTime(2026, 9, 8),
+        vehicleRequirement: 'Ute with a tailgate lifter',
+        handlingNotes: 'Ring ahead.',
+      );
+
+      expect(body.keys, <String>{
+        'pickup_window',
+        'dropoff_window',
+        'vehicle_requirement',
+        'handling_notes',
+      });
+      expect(body['vehicle_requirement'], 'Ute with a tailgate lifter');
+      expect(body['handling_notes'], 'Ring ahead.');
+    });
+
+    test('opens a window at the start of its day and closes it at the end of one', () {
+      final body = scheduleBody(
+        pickupFrom: DateTime(2026, 9, 3),
+        pickupTo: DateTime(2026, 9, 5),
+      );
+      final pickup = body['pickup_window']! as Map<String, Object?>;
+
+      // The edge worth a test of its own: a window closing at midnight *on* its day ends before
+      // that day has happened, so "collect by the 5th" would mean "collect by the 4th at
+      // midnight". Off by a day, in the direction that refuses a delivery.
+      expect(pickup['start'], startsWith('2026-09-03T00:00:00'));
+      expect(pickup['end'], startsWith('2026-09-05T23:59:59'));
+    });
+
+    test('sends RFC 3339 with an offset, which is what the platform parses', () {
+      final pickup =
+          scheduleBody(pickupFrom: DateTime(2026, 9, 3))['pickup_window']! as Map<String, Object?>;
+
+      // `DateTime.toIso8601String()` on a local value produces no offset at all, which is not RFC
+      // 3339 and which `time.Parse(time.RFC3339, …)` refuses.
+      expect(pickup['start'], matches(RegExp(r'^2026-09-03T00:00:00[+-]\d{2}:\d{2}$')));
+    });
+
+    test('a date that was never given is the empty string, never an omitted key', () {
+      final body = scheduleBody();
+      final pickup = body['pickup_window']! as Map<String, Object?>;
+      final dropoff = body['dropoff_window']! as Map<String, Object?>;
+
+      // A `PATCH` leaves out what it is not given, so an omitted end would mean "keep whatever is
+      // there" rather than "the customer cleared it". The contract names the empty string.
+      expect(pickup['start'], '');
+      expect(pickup['end'], '');
+      expect(dropoff['start'], '');
+      expect(dropoff['end'], '');
+      expect(body['vehicle_requirement'], '');
+      expect(body['handling_notes'], '');
+    });
+
+    test('carries no status, and there is no field for one', () {
+      final body = scheduleBody(pickupFrom: DateTime(2026, 9, 3));
+
+      expect(body.containsKey('status'), isFalse);
+      expect(jsonEncode(body), isNot(contains('status')));
+    });
+  });
+
+  group('the goods catalogue', () {
+    test('GETs /v1/goods-categories with no idempotency key', () async {
+      final adapter = _StubAdapter(
+        (_) => _json(<String, Object?>{
+          'categories': <Object?>[
+            <String, Object?>{
+              'code': 'general_freight',
+              'label': 'General freight',
+              'description': 'Palletised or boxed goods needing no special handling.',
+              'carried': true,
+              'provisional': true,
+            },
+          ],
+        }),
+      );
+      final dio = buildDio(baseUrl: 'http://localhost:8092')..httpClientAdapter = adapter;
+
+      final catalogue = await ApiGoodsCategoriesRepository(ApiClient(dio)).catalogue();
+
+      expect(adapter.requests.single.method, 'GET');
+      expect(adapter.requests.single.path, '/v1/goods-categories');
+      // A read changes nothing, and the middleware lets read-only methods through untouched.
+      expect(adapter.requests.single.headers.containsKey('Idempotency-Key'), isFalse);
+
+      expect(catalogue.categories.single.code, 'general_freight');
+      expect(catalogue.categories.single.carried, isTrue);
     });
   });
 
@@ -239,6 +382,68 @@ void main() {
       // The one shape in this API that carries the budget, read here by the customer who owns
       // the job (SHIP-67, `Docs/01` §4.3).
       expect(job.budgetCents, 150000);
+    });
+  });
+
+  group('the budget body', () {
+    test('is one key, in cents', () {
+      // Minor units as a whole number, because money is never a float and a JSON number written as
+      // `1500.50` is one (`Docs/10` §3.3).
+      expect(budgetBody(cents: 150050), <String, Object?>{'budget_cents': 150050});
+    });
+
+    test('a budget nobody gave is the value that clears it', () {
+      expect(budgetBody(), <String, Object?>{'budget_cents': 0});
+    });
+  });
+
+  group('the publication body', () {
+    test('is the one field the contract requires', () {
+      expect(publicationBody(acceptsTerms: true), <String, Object?>{'accepts_terms': true});
+    });
+
+    test('sends what the customer actually did, rather than always true', () {
+      // `false` is refused with `jobs_terms_not_accepted` rather than ignored. A client that
+      // hard-coded `true` would record an acceptance nobody made — which is the whole point of
+      // asking for a declaration.
+      expect(publicationBody(acceptsTerms: false), <String, Object?>{'accepts_terms': false});
+    });
+
+    test('carries no status, and there is no field for one', () {
+      final body = publicationBody(acceptsTerms: true);
+
+      // Publishing is the one request in this API a client might expect to carry a status, and it
+      // is a verb under the resource precisely so that it does not. `Docs/02` §2 and `CLAUDE.md`:
+      // job status is never a settable field.
+      expect(body.containsKey('status'), isFalse);
+      expect(jsonEncode(body), isNot(contains('status')));
+      expect(body.keys, hasLength(1));
+    });
+  });
+
+  group('publishing', () {
+    test('POSTs the verb under the resource with the idempotency key it was given', () async {
+      final stub = _repoReturning(_draft);
+
+      await stub.repo.publish(jobId: 'job-1', acceptsTerms: true, idempotencyKey: 'key-1');
+
+      final sent = stub.adapter.requests.single;
+      expect(sent.method, 'POST');
+      expect(sent.path, '/v1/jobs/job-1/publish');
+      expect(sent.headers['Idempotency-Key'], 'key-1');
+      expect(_sentBody(sent), <String, Object?>{'accepts_terms': true});
+    });
+
+    test('a publication with no idempotency key is refused before it is sent', () async {
+      final stub = _repoReturning(_draft);
+
+      // The middleware fails closed, and so does the client: a state-changing request without a
+      // key is refused rather than sent and rejected.
+      await expectLater(
+        stub.repo.publish(jobId: 'job-1', acceptsTerms: true, idempotencyKey: ''),
+        throwsA(isA<StateError>()),
+      );
+      expect(stub.adapter.requests, isEmpty);
     });
   });
 

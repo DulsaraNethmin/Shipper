@@ -25,7 +25,11 @@ import 'package:shipper/features/identity/registration_screen.dart';
 import 'package:shipper/features/identity/role_selection_screen.dart';
 import 'package:shipper/features/identity/sign_in_screen.dart';
 import 'package:shipper/features/jobs/job_detail_screen.dart';
+import 'package:shipper/features/jobs/job_goods_screen.dart';
+import 'package:shipper/features/jobs/job_locations_edit_screen.dart';
 import 'package:shipper/features/jobs/job_locations_screen.dart';
+import 'package:shipper/features/jobs/job_review_screen.dart';
+import 'package:shipper/features/jobs/job_schedule_screen.dart';
 import 'package:shipper/features/jobs/open_job_screen.dart';
 import 'package:shipper/features/profile/capture_document_screen.dart';
 import 'package:shipper/features/profile/verification_document.dart';
@@ -90,6 +94,44 @@ abstract final class Routes {
   /// step saves it — the id arrives in the response and not in the route. Resuming a draft that
   /// already exists is SHIP-75, and gets a route that names one.
   static const newJob = '/jobs/new';
+
+  /// The locations step of a draft that **already exists** (SHIP-75).
+  ///
+  /// [newJob] creates a draft and this one edits it, which is the whole of the difference between
+  /// starting a job and coming back to one. It exists because a draft can be saved with its
+  /// addresses empty — `Docs/01` §4.1 allows exactly that — and without a route that names an id,
+  /// such a draft could be resumed at no step at all.
+  static const jobLocations = '/jobs/:id/locations';
+
+  /// [jobLocations] for one draft.
+  static String jobLocationsFor(String jobId) => '/jobs/$jobId/locations';
+
+  /// The remaining three steps of describing a delivery (SHIP-72, SHIP-73, SHIP-74).
+  ///
+  /// **Each carries the draft's id, unlike [newJob], and that is the whole of what makes a draft
+  /// resumable** (SHIP-75). The first step has no id because the draft does not exist until it
+  /// saves; every step after it is editing a job the platform already holds, so the id belongs in
+  /// the path — which makes each step a location the customer's own job list can send them back
+  /// to after they closed the app a week ago.
+  ///
+  /// Two segments, so none of them collides with [jobDetail], which matches exactly one.
+  static const jobGoods = '/jobs/:id/goods';
+
+  /// [jobGoods] for one draft.
+  static String jobGoodsFor(String jobId) => '/jobs/$jobId/goods';
+
+  /// The schedule and vehicle step (SHIP-73).
+  static const jobSchedule = '/jobs/:id/schedule';
+
+  /// [jobSchedule] for one draft.
+  static String jobScheduleFor(String jobId) => '/jobs/$jobId/schedule';
+
+  /// The budget and review step, which is also where a job is published (SHIP-74).
+  static const jobReview = '/jobs/:id/review';
+
+  /// [jobReview] for one draft.
+  static String jobReviewFor(String jobId) => '/jobs/$jobId/review';
+
 
   /// One delivery in full, to the customer who owns it (SHIP-77).
   ///
@@ -410,6 +452,24 @@ final _signedInPatterns = <RegExp>[
   // on the other. `negotiation_test.dart` reaches it by tapping, on both sides, for that reason.
   RegExp(r'^/jobs/[^/]+/negotiation/[^/]+$'),
 
+  // The locations step of a saved draft (SHIP-75). It is reached from the customer's own job
+  // list, so forgetting this line is a card that appears to do nothing.
+  RegExp(r'^/jobs/[^/]+/locations$'),
+
+  // The goods step of the job wizard (SHIP-72), and the first route to carry a draft id. Its own
+  // line rather than an alternation shared with the steps that follow it: one line admits one
+  // location, which is the reading every pattern above establishes, and an alternation is a line
+  // whose count somebody has to work out. It is pushed from the locations step, so forgetting it
+  // is a **button that appears to do nothing** — the guard redirects to the home shell rather
+  // than failing.
+  RegExp(r'^/jobs/[^/]+/goods$'),
+
+  // The schedule step (SHIP-73). Its own line, for the reason the goods step above has one.
+  RegExp(r'^/jobs/[^/]+/schedule$'),
+
+  // The review step (SHIP-74), which is where a job is published. Same reasoning again.
+  RegExp(r'^/jobs/[^/]+/review$'),
+
   // `/fleet/vehicles/new` likewise (SHIP-98). Forgetting this line is the failure run 1 named: a
   // route reachable only through an identifier looks, from the outside, like a card that does
   // nothing when it is tapped.
@@ -576,6 +636,27 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: Routes.newJob,
         builder: (context, state) => const JobLocationsScreen(),
+      ),
+      // The rest of the wizard, before `jobDetail` for the same reason `newJob` is: everything
+      // more specific under `/jobs` is declared ahead of `/jobs/:id`. They do not actually collide
+      // — these carry two segments and `/jobs/:id` matches one — and the order is kept so the
+      // reading holds for whoever adds the next one.
+      GoRoute(
+        path: Routes.jobLocations,
+        builder: (context, state) =>
+            JobLocationsEditScreen(jobId: state.pathParameters['id'] ?? ''),
+      ),
+      GoRoute(
+        path: Routes.jobGoods,
+        builder: (context, state) => JobGoodsScreen(jobId: state.pathParameters['id'] ?? ''),
+      ),
+      GoRoute(
+        path: Routes.jobSchedule,
+        builder: (context, state) => JobScheduleScreen(jobId: state.pathParameters['id'] ?? ''),
+      ),
+      GoRoute(
+        path: Routes.jobReview,
+        builder: (context, state) => JobReviewScreen(jobId: state.pathParameters['id'] ?? ''),
       ),
       // Before `jobDetail`, in the same spirit as `newJob`. It does not actually collide —
       // `/jobs/:id` matches one segment and this has two — and it is declared first anyway, so that

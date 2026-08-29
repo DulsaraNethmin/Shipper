@@ -20,7 +20,14 @@ mixin _$Job {
 /// unknown field rather than quietly ignored.
 @JsonKey(unknownEnumValue: JobStatus.unknown) JobStatus get status;/// Where the goods are collected, once the customer has given an address (SHIP-71).
  JobLocation? get pickup;/// Where they are delivered (SHIP-71).
- JobLocation? get dropoff;@JsonKey(name: 'goods_description') String? get goodsDescription;@JsonKey(name: 'length_cm') int? get lengthCm;@JsonKey(name: 'width_cm') int? get widthCm;@JsonKey(name: 'height_cm') int? get heightCm;@JsonKey(name: 'weight_kg') double? get weightKg;@JsonKey(name: 'vehicle_requirement') String? get vehicleRequirement;@JsonKey(name: 'handling_notes') String? get handlingNotes;@JsonKey(name: 'pickup_window') JobTimeWindow? get pickupWindow;@JsonKey(name: 'dropoff_window') JobTimeWindow? get dropoffWindow;/// The customer's own maximum, in **cents**, AUD (SHIP-67).
+ JobLocation? get dropoff;@JsonKey(name: 'goods_description') String? get goodsDescription;/// The catalogue **code** the customer chose — `general_freight`, never the label (SHIP-58).
+///
+/// The code is the half that does not change when the wording does, so it is what the job
+/// stores and what a client sends. Rendering it means looking the code up in the catalogue
+/// from `GET /v1/goods-categories`; a job whose code is no longer served is shown as the raw
+/// code rather than as nothing, because a category withdrawn this morning is still what this
+/// job says it carries.
+@JsonKey(name: 'goods_category') String? get goodsCategory;@JsonKey(name: 'length_cm') int? get lengthCm;@JsonKey(name: 'width_cm') int? get widthCm;@JsonKey(name: 'height_cm') int? get heightCm;@JsonKey(name: 'weight_kg') double? get weightKg;@JsonKey(name: 'vehicle_requirement') String? get vehicleRequirement;@JsonKey(name: 'handling_notes') String? get handlingNotes;@JsonKey(name: 'pickup_window') JobTimeWindow? get pickupWindow;@JsonKey(name: 'dropoff_window') JobTimeWindow? get dropoffWindow;/// The customer's own maximum, in **cents**, AUD (SHIP-67).
 ///
 /// Minor units as a whole number because money is never a float (`Docs/10` §3.3), and the
 /// name carries the unit because a field called `budget` holding `150000` is one somebody
@@ -30,7 +37,13 @@ mixin _$Job {
 /// that distinction is the reason the platform omits the field rather than sending `0`.
 ///
 /// **Read it only on a customer surface.** See the note on this class.
-@JsonKey(name: 'budget_cents') int? get budgetCents;/// When the job stops being offered (SHIP-68).
+@JsonKey(name: 'budget_cents') int? get budgetCents;/// When the customer accepted the terms and the goods declaration **for this job** (SHIP-63).
+///
+/// `Docs/04` §2 requires the declaration for every job rather than once per account, so this
+/// is a fact about the job and not about the customer. Absent until the job is first
+/// published, and unchanged if it later returns to `open` — it was published once, and the
+/// acceptance that published it stands.
+@JsonKey(name: 'terms_accepted_at') String? get termsAcceptedAt;/// When the job stops being offered (SHIP-68).
 ///
 /// Absent while the job is a draft: the clock starts at publication, and a draft may be saved
 /// and returned to indefinitely (`Docs/02` §6.3).
@@ -47,16 +60,16 @@ $JobCopyWith<Job> get copyWith => _$JobCopyWithImpl<Job>(this as Job, _$identity
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is Job&&(identical(other.id, id) || other.id == id)&&(identical(other.status, status) || other.status == status)&&(identical(other.pickup, pickup) || other.pickup == pickup)&&(identical(other.dropoff, dropoff) || other.dropoff == dropoff)&&(identical(other.goodsDescription, goodsDescription) || other.goodsDescription == goodsDescription)&&(identical(other.lengthCm, lengthCm) || other.lengthCm == lengthCm)&&(identical(other.widthCm, widthCm) || other.widthCm == widthCm)&&(identical(other.heightCm, heightCm) || other.heightCm == heightCm)&&(identical(other.weightKg, weightKg) || other.weightKg == weightKg)&&(identical(other.vehicleRequirement, vehicleRequirement) || other.vehicleRequirement == vehicleRequirement)&&(identical(other.handlingNotes, handlingNotes) || other.handlingNotes == handlingNotes)&&(identical(other.pickupWindow, pickupWindow) || other.pickupWindow == pickupWindow)&&(identical(other.dropoffWindow, dropoffWindow) || other.dropoffWindow == dropoffWindow)&&(identical(other.budgetCents, budgetCents) || other.budgetCents == budgetCents)&&(identical(other.expiresAt, expiresAt) || other.expiresAt == expiresAt)&&(identical(other.createdAt, createdAt) || other.createdAt == createdAt)&&(identical(other.updatedAt, updatedAt) || other.updatedAt == updatedAt));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is Job&&(identical(other.id, id) || other.id == id)&&(identical(other.status, status) || other.status == status)&&(identical(other.pickup, pickup) || other.pickup == pickup)&&(identical(other.dropoff, dropoff) || other.dropoff == dropoff)&&(identical(other.goodsDescription, goodsDescription) || other.goodsDescription == goodsDescription)&&(identical(other.goodsCategory, goodsCategory) || other.goodsCategory == goodsCategory)&&(identical(other.lengthCm, lengthCm) || other.lengthCm == lengthCm)&&(identical(other.widthCm, widthCm) || other.widthCm == widthCm)&&(identical(other.heightCm, heightCm) || other.heightCm == heightCm)&&(identical(other.weightKg, weightKg) || other.weightKg == weightKg)&&(identical(other.vehicleRequirement, vehicleRequirement) || other.vehicleRequirement == vehicleRequirement)&&(identical(other.handlingNotes, handlingNotes) || other.handlingNotes == handlingNotes)&&(identical(other.pickupWindow, pickupWindow) || other.pickupWindow == pickupWindow)&&(identical(other.dropoffWindow, dropoffWindow) || other.dropoffWindow == dropoffWindow)&&(identical(other.budgetCents, budgetCents) || other.budgetCents == budgetCents)&&(identical(other.termsAcceptedAt, termsAcceptedAt) || other.termsAcceptedAt == termsAcceptedAt)&&(identical(other.expiresAt, expiresAt) || other.expiresAt == expiresAt)&&(identical(other.createdAt, createdAt) || other.createdAt == createdAt)&&(identical(other.updatedAt, updatedAt) || other.updatedAt == updatedAt));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
-int get hashCode => Object.hash(runtimeType,id,status,pickup,dropoff,goodsDescription,lengthCm,widthCm,heightCm,weightKg,vehicleRequirement,handlingNotes,pickupWindow,dropoffWindow,budgetCents,expiresAt,createdAt,updatedAt);
+int get hashCode => Object.hashAll([runtimeType,id,status,pickup,dropoff,goodsDescription,goodsCategory,lengthCm,widthCm,heightCm,weightKg,vehicleRequirement,handlingNotes,pickupWindow,dropoffWindow,budgetCents,termsAcceptedAt,expiresAt,createdAt,updatedAt]);
 
 @override
 String toString() {
-  return 'Job(id: $id, status: $status, pickup: $pickup, dropoff: $dropoff, goodsDescription: $goodsDescription, lengthCm: $lengthCm, widthCm: $widthCm, heightCm: $heightCm, weightKg: $weightKg, vehicleRequirement: $vehicleRequirement, handlingNotes: $handlingNotes, pickupWindow: $pickupWindow, dropoffWindow: $dropoffWindow, budgetCents: $budgetCents, expiresAt: $expiresAt, createdAt: $createdAt, updatedAt: $updatedAt)';
+  return 'Job(id: $id, status: $status, pickup: $pickup, dropoff: $dropoff, goodsDescription: $goodsDescription, goodsCategory: $goodsCategory, lengthCm: $lengthCm, widthCm: $widthCm, heightCm: $heightCm, weightKg: $weightKg, vehicleRequirement: $vehicleRequirement, handlingNotes: $handlingNotes, pickupWindow: $pickupWindow, dropoffWindow: $dropoffWindow, budgetCents: $budgetCents, termsAcceptedAt: $termsAcceptedAt, expiresAt: $expiresAt, createdAt: $createdAt, updatedAt: $updatedAt)';
 }
 
 
@@ -67,7 +80,7 @@ abstract mixin class $JobCopyWith<$Res>  {
   factory $JobCopyWith(Job value, $Res Function(Job) _then) = _$JobCopyWithImpl;
 @useResult
 $Res call({
- String id,@JsonKey(unknownEnumValue: JobStatus.unknown) JobStatus status, JobLocation? pickup, JobLocation? dropoff,@JsonKey(name: 'goods_description') String? goodsDescription,@JsonKey(name: 'length_cm') int? lengthCm,@JsonKey(name: 'width_cm') int? widthCm,@JsonKey(name: 'height_cm') int? heightCm,@JsonKey(name: 'weight_kg') double? weightKg,@JsonKey(name: 'vehicle_requirement') String? vehicleRequirement,@JsonKey(name: 'handling_notes') String? handlingNotes,@JsonKey(name: 'pickup_window') JobTimeWindow? pickupWindow,@JsonKey(name: 'dropoff_window') JobTimeWindow? dropoffWindow,@JsonKey(name: 'budget_cents') int? budgetCents,@JsonKey(name: 'expires_at') String? expiresAt,@JsonKey(name: 'created_at') String? createdAt,@JsonKey(name: 'updated_at') String? updatedAt
+ String id,@JsonKey(unknownEnumValue: JobStatus.unknown) JobStatus status, JobLocation? pickup, JobLocation? dropoff,@JsonKey(name: 'goods_description') String? goodsDescription,@JsonKey(name: 'goods_category') String? goodsCategory,@JsonKey(name: 'length_cm') int? lengthCm,@JsonKey(name: 'width_cm') int? widthCm,@JsonKey(name: 'height_cm') int? heightCm,@JsonKey(name: 'weight_kg') double? weightKg,@JsonKey(name: 'vehicle_requirement') String? vehicleRequirement,@JsonKey(name: 'handling_notes') String? handlingNotes,@JsonKey(name: 'pickup_window') JobTimeWindow? pickupWindow,@JsonKey(name: 'dropoff_window') JobTimeWindow? dropoffWindow,@JsonKey(name: 'budget_cents') int? budgetCents,@JsonKey(name: 'terms_accepted_at') String? termsAcceptedAt,@JsonKey(name: 'expires_at') String? expiresAt,@JsonKey(name: 'created_at') String? createdAt,@JsonKey(name: 'updated_at') String? updatedAt
 });
 
 
@@ -84,13 +97,14 @@ class _$JobCopyWithImpl<$Res>
 
 /// Create a copy of Job
 /// with the given fields replaced by the non-null parameter values.
-@pragma('vm:prefer-inline') @override $Res call({Object? id = null,Object? status = null,Object? pickup = freezed,Object? dropoff = freezed,Object? goodsDescription = freezed,Object? lengthCm = freezed,Object? widthCm = freezed,Object? heightCm = freezed,Object? weightKg = freezed,Object? vehicleRequirement = freezed,Object? handlingNotes = freezed,Object? pickupWindow = freezed,Object? dropoffWindow = freezed,Object? budgetCents = freezed,Object? expiresAt = freezed,Object? createdAt = freezed,Object? updatedAt = freezed,}) {
+@pragma('vm:prefer-inline') @override $Res call({Object? id = null,Object? status = null,Object? pickup = freezed,Object? dropoff = freezed,Object? goodsDescription = freezed,Object? goodsCategory = freezed,Object? lengthCm = freezed,Object? widthCm = freezed,Object? heightCm = freezed,Object? weightKg = freezed,Object? vehicleRequirement = freezed,Object? handlingNotes = freezed,Object? pickupWindow = freezed,Object? dropoffWindow = freezed,Object? budgetCents = freezed,Object? termsAcceptedAt = freezed,Object? expiresAt = freezed,Object? createdAt = freezed,Object? updatedAt = freezed,}) {
   return _then(_self.copyWith(
 id: null == id ? _self.id : id // ignore: cast_nullable_to_non_nullable
 as String,status: null == status ? _self.status : status // ignore: cast_nullable_to_non_nullable
 as JobStatus,pickup: freezed == pickup ? _self.pickup : pickup // ignore: cast_nullable_to_non_nullable
 as JobLocation?,dropoff: freezed == dropoff ? _self.dropoff : dropoff // ignore: cast_nullable_to_non_nullable
 as JobLocation?,goodsDescription: freezed == goodsDescription ? _self.goodsDescription : goodsDescription // ignore: cast_nullable_to_non_nullable
+as String?,goodsCategory: freezed == goodsCategory ? _self.goodsCategory : goodsCategory // ignore: cast_nullable_to_non_nullable
 as String?,lengthCm: freezed == lengthCm ? _self.lengthCm : lengthCm // ignore: cast_nullable_to_non_nullable
 as int?,widthCm: freezed == widthCm ? _self.widthCm : widthCm // ignore: cast_nullable_to_non_nullable
 as int?,heightCm: freezed == heightCm ? _self.heightCm : heightCm // ignore: cast_nullable_to_non_nullable
@@ -100,7 +114,8 @@ as String?,handlingNotes: freezed == handlingNotes ? _self.handlingNotes : handl
 as String?,pickupWindow: freezed == pickupWindow ? _self.pickupWindow : pickupWindow // ignore: cast_nullable_to_non_nullable
 as JobTimeWindow?,dropoffWindow: freezed == dropoffWindow ? _self.dropoffWindow : dropoffWindow // ignore: cast_nullable_to_non_nullable
 as JobTimeWindow?,budgetCents: freezed == budgetCents ? _self.budgetCents : budgetCents // ignore: cast_nullable_to_non_nullable
-as int?,expiresAt: freezed == expiresAt ? _self.expiresAt : expiresAt // ignore: cast_nullable_to_non_nullable
+as int?,termsAcceptedAt: freezed == termsAcceptedAt ? _self.termsAcceptedAt : termsAcceptedAt // ignore: cast_nullable_to_non_nullable
+as String?,expiresAt: freezed == expiresAt ? _self.expiresAt : expiresAt // ignore: cast_nullable_to_non_nullable
 as String?,createdAt: freezed == createdAt ? _self.createdAt : createdAt // ignore: cast_nullable_to_non_nullable
 as String?,updatedAt: freezed == updatedAt ? _self.updatedAt : updatedAt // ignore: cast_nullable_to_non_nullable
 as String?,
@@ -236,10 +251,10 @@ return $default(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( String id, @JsonKey(unknownEnumValue: JobStatus.unknown)  JobStatus status,  JobLocation? pickup,  JobLocation? dropoff, @JsonKey(name: 'goods_description')  String? goodsDescription, @JsonKey(name: 'length_cm')  int? lengthCm, @JsonKey(name: 'width_cm')  int? widthCm, @JsonKey(name: 'height_cm')  int? heightCm, @JsonKey(name: 'weight_kg')  double? weightKg, @JsonKey(name: 'vehicle_requirement')  String? vehicleRequirement, @JsonKey(name: 'handling_notes')  String? handlingNotes, @JsonKey(name: 'pickup_window')  JobTimeWindow? pickupWindow, @JsonKey(name: 'dropoff_window')  JobTimeWindow? dropoffWindow, @JsonKey(name: 'budget_cents')  int? budgetCents, @JsonKey(name: 'expires_at')  String? expiresAt, @JsonKey(name: 'created_at')  String? createdAt, @JsonKey(name: 'updated_at')  String? updatedAt)?  $default,{required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>(TResult Function( String id, @JsonKey(unknownEnumValue: JobStatus.unknown)  JobStatus status,  JobLocation? pickup,  JobLocation? dropoff, @JsonKey(name: 'goods_description')  String? goodsDescription, @JsonKey(name: 'goods_category')  String? goodsCategory, @JsonKey(name: 'length_cm')  int? lengthCm, @JsonKey(name: 'width_cm')  int? widthCm, @JsonKey(name: 'height_cm')  int? heightCm, @JsonKey(name: 'weight_kg')  double? weightKg, @JsonKey(name: 'vehicle_requirement')  String? vehicleRequirement, @JsonKey(name: 'handling_notes')  String? handlingNotes, @JsonKey(name: 'pickup_window')  JobTimeWindow? pickupWindow, @JsonKey(name: 'dropoff_window')  JobTimeWindow? dropoffWindow, @JsonKey(name: 'budget_cents')  int? budgetCents, @JsonKey(name: 'terms_accepted_at')  String? termsAcceptedAt, @JsonKey(name: 'expires_at')  String? expiresAt, @JsonKey(name: 'created_at')  String? createdAt, @JsonKey(name: 'updated_at')  String? updatedAt)?  $default,{required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case _Job() when $default != null:
-return $default(_that.id,_that.status,_that.pickup,_that.dropoff,_that.goodsDescription,_that.lengthCm,_that.widthCm,_that.heightCm,_that.weightKg,_that.vehicleRequirement,_that.handlingNotes,_that.pickupWindow,_that.dropoffWindow,_that.budgetCents,_that.expiresAt,_that.createdAt,_that.updatedAt);case _:
+return $default(_that.id,_that.status,_that.pickup,_that.dropoff,_that.goodsDescription,_that.goodsCategory,_that.lengthCm,_that.widthCm,_that.heightCm,_that.weightKg,_that.vehicleRequirement,_that.handlingNotes,_that.pickupWindow,_that.dropoffWindow,_that.budgetCents,_that.termsAcceptedAt,_that.expiresAt,_that.createdAt,_that.updatedAt);case _:
   return orElse();
 
 }
@@ -257,10 +272,10 @@ return $default(_that.id,_that.status,_that.pickup,_that.dropoff,_that.goodsDesc
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( String id, @JsonKey(unknownEnumValue: JobStatus.unknown)  JobStatus status,  JobLocation? pickup,  JobLocation? dropoff, @JsonKey(name: 'goods_description')  String? goodsDescription, @JsonKey(name: 'length_cm')  int? lengthCm, @JsonKey(name: 'width_cm')  int? widthCm, @JsonKey(name: 'height_cm')  int? heightCm, @JsonKey(name: 'weight_kg')  double? weightKg, @JsonKey(name: 'vehicle_requirement')  String? vehicleRequirement, @JsonKey(name: 'handling_notes')  String? handlingNotes, @JsonKey(name: 'pickup_window')  JobTimeWindow? pickupWindow, @JsonKey(name: 'dropoff_window')  JobTimeWindow? dropoffWindow, @JsonKey(name: 'budget_cents')  int? budgetCents, @JsonKey(name: 'expires_at')  String? expiresAt, @JsonKey(name: 'created_at')  String? createdAt, @JsonKey(name: 'updated_at')  String? updatedAt)  $default,) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>(TResult Function( String id, @JsonKey(unknownEnumValue: JobStatus.unknown)  JobStatus status,  JobLocation? pickup,  JobLocation? dropoff, @JsonKey(name: 'goods_description')  String? goodsDescription, @JsonKey(name: 'goods_category')  String? goodsCategory, @JsonKey(name: 'length_cm')  int? lengthCm, @JsonKey(name: 'width_cm')  int? widthCm, @JsonKey(name: 'height_cm')  int? heightCm, @JsonKey(name: 'weight_kg')  double? weightKg, @JsonKey(name: 'vehicle_requirement')  String? vehicleRequirement, @JsonKey(name: 'handling_notes')  String? handlingNotes, @JsonKey(name: 'pickup_window')  JobTimeWindow? pickupWindow, @JsonKey(name: 'dropoff_window')  JobTimeWindow? dropoffWindow, @JsonKey(name: 'budget_cents')  int? budgetCents, @JsonKey(name: 'terms_accepted_at')  String? termsAcceptedAt, @JsonKey(name: 'expires_at')  String? expiresAt, @JsonKey(name: 'created_at')  String? createdAt, @JsonKey(name: 'updated_at')  String? updatedAt)  $default,) {final _that = this;
 switch (_that) {
 case _Job():
-return $default(_that.id,_that.status,_that.pickup,_that.dropoff,_that.goodsDescription,_that.lengthCm,_that.widthCm,_that.heightCm,_that.weightKg,_that.vehicleRequirement,_that.handlingNotes,_that.pickupWindow,_that.dropoffWindow,_that.budgetCents,_that.expiresAt,_that.createdAt,_that.updatedAt);case _:
+return $default(_that.id,_that.status,_that.pickup,_that.dropoff,_that.goodsDescription,_that.goodsCategory,_that.lengthCm,_that.widthCm,_that.heightCm,_that.weightKg,_that.vehicleRequirement,_that.handlingNotes,_that.pickupWindow,_that.dropoffWindow,_that.budgetCents,_that.termsAcceptedAt,_that.expiresAt,_that.createdAt,_that.updatedAt);case _:
   throw StateError('Unexpected subclass');
 
 }
@@ -277,10 +292,10 @@ return $default(_that.id,_that.status,_that.pickup,_that.dropoff,_that.goodsDesc
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( String id, @JsonKey(unknownEnumValue: JobStatus.unknown)  JobStatus status,  JobLocation? pickup,  JobLocation? dropoff, @JsonKey(name: 'goods_description')  String? goodsDescription, @JsonKey(name: 'length_cm')  int? lengthCm, @JsonKey(name: 'width_cm')  int? widthCm, @JsonKey(name: 'height_cm')  int? heightCm, @JsonKey(name: 'weight_kg')  double? weightKg, @JsonKey(name: 'vehicle_requirement')  String? vehicleRequirement, @JsonKey(name: 'handling_notes')  String? handlingNotes, @JsonKey(name: 'pickup_window')  JobTimeWindow? pickupWindow, @JsonKey(name: 'dropoff_window')  JobTimeWindow? dropoffWindow, @JsonKey(name: 'budget_cents')  int? budgetCents, @JsonKey(name: 'expires_at')  String? expiresAt, @JsonKey(name: 'created_at')  String? createdAt, @JsonKey(name: 'updated_at')  String? updatedAt)?  $default,) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>(TResult? Function( String id, @JsonKey(unknownEnumValue: JobStatus.unknown)  JobStatus status,  JobLocation? pickup,  JobLocation? dropoff, @JsonKey(name: 'goods_description')  String? goodsDescription, @JsonKey(name: 'goods_category')  String? goodsCategory, @JsonKey(name: 'length_cm')  int? lengthCm, @JsonKey(name: 'width_cm')  int? widthCm, @JsonKey(name: 'height_cm')  int? heightCm, @JsonKey(name: 'weight_kg')  double? weightKg, @JsonKey(name: 'vehicle_requirement')  String? vehicleRequirement, @JsonKey(name: 'handling_notes')  String? handlingNotes, @JsonKey(name: 'pickup_window')  JobTimeWindow? pickupWindow, @JsonKey(name: 'dropoff_window')  JobTimeWindow? dropoffWindow, @JsonKey(name: 'budget_cents')  int? budgetCents, @JsonKey(name: 'terms_accepted_at')  String? termsAcceptedAt, @JsonKey(name: 'expires_at')  String? expiresAt, @JsonKey(name: 'created_at')  String? createdAt, @JsonKey(name: 'updated_at')  String? updatedAt)?  $default,) {final _that = this;
 switch (_that) {
 case _Job() when $default != null:
-return $default(_that.id,_that.status,_that.pickup,_that.dropoff,_that.goodsDescription,_that.lengthCm,_that.widthCm,_that.heightCm,_that.weightKg,_that.vehicleRequirement,_that.handlingNotes,_that.pickupWindow,_that.dropoffWindow,_that.budgetCents,_that.expiresAt,_that.createdAt,_that.updatedAt);case _:
+return $default(_that.id,_that.status,_that.pickup,_that.dropoff,_that.goodsDescription,_that.goodsCategory,_that.lengthCm,_that.widthCm,_that.heightCm,_that.weightKg,_that.vehicleRequirement,_that.handlingNotes,_that.pickupWindow,_that.dropoffWindow,_that.budgetCents,_that.termsAcceptedAt,_that.expiresAt,_that.createdAt,_that.updatedAt);case _:
   return null;
 
 }
@@ -292,7 +307,7 @@ return $default(_that.id,_that.status,_that.pickup,_that.dropoff,_that.goodsDesc
 @JsonSerializable()
 
 class _Job implements Job {
-  const _Job({required this.id, @JsonKey(unknownEnumValue: JobStatus.unknown) required this.status, this.pickup, this.dropoff, @JsonKey(name: 'goods_description') this.goodsDescription, @JsonKey(name: 'length_cm') this.lengthCm, @JsonKey(name: 'width_cm') this.widthCm, @JsonKey(name: 'height_cm') this.heightCm, @JsonKey(name: 'weight_kg') this.weightKg, @JsonKey(name: 'vehicle_requirement') this.vehicleRequirement, @JsonKey(name: 'handling_notes') this.handlingNotes, @JsonKey(name: 'pickup_window') this.pickupWindow, @JsonKey(name: 'dropoff_window') this.dropoffWindow, @JsonKey(name: 'budget_cents') this.budgetCents, @JsonKey(name: 'expires_at') this.expiresAt, @JsonKey(name: 'created_at') this.createdAt, @JsonKey(name: 'updated_at') this.updatedAt});
+  const _Job({required this.id, @JsonKey(unknownEnumValue: JobStatus.unknown) required this.status, this.pickup, this.dropoff, @JsonKey(name: 'goods_description') this.goodsDescription, @JsonKey(name: 'goods_category') this.goodsCategory, @JsonKey(name: 'length_cm') this.lengthCm, @JsonKey(name: 'width_cm') this.widthCm, @JsonKey(name: 'height_cm') this.heightCm, @JsonKey(name: 'weight_kg') this.weightKg, @JsonKey(name: 'vehicle_requirement') this.vehicleRequirement, @JsonKey(name: 'handling_notes') this.handlingNotes, @JsonKey(name: 'pickup_window') this.pickupWindow, @JsonKey(name: 'dropoff_window') this.dropoffWindow, @JsonKey(name: 'budget_cents') this.budgetCents, @JsonKey(name: 'terms_accepted_at') this.termsAcceptedAt, @JsonKey(name: 'expires_at') this.expiresAt, @JsonKey(name: 'created_at') this.createdAt, @JsonKey(name: 'updated_at') this.updatedAt});
   factory _Job.fromJson(Map<String, dynamic> json) => _$JobFromJson(json);
 
 @override final  String id;
@@ -305,6 +320,14 @@ class _Job implements Job {
 /// Where they are delivered (SHIP-71).
 @override final  JobLocation? dropoff;
 @override@JsonKey(name: 'goods_description') final  String? goodsDescription;
+/// The catalogue **code** the customer chose — `general_freight`, never the label (SHIP-58).
+///
+/// The code is the half that does not change when the wording does, so it is what the job
+/// stores and what a client sends. Rendering it means looking the code up in the catalogue
+/// from `GET /v1/goods-categories`; a job whose code is no longer served is shown as the raw
+/// code rather than as nothing, because a category withdrawn this morning is still what this
+/// job says it carries.
+@override@JsonKey(name: 'goods_category') final  String? goodsCategory;
 @override@JsonKey(name: 'length_cm') final  int? lengthCm;
 @override@JsonKey(name: 'width_cm') final  int? widthCm;
 @override@JsonKey(name: 'height_cm') final  int? heightCm;
@@ -324,6 +347,13 @@ class _Job implements Job {
 ///
 /// **Read it only on a customer surface.** See the note on this class.
 @override@JsonKey(name: 'budget_cents') final  int? budgetCents;
+/// When the customer accepted the terms and the goods declaration **for this job** (SHIP-63).
+///
+/// `Docs/04` §2 requires the declaration for every job rather than once per account, so this
+/// is a fact about the job and not about the customer. Absent until the job is first
+/// published, and unchanged if it later returns to `open` — it was published once, and the
+/// acceptance that published it stands.
+@override@JsonKey(name: 'terms_accepted_at') final  String? termsAcceptedAt;
 /// When the job stops being offered (SHIP-68).
 ///
 /// Absent while the job is a draft: the clock starts at publication, and a draft may be saved
@@ -345,16 +375,16 @@ Map<String, dynamic> toJson() {
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is _Job&&(identical(other.id, id) || other.id == id)&&(identical(other.status, status) || other.status == status)&&(identical(other.pickup, pickup) || other.pickup == pickup)&&(identical(other.dropoff, dropoff) || other.dropoff == dropoff)&&(identical(other.goodsDescription, goodsDescription) || other.goodsDescription == goodsDescription)&&(identical(other.lengthCm, lengthCm) || other.lengthCm == lengthCm)&&(identical(other.widthCm, widthCm) || other.widthCm == widthCm)&&(identical(other.heightCm, heightCm) || other.heightCm == heightCm)&&(identical(other.weightKg, weightKg) || other.weightKg == weightKg)&&(identical(other.vehicleRequirement, vehicleRequirement) || other.vehicleRequirement == vehicleRequirement)&&(identical(other.handlingNotes, handlingNotes) || other.handlingNotes == handlingNotes)&&(identical(other.pickupWindow, pickupWindow) || other.pickupWindow == pickupWindow)&&(identical(other.dropoffWindow, dropoffWindow) || other.dropoffWindow == dropoffWindow)&&(identical(other.budgetCents, budgetCents) || other.budgetCents == budgetCents)&&(identical(other.expiresAt, expiresAt) || other.expiresAt == expiresAt)&&(identical(other.createdAt, createdAt) || other.createdAt == createdAt)&&(identical(other.updatedAt, updatedAt) || other.updatedAt == updatedAt));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is _Job&&(identical(other.id, id) || other.id == id)&&(identical(other.status, status) || other.status == status)&&(identical(other.pickup, pickup) || other.pickup == pickup)&&(identical(other.dropoff, dropoff) || other.dropoff == dropoff)&&(identical(other.goodsDescription, goodsDescription) || other.goodsDescription == goodsDescription)&&(identical(other.goodsCategory, goodsCategory) || other.goodsCategory == goodsCategory)&&(identical(other.lengthCm, lengthCm) || other.lengthCm == lengthCm)&&(identical(other.widthCm, widthCm) || other.widthCm == widthCm)&&(identical(other.heightCm, heightCm) || other.heightCm == heightCm)&&(identical(other.weightKg, weightKg) || other.weightKg == weightKg)&&(identical(other.vehicleRequirement, vehicleRequirement) || other.vehicleRequirement == vehicleRequirement)&&(identical(other.handlingNotes, handlingNotes) || other.handlingNotes == handlingNotes)&&(identical(other.pickupWindow, pickupWindow) || other.pickupWindow == pickupWindow)&&(identical(other.dropoffWindow, dropoffWindow) || other.dropoffWindow == dropoffWindow)&&(identical(other.budgetCents, budgetCents) || other.budgetCents == budgetCents)&&(identical(other.termsAcceptedAt, termsAcceptedAt) || other.termsAcceptedAt == termsAcceptedAt)&&(identical(other.expiresAt, expiresAt) || other.expiresAt == expiresAt)&&(identical(other.createdAt, createdAt) || other.createdAt == createdAt)&&(identical(other.updatedAt, updatedAt) || other.updatedAt == updatedAt));
 }
 
 @JsonKey(includeFromJson: false, includeToJson: false)
 @override
-int get hashCode => Object.hash(runtimeType,id,status,pickup,dropoff,goodsDescription,lengthCm,widthCm,heightCm,weightKg,vehicleRequirement,handlingNotes,pickupWindow,dropoffWindow,budgetCents,expiresAt,createdAt,updatedAt);
+int get hashCode => Object.hashAll([runtimeType,id,status,pickup,dropoff,goodsDescription,goodsCategory,lengthCm,widthCm,heightCm,weightKg,vehicleRequirement,handlingNotes,pickupWindow,dropoffWindow,budgetCents,termsAcceptedAt,expiresAt,createdAt,updatedAt]);
 
 @override
 String toString() {
-  return 'Job(id: $id, status: $status, pickup: $pickup, dropoff: $dropoff, goodsDescription: $goodsDescription, lengthCm: $lengthCm, widthCm: $widthCm, heightCm: $heightCm, weightKg: $weightKg, vehicleRequirement: $vehicleRequirement, handlingNotes: $handlingNotes, pickupWindow: $pickupWindow, dropoffWindow: $dropoffWindow, budgetCents: $budgetCents, expiresAt: $expiresAt, createdAt: $createdAt, updatedAt: $updatedAt)';
+  return 'Job(id: $id, status: $status, pickup: $pickup, dropoff: $dropoff, goodsDescription: $goodsDescription, goodsCategory: $goodsCategory, lengthCm: $lengthCm, widthCm: $widthCm, heightCm: $heightCm, weightKg: $weightKg, vehicleRequirement: $vehicleRequirement, handlingNotes: $handlingNotes, pickupWindow: $pickupWindow, dropoffWindow: $dropoffWindow, budgetCents: $budgetCents, termsAcceptedAt: $termsAcceptedAt, expiresAt: $expiresAt, createdAt: $createdAt, updatedAt: $updatedAt)';
 }
 
 
@@ -365,7 +395,7 @@ abstract mixin class _$JobCopyWith<$Res> implements $JobCopyWith<$Res> {
   factory _$JobCopyWith(_Job value, $Res Function(_Job) _then) = __$JobCopyWithImpl;
 @override @useResult
 $Res call({
- String id,@JsonKey(unknownEnumValue: JobStatus.unknown) JobStatus status, JobLocation? pickup, JobLocation? dropoff,@JsonKey(name: 'goods_description') String? goodsDescription,@JsonKey(name: 'length_cm') int? lengthCm,@JsonKey(name: 'width_cm') int? widthCm,@JsonKey(name: 'height_cm') int? heightCm,@JsonKey(name: 'weight_kg') double? weightKg,@JsonKey(name: 'vehicle_requirement') String? vehicleRequirement,@JsonKey(name: 'handling_notes') String? handlingNotes,@JsonKey(name: 'pickup_window') JobTimeWindow? pickupWindow,@JsonKey(name: 'dropoff_window') JobTimeWindow? dropoffWindow,@JsonKey(name: 'budget_cents') int? budgetCents,@JsonKey(name: 'expires_at') String? expiresAt,@JsonKey(name: 'created_at') String? createdAt,@JsonKey(name: 'updated_at') String? updatedAt
+ String id,@JsonKey(unknownEnumValue: JobStatus.unknown) JobStatus status, JobLocation? pickup, JobLocation? dropoff,@JsonKey(name: 'goods_description') String? goodsDescription,@JsonKey(name: 'goods_category') String? goodsCategory,@JsonKey(name: 'length_cm') int? lengthCm,@JsonKey(name: 'width_cm') int? widthCm,@JsonKey(name: 'height_cm') int? heightCm,@JsonKey(name: 'weight_kg') double? weightKg,@JsonKey(name: 'vehicle_requirement') String? vehicleRequirement,@JsonKey(name: 'handling_notes') String? handlingNotes,@JsonKey(name: 'pickup_window') JobTimeWindow? pickupWindow,@JsonKey(name: 'dropoff_window') JobTimeWindow? dropoffWindow,@JsonKey(name: 'budget_cents') int? budgetCents,@JsonKey(name: 'terms_accepted_at') String? termsAcceptedAt,@JsonKey(name: 'expires_at') String? expiresAt,@JsonKey(name: 'created_at') String? createdAt,@JsonKey(name: 'updated_at') String? updatedAt
 });
 
 
@@ -382,13 +412,14 @@ class __$JobCopyWithImpl<$Res>
 
 /// Create a copy of Job
 /// with the given fields replaced by the non-null parameter values.
-@override @pragma('vm:prefer-inline') $Res call({Object? id = null,Object? status = null,Object? pickup = freezed,Object? dropoff = freezed,Object? goodsDescription = freezed,Object? lengthCm = freezed,Object? widthCm = freezed,Object? heightCm = freezed,Object? weightKg = freezed,Object? vehicleRequirement = freezed,Object? handlingNotes = freezed,Object? pickupWindow = freezed,Object? dropoffWindow = freezed,Object? budgetCents = freezed,Object? expiresAt = freezed,Object? createdAt = freezed,Object? updatedAt = freezed,}) {
+@override @pragma('vm:prefer-inline') $Res call({Object? id = null,Object? status = null,Object? pickup = freezed,Object? dropoff = freezed,Object? goodsDescription = freezed,Object? goodsCategory = freezed,Object? lengthCm = freezed,Object? widthCm = freezed,Object? heightCm = freezed,Object? weightKg = freezed,Object? vehicleRequirement = freezed,Object? handlingNotes = freezed,Object? pickupWindow = freezed,Object? dropoffWindow = freezed,Object? budgetCents = freezed,Object? termsAcceptedAt = freezed,Object? expiresAt = freezed,Object? createdAt = freezed,Object? updatedAt = freezed,}) {
   return _then(_Job(
 id: null == id ? _self.id : id // ignore: cast_nullable_to_non_nullable
 as String,status: null == status ? _self.status : status // ignore: cast_nullable_to_non_nullable
 as JobStatus,pickup: freezed == pickup ? _self.pickup : pickup // ignore: cast_nullable_to_non_nullable
 as JobLocation?,dropoff: freezed == dropoff ? _self.dropoff : dropoff // ignore: cast_nullable_to_non_nullable
 as JobLocation?,goodsDescription: freezed == goodsDescription ? _self.goodsDescription : goodsDescription // ignore: cast_nullable_to_non_nullable
+as String?,goodsCategory: freezed == goodsCategory ? _self.goodsCategory : goodsCategory // ignore: cast_nullable_to_non_nullable
 as String?,lengthCm: freezed == lengthCm ? _self.lengthCm : lengthCm // ignore: cast_nullable_to_non_nullable
 as int?,widthCm: freezed == widthCm ? _self.widthCm : widthCm // ignore: cast_nullable_to_non_nullable
 as int?,heightCm: freezed == heightCm ? _self.heightCm : heightCm // ignore: cast_nullable_to_non_nullable
@@ -398,7 +429,8 @@ as String?,handlingNotes: freezed == handlingNotes ? _self.handlingNotes : handl
 as String?,pickupWindow: freezed == pickupWindow ? _self.pickupWindow : pickupWindow // ignore: cast_nullable_to_non_nullable
 as JobTimeWindow?,dropoffWindow: freezed == dropoffWindow ? _self.dropoffWindow : dropoffWindow // ignore: cast_nullable_to_non_nullable
 as JobTimeWindow?,budgetCents: freezed == budgetCents ? _self.budgetCents : budgetCents // ignore: cast_nullable_to_non_nullable
-as int?,expiresAt: freezed == expiresAt ? _self.expiresAt : expiresAt // ignore: cast_nullable_to_non_nullable
+as int?,termsAcceptedAt: freezed == termsAcceptedAt ? _self.termsAcceptedAt : termsAcceptedAt // ignore: cast_nullable_to_non_nullable
+as String?,expiresAt: freezed == expiresAt ? _self.expiresAt : expiresAt // ignore: cast_nullable_to_non_nullable
 as String?,createdAt: freezed == createdAt ? _self.createdAt : createdAt // ignore: cast_nullable_to_non_nullable
 as String?,updatedAt: freezed == updatedAt ? _self.updatedAt : updatedAt // ignore: cast_nullable_to_non_nullable
 as String?,

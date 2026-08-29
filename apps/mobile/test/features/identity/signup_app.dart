@@ -19,6 +19,7 @@ import 'package:shipper/features/bidding/bidding_repository.dart';
 import 'package:shipper/features/delivery/delivery_repository.dart';
 import 'package:shipper/features/fleet/fleet_repository.dart';
 import 'package:shipper/features/identity/identity_repository.dart';
+import 'package:shipper/features/jobs/goods_categories_repository.dart';
 import 'package:shipper/features/jobs/jobs_repository.dart';
 import 'package:shipper/features/jobs/open_jobs_repository.dart';
 import 'package:shipper/features/profile/verification_repository.dart';
@@ -28,6 +29,7 @@ import '../../core/auth/session_fixtures.dart';
 import '../bidding/fake_bidding_repository.dart';
 import '../delivery/fake_delivery_repository.dart';
 import '../fleet/fake_fleet_repository.dart';
+import '../jobs/fake_goods_categories_repository.dart';
 import '../jobs/fake_jobs_repository.dart';
 import '../jobs/fake_open_jobs_repository.dart';
 import '../profile/fake_verification_repository.dart';
@@ -47,6 +49,7 @@ Widget signupApp(
   FakeIdentityRepository identity, {
   FakeTokenStore? store,
   FakeJobsRepository? jobs,
+  FakeGoodsCategoriesRepository? goodsCategories,
   FakeFleetRepository? fleet,
   FakeOpenJobsRepository? openJobs,
   FakeBiddingRepository? bidding,
@@ -93,6 +96,13 @@ Widget signupApp(
       // listening on the local API port — nothing on CI, and on a developer's machine the API.
       // Same hazard as the refresher below, and the same symptom when it is forgotten.
       jobsRepositoryProvider.overrideWithValue(jobs ?? FakeJobsRepository()),
+      // The goods step reads the catalogue as soon as it is drawn (SHIP-72). Same hazard as the
+      // jobs repository above and the same symptom when it is forgotten: a socket opened by a
+      // screen nobody in a given test was thinking about, against nothing at all on CI. It is
+      // **public and unauthenticated**, which makes it the one repository here a signed-out test
+      // could reach — so it is overridden by default rather than only when a test asks.
+      goodsCategoriesRepositoryProvider
+          .overrideWithValue(goodsCategories ?? FakeGoodsCategoriesRepository()),
       // The fleet screens read the provider's own vehicles as soon as they are drawn (SHIP-98),
       // and three of the five things they do are writes. Same hazard, same symptom: a socket
       // opened by a screen nobody in a given test was thinking about is the one that goes

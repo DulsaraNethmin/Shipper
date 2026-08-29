@@ -182,6 +182,35 @@ class FakeJobsRepository implements JobsRepository {
   }
 
   @override
+  Future<Job> publish({
+    required String jobId,
+    required bool acceptsTerms,
+    required String idempotencyKey,
+  }) {
+    return _record(
+      (
+        action: 'publish',
+        jobId: jobId,
+        fields: <String, Object?>{'accepts_terms': acceptsTerms},
+        cursor: null,
+        idempotencyKey: idempotencyKey,
+      ),
+      () {
+        // What the platform does: the transition is applied and the job comes back as it now is,
+        // with the instant the declaration was made recorded against it. Written back to `detail`
+        // so a re-read agrees with what the publication returned — a job that answered `open` once
+        // and `draft` on the next read would be a fake nothing in the product could produce.
+        final opened = detail(jobId).copyWith(
+          status: JobStatus.open,
+          termsAcceptedAt: '2026-08-29T02:15:00.000Z',
+        );
+        detail = (_) => opened;
+        return opened;
+      },
+    );
+  }
+
+  @override
   Future<Job> cancel({
     required String jobId,
     String reason = '',

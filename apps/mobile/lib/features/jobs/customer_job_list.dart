@@ -8,6 +8,8 @@ import 'package:shipper/core/errors/api_failure.dart';
 import 'package:shipper/core/routing/app_router.dart';
 import 'package:shipper/features/jobs/customer_jobs_controller.dart';
 import 'package:shipper/features/jobs/job.dart';
+import 'package:shipper/features/jobs/job_status.dart';
+import 'package:shipper/features/jobs/job_wizard.dart';
 import 'package:shipper/shared/design_system/failure_banner.dart';
 import 'package:shipper/shared/formatting/dates.dart';
 import 'package:shipper/shared/formatting/money.dart';
@@ -187,6 +189,30 @@ class _JobCard extends StatelessWidget {
                 style: theme.textTheme.bodySmall
                     ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
               ),
+
+              // **Resuming a draft (SHIP-75).** This is where a half-finished job is picked up
+              // again, and the reason it is here rather than anywhere else is that the draft lives
+              // on the platform: `POST /v1/jobs` saved it at the first step, so it survives the app
+              // being closed, reinstalled, or opened on another handset. Nothing is kept on the
+              // device to survive, which is why there is no local cache to go stale.
+              //
+              // Only on a draft. Every other status is a job that has been published, and the
+              // wizard is not how a published job is changed.
+              if (job.status == JobStatus.draft) ...[
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: FilledButton.tonal(
+                    key: Key('job-resume-${job.id}'),
+                    // Straight to the step that is not finished, rather than to the beginning.
+                    // A customer who filled in three steps last week should not walk the first two
+                    // again to reach the one they stopped at.
+                    onPressed: () =>
+                        context.push(JobWizardStep.firstIncompleteFor(job).pathFor(job.id)),
+                    child: const Text('Continue this job'),
+                  ),
+                ),
+              ],
             ],
           ),
         ),
