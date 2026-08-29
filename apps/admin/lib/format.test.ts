@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { instant, shortIdentifier } from "./format.ts";
+import { instant, money, shortIdentifier } from "./format.ts";
 
 /**
  * The display helpers (SHIP-188b).
@@ -42,4 +42,22 @@ test("an identifier abbreviates to its first group", () => {
   assert.equal(shortIdentifier("0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0"), "0198f2c1");
   assert.equal(shortIdentifier("0198f2c16b407a119c3e2f9a4d51b7e0"), "0198f2c1");
   assert.equal(shortIdentifier(""), "");
+});
+
+test("an amount is AUD, with a thousands separator and two decimals", () => {
+  assert.equal(money(123456), "$1,234.56");
+  assert.equal(money(5), "$0.05");
+  assert.equal(money(-2500), "-$25.00");
+});
+
+/**
+ * Zero is a dash, not `$0.00`.
+ *
+ * `adminBidResponse.AmountCents` is "zero where the row carries none", so on this wire the two are
+ * the same value — and an offer of nothing does not exist while an offer with no price recorded
+ * does. Rendering `$0.00` would put a number on the screen that nobody ever entered.
+ */
+test("an amount that was never recorded is a dash", () => {
+  assert.equal(money(0), "—");
+  assert.equal(money(Number.NaN), "—");
 });

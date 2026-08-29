@@ -30,6 +30,7 @@ const SECTIONS = [
   { label: "Overview", href: "/", ticket: "SHIP-188a", permission: null },
   { label: "Users", href: "/users", ticket: "SHIP-188b", permission: "users.read" },
   { label: "Jobs and bids", href: "/jobs", ticket: "SHIP-188b", permission: "jobs.read" },
+  { label: "Audit trail", href: "/audit", ticket: "SHIP-188c", permission: "audit.read" },
   { label: "Reports", href: null, ticket: "SHIP-156", permission: "moderation.read" },
   { label: "Delivery exceptions", href: null, ticket: "SHIP-157", permission: "moderation.read" },
   { label: "Disputes", href: null, ticket: "SHIP-164", permission: "disputes.read" },

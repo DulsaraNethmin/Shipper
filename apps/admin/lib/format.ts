@@ -66,3 +66,26 @@ export function shortIdentifier(id: string): string {
   const at = id.indexOf("-");
   return at < 0 ? id.slice(0, 8) : id.slice(0, at);
 }
+
+/**
+ * An amount in cents, as AUD (SHIP-188c).
+ *
+ * `CLAUDE.md` fixes the currency, so it is not a parameter — there is no second currency in this
+ * product and a symbol that could vary would be inventing one. `amount_cents` is an integer on the
+ * wire for the ordinary reason: money in a binary float rounds where nobody expects it, and the one
+ * place this panel could introduce that is the division below, which is why it happens once, here,
+ * rather than in each cell.
+ *
+ * A bid row may carry no amount at all — `adminBidResponse.AmountCents` is "zero where the row
+ * carries none" — and zero is rendered as a dash rather than as `$0.00`, because an offer of nothing
+ * and an offer with no price recorded are different facts and only the second exists.
+ */
+export function money(cents: number): string {
+  if (!Number.isFinite(cents) || cents === 0) return "—";
+
+  return new Intl.NumberFormat("en-AU", {
+    style: "currency",
+    currency: "AUD",
+    currencyDisplay: "narrowSymbol",
+  }).format(cents / 100);
+}

@@ -56,3 +56,40 @@ export function href(path: string, params: Record<string, string | undefined>): 
   const query = search.toString();
   return query === "" ? path : `${path}?${query}`;
 }
+
+/**
+ * Whether a value is an identifier this panel will put in a URL or a path.
+ *
+ * # Two callers, and the second is why it is strict
+ *
+ * `app/(panel)/jobs/[id]/page.tsx` interpolates the segment it was given into an upstream path —
+ * the one place in this application where anything but `platform()` reaches a `/v1/` template. It is
+ * checked here first, so what is interpolated is thirty-six characters of hexadecimal and hyphen and
+ * cannot be anything else. `new URL` would normalise a `..` and `URLSearchParams` would encode a
+ * `?`, so this is a third lock rather than the only one; it is nine characters of regular expression
+ * and the thing behind it is twenty-four privileged endpoints.
+ *
+ * The second caller is the job search, where a term that is an identifier means the job rather than
+ * a description to match against. `GET /v1/admin/jobs` matches `q` against `goods_description` and
+ * only that, so an operator pasting a job id from a log line, an audit entry or another screen would
+ * otherwise get an empty table — the single most misleading answer that screen can give.
+ *
+ * # Only the canonical form, in either case
+ *
+ * `uuid.Parse` on the platform also takes the unhyphenated, `urn:uuid:` and brace-wrapped spellings.
+ * Matching those here would be the wrong kind of generous: a 32-character run of hexadecimal is a
+ * plausible thing to search a goods description for, and treating it as an identifier would take
+ * somebody somewhere they did not ask to go. What this recognises is the form every screen, log line
+ * and audit entry in this product prints — so a term that looks like an identifier is one that was
+ * copied from one.
+ *
+ * No version or variant nibble is checked. The platform issues v7, but an identifier in somebody's
+ * hand came from this product and either names something or does not — and "does not" is a refusal
+ * the detail screen renders honestly, which is a better answer than a search that silently found
+ * nothing.
+ */
+const IDENTIFIER = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isIdentifier(value: string): boolean {
+  return IDENTIFIER.test(value.trim());
+}

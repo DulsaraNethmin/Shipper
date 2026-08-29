@@ -61,6 +61,8 @@ const MAY_REQUEST = [
   "app/api/admin/sessions/current/route.ts",
   "app/(panel)/users/page.tsx",
   "app/(panel)/jobs/page.tsx",
+  "app/(panel)/jobs/[id]/page.tsx",
+  "components/audit-trail.tsx",
 ];
 
 /**
@@ -92,6 +94,15 @@ const ENDPOINTS: Record<string, string[]> = {
   "app/api/admin/sessions/current/route.ts": ["/v1/admin/sessions/current"],
   "app/(panel)/users/page.tsx": ["/v1/admin/users"],
   "app/(panel)/jobs/page.tsx": ["/v1/admin/jobs"],
+
+  // The one path in this application with a hole in it, and the allow-list spells the hole —
+  // which is the property worth having. The pattern below captures `${…}`, so a file that
+  // started building its path from something would show it here as a changed expectation rather
+  // than pass unnoticed. `lib/query.ts`'s isIdentifier is what makes the value safe to
+  // interpolate; this is what makes the interpolation visible.
+  "app/(panel)/jobs/[id]/page.tsx": ["/v1/admin/jobs/${id}"],
+
+  "components/audit-trail.tsx": ["/v1/admin/audit"],
 };
 
 /**
@@ -336,7 +347,11 @@ test("every screen that names an endpoint can render the platform's refusal", ()
     .filter((file) => /^app\/.*page\.tsx$/.test(file) && /\/v1\//.test(code.get(file) ?? ""))
     .sort();
 
-  assert.deepEqual(screens, ["app/(panel)/jobs/page.tsx", "app/(panel)/users/page.tsx"]);
+  assert.deepEqual(screens, [
+    "app/(panel)/jobs/[id]/page.tsx",
+    "app/(panel)/jobs/page.tsx",
+    "app/(panel)/users/page.tsx",
+  ]);
 
   for (const screen of screens) {
     assert.match(
