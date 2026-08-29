@@ -31,6 +31,12 @@ const SECTIONS = [
   { label: "Users", href: "/users", ticket: "SHIP-188b", permission: "users.read" },
   { label: "Jobs and bids", href: "/jobs", ticket: "SHIP-188b", permission: "jobs.read" },
   { label: "Audit trail", href: "/audit", ticket: "SHIP-188c", permission: "audit.read" },
+  {
+    label: "Verification queue",
+    href: "/verifications?state=Pending",
+    ticket: "SHIP-188d",
+    permission: "verifications.read",
+  },
   { label: "Reports", href: null, ticket: "SHIP-156", permission: "moderation.read" },
   { label: "Delivery exceptions", href: null, ticket: "SHIP-157", permission: "moderation.read" },
   { label: "Disputes", href: null, ticket: "SHIP-164", permission: "disputes.read" },
@@ -59,9 +65,12 @@ export function PanelNav({ permissions }: { permissions: string[] }) {
 
         // `startsWith` for everything but the overview, so a job's own screen keeps "Jobs and
         // bids" marked. The overview is an exact match or it would be current on every page.
+        // The path only — one section's href carries a query string (the verification queue's
+        // `state`, which the platform requires and this panel never leaves off), and `usePathname`
+        // returns no query, so comparing the whole href would never match.
+        const target = section.href === null ? null : section.href.split("?")[0];
         const current =
-          section.href !== null &&
-          (section.href === "/" ? path === "/" : path.startsWith(section.href));
+          target !== null && (target === "/" ? path === "/" : path.startsWith(target));
 
         const className =
           "flex items-baseline justify-between gap-2 rounded-md px-3 py-2 text-sm " +

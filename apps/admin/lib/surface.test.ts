@@ -62,7 +62,11 @@ const MAY_REQUEST = [
   "app/(panel)/users/page.tsx",
   "app/(panel)/jobs/page.tsx",
   "app/(panel)/jobs/[id]/page.tsx",
+  "app/(panel)/verifications/page.tsx",
+  "app/(panel)/verifications/[id]/page.tsx",
+  "app/api/admin/verifications/[id]/decision/route.ts",
   "components/audit-trail.tsx",
+  "components/verification-decision.tsx",
 ];
 
 /**
@@ -103,6 +107,9 @@ const ENDPOINTS: Record<string, string[]> = {
   "app/(panel)/jobs/[id]/page.tsx": ["/v1/admin/jobs/${id}"],
 
   "components/audit-trail.tsx": ["/v1/admin/audit"],
+  "app/(panel)/verifications/page.tsx": ["/v1/admin/verifications"],
+  "app/(panel)/verifications/[id]/page.tsx": ["/v1/admin/verifications/${id}/documents"],
+  "app/api/admin/verifications/[id]/decision/route.ts": ["/v1/admin/verifications/${id}/decision"],
 };
 
 /**
@@ -127,10 +134,20 @@ const MAY_NAME_THE_COOKIE = [
   "app/api/admin/sessions/current/route.ts",
 ];
 
-/** The files that may hold a bearer credential on its way to the platform. */
+/**
+ * The files that may hold a bearer credential on its way to the platform.
+ *
+ * **Three, and not the same three as the list above** — which is the check working rather than a
+ * discrepancy to tidy. `app/api/admin/verifications/[id]/decision/route.ts` spends the credential
+ * and never names the cookie: it reads the token through `sessionTokenFrom`, which is what lets a
+ * route handler stay a plain function from a `Request` to a `Response`. Adding it to both lists on
+ * the assumption they move together failed this file, which is exactly what an allow-list asserted
+ * by name is for.
+ */
 const MAY_SPEND_THE_CREDENTIAL = [
   "lib/credential.ts",
   "app/api/admin/sessions/current/route.ts",
+  "app/api/admin/verifications/[id]/decision/route.ts",
 ];
 
 function sources(): Map<string, string> {
@@ -300,6 +317,8 @@ test("the idempotency key is minted in the browser and only forwarded after that
       "app/api/admin/sessions/route.ts",
       "components/sign-in-form.tsx",
       "components/sign-out-button.tsx",
+      "components/verification-decision.tsx",
+      "app/api/admin/verifications/[id]/decision/route.ts",
       "lib/keys.ts",
     ].sort(),
   );
@@ -320,6 +339,7 @@ test("every route handler checks that the request came from this panel", () => {
   assert.deepEqual(handlers, [
     "app/api/admin/sessions/current/route.ts",
     "app/api/admin/sessions/route.ts",
+    "app/api/admin/verifications/[id]/decision/route.ts",
   ]);
 
   for (const handler of handlers) {
@@ -351,6 +371,8 @@ test("every screen that names an endpoint can render the platform's refusal", ()
     "app/(panel)/jobs/[id]/page.tsx",
     "app/(panel)/jobs/page.tsx",
     "app/(panel)/users/page.tsx",
+    "app/(panel)/verifications/[id]/page.tsx",
+    "app/(panel)/verifications/page.tsx",
   ]);
 
   for (const screen of screens) {
