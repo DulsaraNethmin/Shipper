@@ -6,9 +6,10 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**248 tickets, 774 points.** Counted from the rows on 2026-08-21, at `9991578`. The previous
-figure — 246 and 766 — was correct for the tree it was written on; this pass adds **SHIP-187a** and
-**SHIP-187b**, which take M8 to eight rows and twenty-seven points.
+**249 tickets, 776 points.** Counted from the rows on 2026-08-29, on a branch whose base is
+`develop` at `f65cf7b`. The previous figure — 248 and 774 — was correct for the tree it was written
+on; this pass adds **X-11**, the domain name and the DNS records the demonstration environment
+resolves at, which takes Track X to eleven rows and thirty-one points.
 
 **Both rows were written because a deployment could not be built without them, which is the same
 way X-10 was found.** Attempting SHIP-188 established by running it that the API refuses to start
@@ -56,7 +57,7 @@ whenever a row is added rather than left for a later pass to reconcile.
 
 **Dependencies point backwards, with exactly ten forward edges across nine tickets — do not write a parser that assumes otherwise, and count edges rather than rows.** `SHIP-15c` depends on `SHIP-17a`, `SHIP-15e` depends on `SHIP-44`, `SHIP-15m` depends on `SHIP-44` **and** `SHIP-135` — two edges from one row, which is why this sentence says which unit it is counting — `SHIP-30a` depends on `SHIP-151`, `SHIP-65a` depends on `SHIP-83a`, `SHIP-70a` depends on `SHIP-90`, `SHIP-78a` depends on `SHIP-79`, `SHIP-81b` depends on `SHIP-114`, and `SHIP-134a` depends on `SHIP-135`. All of them exist because a lettered ticket is inserted at the point in build order where it *belongs* rather than where its blockers sit. Compute startability from the dependency column itself, never from ticket order.
 
-**The count is ten edges and it is unchanged by the wave-11 reconciliation, which added two.** `SHIP-144 → X-10` and `SHIP-145 → X-10` are both *backward*: Track X sorts first in build order, as it does in the milestone table above, so a dependency on an X row is never a forward edge whatever it gates. Re-derived by parsing the column rather than counted by eye, on `5a3b8d7` and again after the row was added.
+**The count is ten edges and it is unchanged by the wave-11 reconciliation, which added two.** `SHIP-144 → X-10` and `SHIP-145 → X-10` are both *backward*: Track X sorts first in build order, as it does in the milestone table above, so a dependency on an X row is never a forward edge whatever it gates. Re-derived by parsing the column rather than counted by eye, on `5a3b8d7` and again after the row was added. **`SHIP-188 → X-11` is the third such edge and leaves the count at ten for the same reason**, which is now the rule this paragraph is really recording: an edge into Track X is never forward, so a new X row can gate any number of tickets without moving this number.
 
 **Every one of the ten points at finished work again, and that is a state this paragraph has now been through in both directions.** The wave-10 reconciliation recorded the first exception in the file's history — `SHIP-65a → SHIP-83a`, where the target was open, so `SHIP-65a` was genuinely not startable and a tool treating forward edges as decorative would have reported it as ready. **SHIP-83a landed in wave 11**, so that edge is satisfied and SHIP-65a is startable; the warning is kept rather than deleted because the condition recurs the next time a lettered row is written ahead of its blocker. **Compute startability from the dependency column itself, never from ticket order, and never from whether this paragraph currently names an exception.**
 
@@ -72,7 +73,7 @@ whenever a row is added rather than left for a later pass to reconcile.
 
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
-| **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 10 | 29 |
+| **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 11 | 31 |
 | **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 41 | 117 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 29 | 83 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 28 | 84 |
@@ -82,7 +83,7 @@ whenever a row is added rather than left for a later pass to reconcile.
 | **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 22 | 69 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 24 | 72 |
 | **M8** — Demonstration | The marketplace runs at a stable address and a buyer can drive the whole journey unaided. | 8 | 27 |
-| | | **248** | **774** |
+| | | **249** | **776** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
@@ -103,8 +104,11 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | X-8 | Draft customer terms of use and provider agreement | 5 | Both documents approved by the legal adviser | X-4 |
 | X-9 | Finalise the prohibited-goods list | 3 | Category list approved and ready to load as reference data | X-4 |
 | X-10 | Create the Firebase project and issue its push credentials | 3 | A Firebase project exists; a service-account key is in the CI secret store and in no commit; `google-services.json` and `GoogleService-Info.plist` are available to the mobile build; and a push sent with the platform's own credential arrives on a real handset | — |
+| X-11 | Register the demonstration hostname and point its records at the host | 2 | Three names — the API, the object store and the mailbox — resolve to the demonstration host's public IPv4, and ports 80 and 443 reach it from the public internet | — |
 
 **X-10 was written at the wave-11 reconciliation, eleven waves after the work behind it started, and the reason it stayed invisible is worth more than the row.** `Docs/11` §5 lists only work blocked on a Track-X ticket, and **this was blocked on nothing** — there was no row to be blocked on. So SHIP-139 built the Firebase adapter against a fake FCM server, SHIP-143 shipped a `PushTokenSource` seam with a test asserting the absence, both said in their own write-ups that no project exists, and neither could do anything about it. **A prerequisite the backlog assumed and never wrote down is invisible to every instrument here**: `make status` counts rows, `make verify` exercises endpoints, and neither can report a thing that is missing from the plan itself. It is the same shape as the SHIP-153 gap the wave-10 reconciliation found, and the same answer — write the row.
+
+**X-11 is the third instance of exactly that shape and the second found by trying to deploy rather than by a reconciliation.** SHIP-188's *Done when* has always read "/health over HTTPS **at a stable hostname**", and no row in this file ever asked anybody to obtain one. The branch built the whole environment — Caddy, the certificate automation, three virtual hosts, the acceptance harness — and its own final commit records the harness "exits 1 at the hostname because no DNS name exists yet". **The gap was therefore not merely unwritten, it was measured and reported by the work itself, and still had nowhere to go**: a `grep -inE 'dns|domain name|hostname|registrar'` over this file returned SHIP-188's own row and nothing else. `Docs/11` §5 lists work blocked on a Track-X ticket, so with no row to be blocked on SHIP-188 read as startable, was started, and stopped one clause short of done. **A bare IP address cannot stand in**: Let's Encrypt does not issue certificates for IP addresses, so there would be no HTTPS to demonstrate and the criterion could not be met at all. `deploy/demo/README.md` carries the two ways to satisfy it and what each costs.
 
 **It depends on nothing and can be done this week, which is the operationally important half.** Creating the project, downloading the two client configuration files and issuing a service-account key need no third-party approval and no enrolment. **The one part that does wait is the iOS leg**: FCM reaches an iPhone through APNs, which needs an authentication key from the Apple Developer Program, so that half arrives with X-2. Split the ticket if the Android leg is wanted sooner; do not let the iOS half hold the project.
 
@@ -513,7 +517,7 @@ What does work is an endpoint the app reads **while it still has signal** and ke
 | SHIP-187 | Container images for the API, worker and notifier | 3 | Each binary builds to an image that starts from environment configuration alone, with no file baked in that a deployment would need to change | SHIP-20 |
 | SHIP-187a | Messaging vendor as configuration | 5 | An email or SMS vendor differing in path, credential header and body shape is reachable by configuration alone, and the transport is chosen by setting rather than by environment | SHIP-32, SHIP-35 |
 | SHIP-187b | SMTP email transport | 3 | A message sent over SMTP is accepted by a mail server with its headers and body intact, and a credential is refused over an unencrypted connection | SHIP-187a |
-| SHIP-188 | Demonstration environment | 5 | The API answers /health over HTTPS at a stable hostname, with migrations and the topic set applied by the same deployment | SHIP-187, SHIP-187b |
+| SHIP-188 | Demonstration environment | 5 | The API answers /health over HTTPS at a stable hostname, with migrations and the topic set applied by the same deployment | SHIP-187, SHIP-187b, X-11 |
 | SHIP-189 | Deploy the admin panel and the driver portal | 2 | Both are reachable over HTTPS and talk to the demonstration API; a driver link opens on a handset with no account | SHIP-188 |
 | SHIP-190 | Demonstration build of the mobile app | 2 | An installable Android build talks to the demonstration API with no change to any source file | SHIP-188 |
 | SHIP-191 | Demonstration walkthrough | 2 | A written script drives every step of Docs 01 §8's demo gate against the hosted instance, unaided, with no direct database access | SHIP-186, SHIP-189, SHIP-190 |
@@ -561,11 +565,11 @@ Worth stating plainly rather than discovering in month four.
 
 | Working pattern | Points per week | Elapsed |
 |---|---|---|
-| Full-time, focused | 20–25 | **30–38 weeks** (roughly 7–9 months) |
+| Full-time, focused | 20–25 | **31–38 weeks** (roughly 7–9 months) |
 | Full-time, with interruptions | 15 | **~51 weeks** |
-| Evenings and weekends | 6–8 | **96–129 weeks** (around two years) |
+| Evenings and weekends | 6–8 | **97–129 weeks** (around two years) |
 
-**The three rows are `floor(774 / rate)` and nothing else, and the total they divide is the one the rows carry.** They read 23, 29, 39, 74 and 99 two passes ago, which is `floor(599 / rate)` exactly — so the table was not merely stale, it was arithmetic over a total the plan stopped having long ago, and the 599 was still printed under *If you need to cut scope* where it was easiest to read as current. Recompute all five figures whenever the point total moves — now 30, 38, 51, 96 and 129 — together with the 774 under *If you need to cut scope*, which is the same total wearing prose. They are derived, not estimated.
+**The three rows are `floor(776 / rate)` and nothing else, and the total they divide is the one the rows carry.** They read 23, 29, 39, 74 and 99 two passes ago, which is `floor(599 / rate)` exactly — so the table was not merely stale, it was arithmetic over a total the plan stopped having long ago, and the 599 was still printed under *If you need to cut scope* where it was easiest to read as current. Recompute all five figures whenever the point total moves — now 31, 38, 51, 97 and 129 — together with the 776 under *If you need to cut scope*, which is the same total wearing prose. They are derived, not estimated.
 
 **M8 moved them for the first time since that correction, and it is the cheap case rather than the instructive one.** Nineteen points is under three weeks at any of these rates, so every row moved by one or two and none of the prose around them stopped being true. **The figure to distrust is the one that did not move**: a derived table is at its most dangerous when the total changes by little, because nothing about the page looks wrong.
 
@@ -575,7 +579,7 @@ Two things move this number more than working faster does: cutting scope (below)
 
 ## If you need to cut scope
 
-774 points is a substantial solo build. These are the honest levers, in the order I would pull them:
+776 points is a substantial solo build. These are the honest levers, in the order I would pull them:
 
 | Cut | Saves | What you lose |
 |---|---|---|

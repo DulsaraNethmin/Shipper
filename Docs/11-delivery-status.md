@@ -89,13 +89,28 @@ question.
 | | Tickets | Points |
 |---|---|---|
 | **Done** | 208 | 648 |
-| Remaining | 40 | 126 |
-| **Total** | 248 | 774 |
+| Remaining | 41 | 128 |
+| **Total** | 249 | 776 |
 
-**Measured on `ship-187a-187b-messaging-transports`, whose base is `develop` at `82cda3c`.**
-`make status` on this branch prints **208 / 248 and 648 / 774** with both guards green. The
-movement is **SHIP-187a and SHIP-187b**, at eight points, taking the demonstration track to
-**3 of 8** — and the total itself moved, because both rows are new.
+**Measured on `ship-15as-x11-domain-row`, whose base is `develop` at `f65cf7b`.** `make status` on
+this branch prints **208 / 249 and 648 / 776** with both guards green. **It closes no ticket**: the
+done column is unchanged and the whole of the movement is `Docs/09` gaining **X-11**, the domain
+name and the DNS records the demonstration resolves at, at two points. Track X goes to eleven rows
+and thirty-one points, and **1 of 11**.
+
+**The row exists because SHIP-188 could not finish without it and had nothing to be blocked on.**
+Its *Done when* has always required "/health over HTTPS **at a stable hostname**"; the branch built
+the environment, the certificate automation and the acceptance harness, and the harness "exits 1 at
+the hostname because no DNS name exists yet". That is the same shape as SHIP-187a and X-10 before
+it — **a prerequisite the backlog assumed and never wrote down** — and the second consecutive one
+found by trying to deploy rather than by a reconciliation. §6's startable set is not recomputed
+here; SHIP-188 now carries `X-11` in its dependency column, so the next pass to parse it will stop
+reading SHIP-188 as startable.
+
+**The pass beneath it:** measured on `ship-187a-187b-messaging-transports`, whose base is `develop`
+at `82cda3c`. `make status` on that branch printed **208 / 248 and 648 / 774** with both guards
+green. The movement was **SHIP-187a and SHIP-187b**, at eight points, taking the demonstration track
+to **3 of 8** — and the total itself moved, because both rows were new.
 
 **The rows were written mid-ticket, and how they were found matters more than what they cost.**
 SHIP-188 was started, its stack was built, and the API refused to start: outside development,
