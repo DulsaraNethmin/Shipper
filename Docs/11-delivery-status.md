@@ -18931,6 +18931,36 @@ Kept, struck, because the shape recurs and this is the second instance of it. **
 
 ## 9. Open recommendations nobody has decided
 
+### The required-field set for publication is a judgement, and it is the owner's to confirm
+
+**SHIP-63 had to decide what a job must say before providers can bid on it, and no document says.**
+`Docs/09`'s *Done when* asks it to "validate required fields" and names none. `Docs/01` §4.1 lists
+what a customer *may* put on a job — "pickup/drop-off locations, date windows, goods description,
+dimensions/weight, vehicle requirement, handling notes, and optional maximum budget" — but it is a
+**capability list rather than a specification**: only the budget is marked optional, and reading the
+rest as mandatory would refuse a job for having no handling notes, which is the ordinary case rather
+than an incomplete one.
+
+**What shipped:** pickup, drop-off, a goods description, a goods category, and the *start* of the
+pickup window. The test applied was **can a provider act on this** — where from, where to, when, and
+what.
+
+**The arguable entry is size.** Weight and dimensions are **not** required. A provider choosing
+between a van and a tray truck wants them, and a job without them will attract vaguer bids or none.
+They were left optional because refusing to publish is the more expensive failure: a customer who
+cannot say what their pallet weighs would be stopped at the last step of the flow with no way
+forward, whereas a provider who needs the number can ask on the job's message thread (`Docs/02` §5).
+
+**This is a product decision recorded as an engineering one, which is why it is here.** The whole
+set lives in one function — `publishable` in `internal/jobs/publish.go` — precisely so that changing
+it is one edit and one test, and `publishableFields` in `publish_test.go` is deliberately the
+*minimum* that publishes, so a field added to the set without an argument fails a test rather than
+passing quietly. **If the owner wants size required, say so and it is a ten-minute change.**
+
+**The related question nobody has asked yet:** whether a job with no size attracts worse bids is
+measurable once the demonstration has data, and SHIP-186's seed set is the first place it could be
+looked at.
+
 **~~What the next release is for.~~ Decided by the owner on 20 August 2026 — a hosted demonstration,
 not a pilot.** Shipper is being built to sell rather than to launch, so store publishing, pilot
 recruitment and production hardening stop being the destination and a demonstration a prospective
