@@ -6,6 +6,7 @@ import 'package:go_router/go_router.dart';
 
 import 'package:shipper/core/errors/api_failure.dart';
 import 'package:shipper/core/routing/app_router.dart';
+import 'package:shipper/features/jobs/address_section.dart';
 import 'package:shipper/features/jobs/job.dart';
 import 'package:shipper/features/jobs/job_locations_controller.dart';
 import 'package:shipper/shared/design_system/failure_banner.dart';
@@ -14,22 +15,14 @@ import 'package:shipper/shared/design_system/failure_banner.dart';
 ///
 /// ## Nothing on this screen validates an address, and that is the decision
 ///
-/// There is no local check on any of the eight inputs — not a postcode pattern, not a length,
-/// not a list of the eight states. `Docs/07` §2 puts the rules on the platform and the app's job
-/// is to render its answer, and `Docs/06` §5.3 keeps validation limits server-side precisely
-/// because Dart has no over-the-air update path: a limit compiled in here is a limit that cannot
-/// be corrected without a store release.
+/// [AddressSection] carries the argument, because SHIP-75 needs the same eight inputs on the step
+/// that edits a saved draft and the reasoning has to travel with them. The short version:
+/// `Docs/07` §2 puts the rules on the platform, and a client-side rule here could only refuse
+/// something the platform accepts.
 ///
-/// `validators.dart` describes the one duplication this codebase knowingly carries — the password
-/// minimum — and the argument that makes it safe is that it can only fail in the harmless
-/// direction. **None of these fields has that property.** A client-side postcode rule would refuse
-/// an address the platform accepts; a client-side list of states would refuse a territory renamed
-/// server-side; and a client-side "all four are required" rule would refuse the empty address that
-/// `Docs/01` §4.1 explicitly allows, because a draft may be saved half-finished and returned to.
-///
-/// So the platform decides, and what it decides arrives as `validation_failed` with one `details`
-/// entry per offending field under a dotted path — `pickup.postcode`, `dropoff.state` — which is
-/// the shape this form renders inline beside the input that caused it.
+/// **This screen creates the draft; `JobLocationsEditScreen` edits one that exists.** They draw
+/// the same form and send different requests — `POST /v1/jobs` against `PATCH /v1/jobs/{id}` —
+/// which is the whole of the difference between starting a job and coming back to one.
 ///
 /// ## An address the platform could not place is an ordinary outcome, not an error
 ///
@@ -49,8 +42,8 @@ class JobLocationsScreen extends ConsumerStatefulWidget {
 class _JobLocationsScreenState extends ConsumerState<JobLocationsScreen> {
   final _form = GlobalKey<FormState>();
 
-  final _pickup = _AddressFields();
-  final _dropoff = _AddressFields();
+  final _pickup = AddressFields();
+  final _dropoff = AddressFields();
 
   /// What the platform said about each field, keyed by the dotted path it named.
   ///
@@ -152,9 +145,21 @@ class _JobLocationsScreenState extends ConsumerState<JobLocationsScreen> {
             FailureBanner(failure),
             const SizedBox(height: 16),
           ],
-          _addressSection(theme, 'Pickup', 'pickup', _pickup),
+          AddressSection(
+            title: 'Pickup',
+            path: 'pickup',
+            fields: _pickup,
+            messageFor: (field) => _serverErrors[field],
+            onEdited: _clearServerError,
+          ),
           const SizedBox(height: 24),
-          _addressSection(theme, 'Drop-off', 'dropoff', _dropoff),
+          AddressSection(
+            title: 'Drop-off',
+            path: 'dropoff',
+            fields: _dropoff,
+            messageFor: (field) => _serverErrors[field],
+            onEdited: _clearServerError,
+          ),
           const SizedBox(height: 32),
           FilledButton(
             key: const Key('job-locations-submit'),
@@ -178,77 +183,6 @@ class _JobLocationsScreenState extends ConsumerState<JobLocationsScreen> {
           ),
         ],
       ),
-    );
-  }
-
-  Widget _addressSection(ThemeData theme, String title, String path, _AddressFields fields) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(title, style: theme.textTheme.titleMedium),
-        const SizedBox(height: 12),
-        TextFormField(
-          key: Key('$path-line'),
-          controller: fields.line,
-          textInputAction: TextInputAction.next,
-          decoration: const InputDecoration(
-            labelText: 'Street address',
-            // Freeform on the platform's side too: unit, level and lot numbers, PO boxes and
-            // roadside mail boxes are all legitimate and none of them is parsed.
-            helperText: 'Unit or level numbers, or anything a driver needs to find the door.',
-          ),
-          onChanged: (_) => _clearServerError('$path.line'),
-          validator: (_) => _serverErrors['$path.line'],
-        ),
-        const SizedBox(height: 12),
-        TextFormField(
-          key: Key('$path-suburb'),
-          controller: fields.suburb,
-          textInputAction: TextInputAction.next,
-          decoration: const InputDecoration(labelText: 'Suburb'),
-          onChanged: (_) => _clearServerError('$path.suburb'),
-          validator: (_) => _serverErrors['$path.suburb'],
-        ),
-        const SizedBox(height: 12),
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Expanded(
-              child: TextFormField(
-                key: Key('$path-state'),
-                controller: fields.state,
-                textInputAction: TextInputAction.next,
-                // A text field rather than a picker, deliberately. The eight states are the
-                // platform's list and it accepts any case and the spelled-out name, so a
-                // picker here would be a second copy of that list compiled into a build that
-                // cannot be updated over the air (Docs/10 §4.7, Docs/07 §1).
-                textCapitalization: TextCapitalization.characters,
-                decoration: const InputDecoration(
-                  labelText: 'State',
-                  helperText: 'NSW, or New South Wales',
-                ),
-                onChanged: (_) => _clearServerError('$path.state'),
-                validator: (_) => _serverErrors['$path.state'],
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: TextFormField(
-                key: Key('$path-postcode'),
-                controller: fields.postcode,
-                keyboardType: TextInputType.number,
-                textInputAction: TextInputAction.next,
-                decoration: const InputDecoration(
-                  labelText: 'Postcode',
-                  helperText: 'Four digits',
-                ),
-                onChanged: (_) => _clearServerError('$path.postcode'),
-                validator: (_) => _serverErrors['$path.postcode'],
-              ),
-            ),
-          ],
-        ),
-      ],
     );
   }
 
@@ -375,32 +309,5 @@ class _LookupOutcome extends StatelessWidget {
         ),
       ],
     );
-  }
-}
-
-/// The four text controllers of one address, kept together so the screen does not carry eight.
-class _AddressFields {
-  final line = TextEditingController();
-  final suburb = TextEditingController();
-  final state = TextEditingController();
-  final postcode = TextEditingController();
-
-  /// What is in the fields, untouched.
-  ///
-  /// Trimmed and nothing else. The platform collapses whitespace, resolves the state and strips
-  /// spaces from the postcode; a second normaliser on the device is how a client ends up unable
-  /// to reproduce the address it sent.
-  AddressInput get value => AddressInput(
-        line: line.text.trim(),
-        suburb: suburb.text.trim(),
-        state: state.text.trim(),
-        postcode: postcode.text.trim(),
-      );
-
-  void dispose() {
-    line.dispose();
-    suburb.dispose();
-    state.dispose();
-    postcode.dispose();
   }
 }

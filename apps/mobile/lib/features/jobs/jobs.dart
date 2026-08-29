@@ -6,7 +6,11 @@
 ///   an address on its way *to* the platform.
 /// - `job_status.dart` — the twelve states of `Docs/02` §1, in their wire form.
 /// - `jobs_repository.dart` — the six endpoints a customer screen calls.
-/// - `job_locations_screen.dart` and its controller — the first step of publishing (SHIP-71).
+/// - `job_locations_screen.dart` and its controller — the first step of publishing (SHIP-71). It
+///   *creates* the draft; `job_locations_edit_screen.dart` edits one that exists (SHIP-75), which
+///   is the whole of the difference between starting a job and coming back to one.
+/// - `address_section.dart` — the eight inputs both of those draw, and the argument for why none
+///   of them validates on the device.
 /// - `job_wizard.dart` — the four steps of describing a delivery, and the chrome they share.
 /// - `job_draft_controller.dart` — the spine of the wizard: one draft, read once and edited a
 ///   step at a time. Every step after the first uses it, because they are all the same operation.

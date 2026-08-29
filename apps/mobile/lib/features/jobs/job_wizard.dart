@@ -14,8 +14,7 @@ import 'package:shipper/shared/design_system/failure_banner.dart';
 /// list and must not be conflated: `publishable` in `internal/jobs/publish.go` requires the two
 /// addresses, a goods description, a goods category and the start of the pickup window — which
 /// spans the first three steps and none of the fourth. The budget is optional and always was.
-/// Reading a draft against that set is what SHIP-75 resumes on, and it is written there rather
-/// than here.
+/// [firstIncompleteFor] is the one place that reads the platform's set, and it says so.
 enum JobWizardStep {
   /// Pickup and drop-off (SHIP-71). The step that creates the draft.
   locations('Locations', 'Where is it going?'),
@@ -39,6 +38,56 @@ enum JobWizardStep {
 
   /// One-based, for `Step 2 of 4`. People do not count from zero.
   int get position => index + 1;
+
+  /// The route this step occupies for [jobId] (SHIP-75).
+  ///
+  /// **Every step has one, including the first**, which is what makes a draft resumable. `/jobs/new`
+  /// deliberately carries no id — the draft does not exist until that step saves — so resuming into
+  /// the locations step needs a second route that names one. Without it, a draft whose addresses
+  /// were left empty could be reopened at no step at all.
+  String pathFor(String jobId) => switch (this) {
+        JobWizardStep.locations => Routes.jobLocationsFor(jobId),
+        JobWizardStep.goods => Routes.jobGoodsFor(jobId),
+        JobWizardStep.schedule => Routes.jobScheduleFor(jobId),
+        JobWizardStep.review => Routes.jobReviewFor(jobId),
+      };
+
+  /// The first step of [draft] that is not finished, or [review] when nothing is missing
+  /// (SHIP-75).
+  ///
+  /// ## This is the client's copy of the platform's required-field set
+  ///
+  /// It mirrors `publishable` in `internal/jobs/publish.go` as it stands: both addresses, a goods
+  /// description, a goods category, and the start of the pickup window. **Size — weight and
+  /// dimensions — is deliberately not in it**, which mirrors the platform and is the one entry
+  /// `Docs/11` §9 records as the owner's to revisit. If that decision changes, this changes with
+  /// it, and the test below it is what says so out loud.
+  ///
+  /// ## It is allowed to be wrong, in exactly one direction
+  ///
+  /// `Docs/07` §3 puts every decision on the platform, and this decides nothing: it chooses which
+  /// step to **open**, and the customer can walk to any other from there. If it disagrees with
+  /// `publishable`, the cost is a customer landing on a step they had already finished — never a
+  /// job wrongly published, and never one wrongly refused, because `POST /v1/jobs/{id}/publish`
+  /// re-checks the whole set server-side and lists everything missing at once.
+  ///
+  /// That is why it is a convenience rather than a duplicated rule, and why it is safe to keep a
+  /// copy of a list that lives somewhere else.
+  static JobWizardStep firstIncompleteFor(Job draft) {
+    final pickup = draft.pickup;
+    final dropoff = draft.dropoff;
+    if (pickup == null || pickup.isEmpty || dropoff == null || dropoff.isEmpty) {
+      return JobWizardStep.locations;
+    }
+
+    if ((draft.goodsDescription ?? '').isEmpty || (draft.goodsCategory ?? '').isEmpty) {
+      return JobWizardStep.goods;
+    }
+
+    if ((draft.pickupWindow?.start ?? '').isEmpty) return JobWizardStep.schedule;
+
+    return JobWizardStep.review;
+  }
 }
 
 /// The chrome every step after the first shares: the title, the step indicator, and the three
