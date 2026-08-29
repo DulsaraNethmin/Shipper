@@ -20,7 +20,7 @@ import (
 // per-domain contract fragments. So a domain declares its own codes in its own package:
 //
 //	var CodeProhibitedCategory = httpx.RegisterCode(
-//	    "prohibited_category", "The goods category may not be published.")
+//	    "jobs_prohibited_category", "The goods category may not be published.")
 //
 // and edits nothing shared. What stops two domains choosing the same string is a test in cmd/api,
 // which is the one package that links every domain together and is therefore the only place the
@@ -61,8 +61,8 @@ var (
 // the process at startup is a service where two domains quietly mean different things by one
 // string that clients cannot tell apart.
 //
-// Codes are lower_snake_case and named <domain>_<condition> — `prohibited_category`,
-// `bid_withdrawn`. They are part of the API contract in the same way a field name is: stable once
+// Codes are lower_snake_case and named <domain>_<condition> — `jobs_prohibited_category`,
+// `bidding_bid_withdrawn`. They are part of the API contract in the same way a field name is: stable once
 // published, because a store build already on a device is branching on them and Flutter has no
 // over-the-air path to fix it (Docs/06 §5.3).
 func RegisterCode(code Code, description string) Code {

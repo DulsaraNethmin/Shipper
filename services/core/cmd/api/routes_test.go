@@ -99,6 +99,28 @@ func testStorageConfig() config.Storage {
 	}
 }
 
+// testGoodsConfig is a catalogue for the router to be built with (SHIP-58).
+//
+// Needed for the same reason [testStorageConfig] is, and it is the fourth instance of the shape
+// Docs/11 §3 records at SHIP-15p — "the app test fixture that every new configuration section used
+// to break". `config.Goods{}` has no categories, and a catalogue with nothing carried is one
+// jobs.NewCatalogue refuses, so a router built from a zero-valued Config panics during attach.
+// That is the guard working: a deployment whose catalogue failed to parse must not start serving a
+// marketplace that can publish nothing.
+//
+// **Deliberately not the shipped default**, which internal/config keeps unexported anyway. Nothing
+// in this package asserts on the catalogue's contents — the tests here are about wiring — and a
+// fixture that happened to match the real list would let a test in this package pass for a reason
+// it does not state. internal/jobs is where the served list is exercised.
+func testGoodsConfig() config.Goods {
+	return config.Goods{
+		Categories: []config.GoodsCategory{
+			{Code: "cmd_api_carried", Label: "Carried", Carried: true},
+			{Code: "cmd_api_refused", Label: "Refused", Carried: false},
+		},
+	}
+}
+
 func testDeps() Deps {
 	return Deps{
 		Config: &config.Config{
@@ -106,6 +128,7 @@ func testDeps() Deps {
 			Identity:  testIdentityConfig(),
 			Delivery:  testDeliveryConfig(),
 			Storage:   testStorageConfig(),
+			Goods:     testGoodsConfig(),
 			App:       testAppConfig(),
 		},
 		Logger:    slog.New(slog.NewJSONHandler(io.Discard, nil)),

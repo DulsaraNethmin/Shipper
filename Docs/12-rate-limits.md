@@ -123,9 +123,9 @@ rule are what stand in front of them. A rate limit bounds volume; it has never b
 screens at once; 3600 an hour is well past any legitimate client and well under what makes scraping
 worthwhile.
 
-**`PublicRead` — unauthenticated read.** `GET /v1/app/policy` and `GET /v1/app/minimum-version` are
-hit by **every** application launch, and the key is a network address, so one corporate NAT is one
-caller. Deliberately the loosest class for that reason. The responses are static configuration, and
+**`PublicRead` — unauthenticated read.** `GET /v1/app/policy`, `GET /v1/app/minimum-version` and
+`GET /v1/goods-categories` (SHIP-58) are hit by **every** application launch, and the key is a
+network address, so one corporate NAT is one caller. Deliberately the loosest class for that reason. The responses are static configuration, and
 the honest control for volumetric abuse of static content is an edge cache rather than an
 application bucket — which is a deployment decision, not this document's.
 
@@ -143,9 +143,9 @@ application bucket — which is a deployment decision, not this document's.
 
 ## 5. The assignment
 
-All 86 routes on `services/core/cmd/api/routes_golden.txt`, generated from the manifest rather than
-listed by hand. Counts: `Unlimited` 1, `Credential` 5, `Message` 3, `Upload` 3, `Write` 36,
-`Read` 35, `PublicRead` 3.
+All 88 routes on `services/core/cmd/api/routes_golden.txt`, generated from the manifest rather than
+listed by hand. Counts: `Unlimited` 1, `Credential` 5, `Message` 3, `Upload` 3, `Write` 37,
+`Read` 35, `PublicRead` 4.
 
 | Method | Path | Auth | Class |
 |---|---|---|---|
@@ -192,6 +192,7 @@ listed by hand. Counts: `Unlimited` 1, `Credential` 5, `Message` 3, `Upload` 3, 
 | POST | `/v1/driver/jobs/{id}/milestones` | driver-token | `Write` |
 | POST | `/v1/driver/jobs/{id}/proof-uploads` | driver-token | `Upload` |
 | GET | `/v1/fleet/bids` | user | `Read` |
+| GET | `/v1/goods-categories` | public | `PublicRead` |
 | GET | `/v1/fleet/jobs` | user | `Read` |
 | GET | `/v1/fleet/jobs/{id}` | user | `Read` |
 | GET | `/v1/fleet/profile` | user | `Read` |
@@ -226,6 +227,7 @@ listed by hand. Counts: `Unlimited` 1, `Credential` 5, `Message` 3, `Upload` 3, 
 | GET | `/v1/jobs/{id}/history` | user | `Read` |
 | POST | `/v1/jobs/{id}/milestones` | user | `Write` |
 | POST | `/v1/jobs/{id}/proof-uploads` | user | `Upload` |
+| POST | `/v1/jobs/{id}/publish` | user | `Write` |
 | POST | `/v1/notifications/device-tokens` | user | `Write` |
 | DELETE | `/v1/notifications/device-tokens/current` | user | `Write` |
 | GET | `/v1/notifications/preferences` | user | `Read` |
@@ -308,22 +310,29 @@ person can hold in their head, against eighty-six they cannot.
 ## 8. The gate SHIP-183a inherited, and SHIP-183b closed
 
 > **Closed by SHIP-183b.** `internal/httpx` reads `X-Forwarded-For` as far as a configured
-> trusted-proxy hop count or CIDR allow-list allows, and `RemoteAddr` otherwise, so all eleven
+> trusted-proxy hop count or CIDR allow-list allows, and `RemoteAddr` otherwise, so all twelve
 > routes now enforce. The section is kept as written because the argument is what the
 > configuration has to keep being true of — a deployment that sets neither variable still gets
 > `RemoteAddr` alone, which is the shared-bucket end of exactly this trade-off, deliberately
 > chosen as the safe default. §11 records what SHIP-183b decided along the way.
 
-**Eleven of the 86 routes key on a network address, and none of their limits can be trusted behind
+**Twelve of the 88 routes key on a network address, and none of their limits can be trusted behind
 a load balancer until the trusted-proxy configuration exists.** `Docs/11` §9 records that
 `X-Forwarded-For` is deliberately unread and parks the decision on "the deployment work". This
 review turns that from a note into a countable dependency.
 
-The five `Credential`, three `Message` and three `PublicRead` routes are the eleven. With
+The five `Credential`, three `Message` and four `PublicRead` routes are the twelve. With
 `X-Forwarded-For` unread behind a proxy, every request presents the balancer's address, so all
-eleven share one bucket per class and the first deployment throttles the entire world at the first
+twelve share one bucket per class and the first deployment throttles the entire world at the first
 caller. Applying these limits **before** a trusted-proxy hop count or CIDR allow-list exists takes
-the blast radius of that gap from the two routes that have it today to eleven.
+the blast radius of that gap from the two routes that have it today to twelve.
+
+**It was eleven until SHIP-58 added `GET /v1/goods-categories`, and the arithmetic moving is the
+mechanism rather than a correction.** This section's figures are held by
+`TestTheAddressKeyedRoutesEnforceTheirClass`, which recomputes them from the manifest, so a
+public route added without this paragraph fails the build. That is the property worth keeping: the
+count is a consequence of the route table, and the one way it can be wrong is if somebody edits
+both to agree on something false.
 
 **The other 75 routes are unaffected by the proxy**, because a user id, an administrator id and a
 driver token's job all survive one untouched. **That is the scheduling consequence worth carrying
@@ -384,7 +393,7 @@ class keeps a floor of one token and one millisecond, so these are a dial and no
 |---|---|
 | An account reported locked out by a third party, or buckets emptied from >3 distinct addresses | Build the distinct-address per-account limit (§6) |
 | An incident wanting one route different from the rest | A per-**class** override map, never per-route (§7) |
-| ~~The trusted-proxy configuration landing~~ **Done at SHIP-183b** | The eleven address-keyed routes became enforceable (§8) |
+| ~~The trusted-proxy configuration landing~~ **Done at SHIP-183b** | The eleven address-keyed routes became enforceable (§8) — twelve since SHIP-58 |
 | An IPv6 caller reported sharing a limit with an unrelated one, or evading one from inside a prefix | Revisit the /64 the address is keyed on (§11) |
 | An incident wanting the global lever to reach the `Credential` class | Thread the scale into `internal/identity` and `internal/admin`, which it does not reach today (§11) |
 | The first route whose cost is neither a caller, a destination nor an artefact | A fourth mechanism, and this document gains a section rather than a class |

@@ -171,7 +171,7 @@ This section, like §4.4 below it, described a mechanism that did not exist. `ht
 
 ```go
 var CodeProhibitedCategory = httpx.RegisterCode(
-    "prohibited_category", "The goods category may not be published.")
+    "jobs_prohibited_category", "The goods category may not be published.")
 ```
 
 Named `<domain>_<condition>`, lower snake case. Registration refuses a duplicate, a code that is not lower snake case, and a code with no description — the description is what the generated document says the code means, and a client given only a name guesses.

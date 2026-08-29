@@ -50,10 +50,12 @@ func newTestRouter(t *testing.T, pool *pgxpool.Pool, opts ...Option) http.Handle
 	}
 
 	mux := http.NewServeMux()
+	mux.Handle("GET /v1/goods-categories", handler.Categories())
 	mux.Handle("GET /v1/jobs", handler.List())
 	mux.Handle("POST /v1/jobs", handler.Create())
 	mux.Handle("GET /v1/jobs/{id}", handler.Detail())
 	mux.Handle("PATCH /v1/jobs/{id}", handler.Update())
+	mux.Handle("POST /v1/jobs/{id}/publish", handler.Publish())
 	mux.Handle("POST /v1/jobs/{id}/cancel", handler.Cancel())
 	mux.Handle("POST /v1/jobs/{id}/extend", handler.Extend())
 	mux.Handle("GET /v1/jobs/{id}/history", handler.History())

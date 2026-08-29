@@ -16,6 +16,7 @@ package config
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -70,6 +71,7 @@ type Config struct {
 	TrustedProxy TrustedProxy
 	Storage      Storage
 	Verification Verification
+	Goods        Goods
 	App          App
 }
 
@@ -115,6 +117,162 @@ type Verification struct {
 	// Empty by default. See the type's own note: that is X-4 being unanswered, not a value
 	// somebody forgot.
 	ExpiryLeadTimes map[string]time.Duration
+}
+
+// Goods carries the catalogue of goods categories a job may name (SHIP-58).
+//
+// # Why this is configuration rather than a table or a constant
+//
+// CLAUDE.md names "category lists" first among the things that live server-side because they
+// change under operational pressure, and Docs/06 §5.3 requires such values to move without a
+// deploy. A Go constant fails that outright. A table would pass it, and was rejected for a
+// narrower reason: the list is not data the product *accumulates*, it is a decision the platform
+// *publishes*, and the moment it lives in a table it acquires an administrative surface nobody
+// asked for and a migration for every revision.
+//
+// # The list below is provisional, and the type says so per entry rather than per catalogue
+//
+// X-9 asked for a finalised prohibited-goods list and depends on X-4, the legal brief, which is
+// unanswered. Docs/11 §5 records the way out taken here: the owner approves a provisional list,
+// **the list is marked provisional in the reference data itself**, X-4 stays open, and Docs/11 §4
+// carries what is still owed. This is the same shape SHIP-139 and SHIP-143 shipped in against an
+// FCM project that did not exist.
+//
+// [GoodsCategory.Provisional] is per entry rather than one flag on the catalogue, and that is a
+// judgement about how X-4 will land rather than a preference: a legal adviser is far more likely
+// to confirm most of a list and query two entries than to bless or reject thirteen at once. A
+// per-entry flag lets that answer arrive incrementally and be seen by a client; a catalogue-wide
+// one would have to flip from true to false in a single step that nobody could stage.
+//
+// # Why the default is in Go, having just argued that a constant fails
+//
+// Because the two are not the same claim. What Docs/06 §5.3 forbids is a value that *cannot* be
+// changed without a release, and one environment variable changes every field of every entry
+// here. What it does not ask for is a service that refuses to start until somebody types a
+// thirteen-entry JSON document — which is what an empty default would mean, since a catalogue
+// with nothing carried can publish nothing at all. Storage.AcceptedContentTypes is the same
+// arrangement for the same reason and is likewise policy rather than plumbing.
+//
+// Verification.ExpiryLeadTimes is the deliberate opposite and the contrast is worth keeping: its
+// default is empty because a lead time nobody decided would be *the platform inventing policy*.
+// A category list nobody decided is not policy the platform invented — it is Docs/01 §2's
+// out-of-scope list and Docs/05 §4's draft position, both already written down and neither
+// contentious. The owner approved it; the flag records that a lawyer has not.
+type Goods struct {
+	// Categories is the whole catalogue, in the order it is served to clients.
+	//
+	// Order is meaningful and is the configuration's, not this package's: it is what a client
+	// renders in a picker, and sorting it here would take that decision away from whoever set
+	// it. The default below reads carried first because that is what a customer is choosing
+	// between; the refused entries follow so the app can show what Shipper will not take.
+	Categories []GoodsCategory
+}
+
+// carriedCount is how many categories a job may actually be published in.
+func (g Goods) carriedCount() int {
+	n := 0
+	for _, c := range g.Categories {
+		if c.Carried {
+			n++
+		}
+	}
+	return n
+}
+
+// GoodsCategory is one entry in the catalogue (SHIP-58).
+//
+// A struct rather than a bare code because the label and the description are served to clients
+// and must not be compiled into them — Flutter has no over-the-air path for Dart code, so a
+// wording change would otherwise need an app release (CLAUDE.md, Docs/06 §5.3). The same argument
+// covers Carried: whether Shipper takes a category is a policy answer that has to be able to move
+// on a Tuesday afternoon.
+//
+// **Declared here rather than in internal/jobs**, and that is forced rather than stylistic:
+// internal/config is infrastructure and may not import a domain (SHIP-15c). cmd/api translates
+// this into the domain's own catalogue type, exactly as it translates Verification.ExpiryLeadTimes
+// into profiles' document kinds, and the domain refuses a catalogue it cannot make sense of.
+type GoodsCategory struct {
+	// Code is the stored form and the value a client sends — lower snake case, stable.
+	//
+	// Stable is the load-bearing word. It is written into jobs.goods_category on every job that
+	// names it, so renaming a code orphans history; the label is what changes when the wording
+	// does. [loader.goods] refuses a code that is not lower snake case for that reason — a code
+	// that looks like a label invites somebody to edit it like one.
+	Code string `json:"code"`
+
+	// Label is the short human name, in Australian English.
+	Label string `json:"label"`
+
+	// Description is the one-line explanation a client shows beneath the label. Optional.
+	Description string `json:"description,omitempty"`
+
+	// Carried says whether a job in this category may be published.
+	//
+	// False does not mean hidden. A refused category is served like any other so that the app
+	// can show what Shipper will not carry and SHIP-59 can refuse a publication by name rather
+	// than with a generic validation failure — which is what Docs/09's "cannot be published and
+	// explains why" asks for. Docs/07 §3 still applies: the app may hide or disable, and the
+	// platform decides.
+	Carried bool `json:"carried"`
+
+	// Provisional says the entry has not been through the legal review X-4 owns.
+	//
+	// True for every entry in the default catalogue. See [Goods] for why it is per entry.
+	Provisional bool `json:"provisional"`
+}
+
+// provisionalGoodsCategories is the catalogue X-9 was accepted in reduced form with.
+//
+// Every refused entry traces to a line already written down and closed: Docs/01 §2's out-of-scope
+// list names dangerous goods, live animals, people and specialist regulated freight, and Docs/05
+// §4's draft position adds illegal goods. Two — temperature_controlled and high_value_negotiables
+// — are the owner's own additions and are the two most likely to move when X-4 is answered, which
+// is precisely what [GoodsCategory.Provisional] is for.
+//
+// Docs/01 §8's demo gate carries the caveat this list ships under: it "runs on a **provisional**
+// category list approved by the owner rather than by a legal adviser, which is enough to
+// demonstrate the mechanism and is **not** enough to put in front of public users."
+var provisionalGoodsCategories = []GoodsCategory{
+	{Code: "general_freight", Label: "General freight",
+		Description: "Palletised or boxed goods needing no special handling.",
+		Carried:     true, Provisional: true},
+	{Code: "furniture", Label: "Furniture and white goods",
+		Description: "Household or office furniture, appliances.",
+		Carried:     true, Provisional: true},
+	{Code: "household_removals", Label: "Household removals",
+		Description: "Personal effects, part or whole household.",
+		Carried:     true, Provisional: true},
+	{Code: "building_materials", Label: "Building materials",
+		Description: "Timber, plasterboard, fixtures and fittings.",
+		Carried:     true, Provisional: true},
+	{Code: "machinery", Label: "Machinery and equipment",
+		Description: "Plant and equipment carried on a trailer.",
+		Carried:     true, Provisional: true},
+	{Code: "retail_stock", Label: "Retail and office stock",
+		Description: "Shop stock, fit-out, office relocation.",
+		Carried:     true, Provisional: true},
+
+	{Code: "dangerous_goods", Label: "Dangerous goods",
+		Description: "Explosives, flammable liquids or gases, corrosives, oxidisers.",
+		Carried:     false, Provisional: true},
+	{Code: "live_animals", Label: "Live animals",
+		Description: "Shipper does not carry livestock or pets.",
+		Carried:     false, Provisional: true},
+	{Code: "people", Label: "Passengers",
+		Description: "Shipper carries freight, not people.",
+		Carried:     false, Provisional: true},
+	{Code: "regulated_freight", Label: "Specialist regulated freight",
+		Description: "Pharmaceuticals, firearms, tobacco or alcohol in commercial quantity.",
+		Carried:     false, Provisional: true},
+	{Code: "temperature_controlled", Label: "Temperature-controlled goods",
+		Description: "There is no cold chain in the MVP.",
+		Carried:     false, Provisional: true},
+	{Code: "high_value_negotiables", Label: "Cash, bullion and negotiable instruments",
+		Description: "These need secure freight, which Shipper does not arrange.",
+		Carried:     false, Provisional: true},
+	{Code: "illegal_goods", Label: "Unlawful goods",
+		Description: "Anything unlawful to possess or transport.",
+		Carried:     false, Provisional: true},
 }
 
 // Storage configures the private object store that holds proof-of-delivery photographs and
@@ -1122,6 +1280,12 @@ func Load() (*Config, error) {
 			// answered. See [Verification].
 			ExpiryLeadTimes: l.durations("VERIFICATION_EXPIRY_LEAD_TIMES", nil),
 		},
+		Goods: Goods{
+			// The provisional list is the default and one variable replaces it whole.
+			// See [Goods] for why this one has a default where ExpiryLeadTimes above
+			// deliberately has none.
+			Categories: l.goods("GOODS_CATEGORIES", provisionalGoodsCategories),
+		},
 		App: App{
 			MinimumIOSBuild:     l.positiveInt("MIN_SUPPORTED_IOS_BUILD", 1),
 			MinimumAndroidBuild: l.positiveInt("MIN_SUPPORTED_ANDROID_BUILD", 1),
@@ -1226,6 +1390,11 @@ func (c Config) LogValue() slog.Value {
 		slog.Duration("storage_presign_ttl", c.Storage.PresignTTL),
 		slog.Duration("storage_download_ttl", c.Storage.DownloadTTL),
 		slog.Int("verification_expiry_lead_times", len(c.Verification.ExpiryLeadTimes)),
+
+		// Both halves, because the interesting failure is a catalogue that parsed and
+		// carries nothing — which a total would hide behind a plausible-looking number.
+		slog.Int("goods_categories", len(c.Goods.Categories)),
+		slog.Int("goods_categories_carried", c.Goods.carriedCount()),
 		slog.Int64("storage_max_upload_bytes", c.Storage.MaxUploadBytes),
 	)
 }
@@ -1573,6 +1742,111 @@ func (l *loader) durations(key string, def map[string]time.Duration) map[string]
 		out[name] = d
 	}
 	return out
+}
+
+// goods reads the goods-category catalogue from one variable, as a JSON array (SHIP-58).
+//
+// # Why JSON, when every other list here is comma-separated
+//
+// Because every other list here is a list of scalars and this one is a list of records. `csv`
+// and `durations` encode one and two fields respectively; a category has five, one of which is a
+// free-text description that will contain commas the day somebody writes a good one. Inventing a
+// third ad-hoc separator scheme to avoid a parser the standard library already has would be
+// choosing a format that breaks on its own content.
+//
+// # Why a variable and not a file
+//
+// This package's own doc states the rule — "nothing is read from a configuration file at
+// runtime" — and every setting in it follows that. The rule is worth more than the convenience:
+// a file is a second thing a deployment has to ship, mount and keep in step with the image, and
+// the failure it produces is a service that starts with a catalogue nobody intended. A variable
+// is visible in one place beside every other setting.
+//
+// It is verbose to type, and deploy/.env.example shows the shape. That cost is paid by whoever
+// overrides the list, which by design is rare: the default is the approved one until X-4 is
+// answered.
+//
+// # Every refusal below returns the default rather than an empty catalogue
+//
+// A malformed override is a startup error — [Load] fails on l.errs and the service does not
+// start, so the returned value is never actually served. Returning def rather than nil is
+// nonetheless deliberate: it keeps this function total, so a caller reading the config in a test
+// that ignores the error does not get a nil catalogue that publishes nothing and reports no
+// reason. The same argument every other helper here makes when it returns def after errf.
+func (l *loader) goods(key string, def []GoodsCategory) []GoodsCategory {
+	v, ok := l.lookup(key)
+	if !ok {
+		return def
+	}
+
+	var parsed []GoodsCategory
+	if err := json.Unmarshal([]byte(v), &parsed); err != nil {
+		l.errf("%s: not a JSON array of categories: %v", key, err)
+		return def
+	}
+	if len(parsed) == 0 {
+		l.errf("%s: the catalogue is empty; with no categories no job can be published", key)
+		return def
+	}
+
+	seen := make(map[string]bool, len(parsed))
+	carried := 0
+	for i, c := range parsed {
+		switch {
+		case c.Code == "":
+			l.errf("%s: entry %d has no code", key, i)
+		case !lowerSnakeCase(c.Code):
+			l.errf("%s: %q is not lower snake case; a code is stored on every job that "+
+				"names it and is not the field that carries wording", key, c.Code)
+		case seen[c.Code]:
+			l.errf("%s: %q appears twice, and which one applies would depend on the order",
+				key, c.Code)
+		default:
+			seen[c.Code] = true
+		}
+
+		if c.Label == "" {
+			l.errf("%s: %q has no label; the label is what a client shows", key, c.Code)
+		}
+		if c.Carried {
+			carried++
+		}
+	}
+
+	// A catalogue of nothing but refusals is a marketplace that accepts no work at all. It
+	// parses, it serves, and every publication fails with a policy refusal — which reads to
+	// whoever is watching as a broken product rather than as a configuration mistake, so it is
+	// refused at startup where the cause is still legible.
+	if carried == 0 {
+		l.errf("%s: no category is carried; every publication would be refused", key)
+	}
+
+	return parsed
+}
+
+// lowerSnakeCase reports whether s is lower-case letters, digits and single underscores.
+//
+// Hand-written rather than a regexp because this package imports none, and the rule is short
+// enough that a pattern would be the less readable of the two. It matches what
+// httpx.RegisterCode requires of an error code, for the same reason: these are identifiers that
+// travel on the wire and get stored, and a mixed-case one is a bug report six months later.
+func lowerSnakeCase(s string) bool {
+	if s == "" || s[0] == '_' || s[len(s)-1] == '_' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '_':
+			if s[i-1] == '_' {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (l *loader) level(key string, def slog.Level) slog.Level {

@@ -28,12 +28,12 @@ import (
 //     TestARouteWithNoClassDoesNotRegister, TestARouteWithNoClassIsNotAttached;
 //   - the eleven address-keyed routes carry their class and are not yet enforced — which
 //     SHIP-183b is what retired, so the test holding it is now
-//     TestTheElevenAddressKeyedRoutesEnforceTheirClass rather than its negation.
+//     TestTheAddressKeyedRoutesEnforceTheirClass rather than its negation.
 //
 // SHIP-183b's has two, and the second is the one worth being careful about:
 //
 //   - the eleven routes Docs/12 §8 names enforce their class —
-//     TestTheElevenAddressKeyedRoutesEnforceTheirClass, TestAnAddressKeyedRouteRefusesAtCapacity;
+//     TestTheAddressKeyedRoutesEnforceTheirClass, TestAnAddressKeyedRouteRefusesAtCapacity;
 //   - no caller can choose their own bucket — TestACallerCannotChooseTheirOwnBucket here for the
 //     wiring, and internal/httpx/clientaddr_test.go for the resolution itself. The availability
 //     half is TestBehindATrustedProxyTwoCallersAreCountedApart: an implementation that ignored
@@ -145,11 +145,11 @@ func TestEveryRouteMatchesItsDocumentedClass(t *testing.T) {
 // table can be edited correctly and the sentence above it left alone. The counts are recomputed
 // from the served manifest rather than from the table, so this fails whichever of the two moved.
 func TestTheClassCountsAreWhatTheDocumentClaims(t *testing.T) {
-	// Docs/12 §5: "Counts: Unlimited 1, Credential 5, Message 3, Upload 3, Write 36, Read 35,
-	// PublicRead 3."
+	// Docs/12 §5: "Counts: Unlimited 1, Credential 5, Message 3, Upload 3, Write 37, Read 35,
+	// PublicRead 4."
 	want := map[LimitClass]int{
 		LimitUnlimited: 1, LimitCredential: 5, LimitMessage: 3, LimitUpload: 3,
-		LimitWrite: 36, LimitRead: 35, LimitPublicRead: 3,
+		LimitWrite: 37, LimitRead: 35, LimitPublicRead: 4,
 	}
 
 	got := map[LimitClass]int{}
@@ -233,7 +233,13 @@ func TestARouteWithNoClassIsNotAttached(t *testing.T) {
 	}}, GroupV1, testDeps(), nil, testLimiter())
 }
 
-// TestTheElevenAddressKeyedRoutesEnforceTheirClass is SHIP-183b's first clause.
+// TestTheAddressKeyedRoutesEnforceTheirClass is SHIP-183b's first clause.
+//
+// It was TestTheElevenAddressKeyedRoutesEnforceTheirClass until SHIP-58 made the count twelve.
+// The number came out of the name rather than being corrected in it: a test whose name asserts an
+// arithmetic fact has to be renamed every time the fact moves, and the rename is the step that
+// gets skipped — leaving a name that reads as documentation and is a lie. The count lives in the
+// body, beside the document reference it is checked against.
 //
 // It replaces SHIP-183a's TestAddressKeyedRoutesCarryTheirClassAndAreNotEnforced, which asserted
 // the opposite and was right to: internal/httpx read RemoteAddr alone, so enforcing these behind a
@@ -245,7 +251,7 @@ func TestARouteWithNoClassIsNotAttached(t *testing.T) {
 // internal/admin, because that class charges failures only and this middleware runs before the
 // handler. Asserting the split rather than a total is what stops a Credential route quietly
 // losing its domain-side limit and still passing a count of eleven.
-func TestTheElevenAddressKeyedRoutesEnforceTheirClass(t *testing.T) {
+func TestTheAddressKeyedRoutesEnforceTheirClass(t *testing.T) {
 	var (
 		byMiddleware []string
 		byDomain     []string
@@ -268,15 +274,17 @@ func TestTheElevenAddressKeyedRoutesEnforceTheirClass(t *testing.T) {
 		byDomain = append(byDomain, name)
 	}
 
-	// Docs/12 §8: "The five Credential, three Message and three PublicRead routes are the
-	// eleven."
-	if total := len(byMiddleware) + len(byDomain); total != 11 {
-		t.Errorf("%d routes are keyed on the address, %s §8 says eleven", total, rateLimitDocPath)
+	// Docs/12 §8: "The five Credential, three Message and four PublicRead routes are the
+	// twelve." It was eleven until SHIP-58 added GET /v1/goods-categories, which is public
+	// for the reason that section gives — the app renders the job form from it, and there is
+	// no subject to key a limit on.
+	if total := len(byMiddleware) + len(byDomain); total != 12 {
+		t.Errorf("%d routes are keyed on the address, %s §8 says twelve", total, rateLimitDocPath)
 	}
-	if len(byMiddleware) != 6 {
+	if len(byMiddleware) != 7 {
 		sort.Strings(byMiddleware)
 		t.Errorf("%d address-keyed routes take a middleware bucket, want the three %s and the "+
-			"three %s: %v", len(byMiddleware), LimitMessage, LimitPublicRead, byMiddleware)
+			"four %s: %v", len(byMiddleware), LimitMessage, LimitPublicRead, byMiddleware)
 	}
 	if len(byDomain) != 5 {
 		sort.Strings(byDomain)

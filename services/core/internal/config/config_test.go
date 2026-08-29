@@ -36,6 +36,10 @@ var allKeys = []string{
 	// been reading a developer's incident tuning.
 	"RATE_LIMIT_BURST_SCALE", "RATE_LIMIT_RATE_SCALE",
 	"TRUSTED_PROXY_HOPS", "TRUSTED_PROXY_NETWORKS",
+	// SHIP-58's catalogue, for exactly the reason the note above gives: make exports
+	// deploy/.env, so a developer overriding the category list locally would otherwise be
+	// running these tests against their own list rather than the shipped default.
+	"GOODS_CATEGORIES",
 }
 
 // deploymentStorageCredentials is a credential a staging or production configuration can
@@ -1300,4 +1304,116 @@ func TestLoadRefusesSMTPWithoutAHost(t *testing.T) {
 	if !strings.Contains(err.Error(), "EMAIL_SMTP_HOST") {
 		t.Errorf("error = %v, want it to name EMAIL_SMTP_HOST", err)
 	}
+}
+
+// SHIP-58: the goods catalogue, and the two claims its *Done when* makes.
+//
+// "Categories load from configuration" is the first, and it is what
+// TestTheCatalogueIsReplacedWholeByOneVariable checks. "Not compiled in" is the second, and it is
+// checked by that test asserting the default's own codes are *gone* — an override that merged
+// with the default would satisfy the first claim and quietly break the second, because a category
+// withdrawn on legal advice would go on being served.
+
+func TestTheDefaultCatalogueIsTheApprovedProvisionalOne(t *testing.T) {
+	clearEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(cfg.Goods.Categories) != 13 {
+		t.Fatalf("the default catalogue has %d entries, want the 13 the owner approved",
+			len(cfg.Goods.Categories))
+	}
+	if got := cfg.Goods.carriedCount(); got != 6 {
+		t.Errorf("the default catalogue carries %d categories, want 6", got)
+	}
+
+	// X-9 was accepted in reduced form and Docs/11 §5 makes this flag the condition of that:
+	// the list may ship before a legal adviser has seen it precisely because it says so.
+	for _, c := range cfg.Goods.Categories {
+		if !c.Provisional {
+			t.Errorf("%s ships provisional=false; X-4 has not been answered", c.Code)
+		}
+	}
+
+	// The four Docs/01 §2 puts out of scope, and Docs/05 §4's addition. Named individually
+	// because this is the half of the list that a careless edit would quietly turn carried.
+	for _, code := range []string{
+		"dangerous_goods", "live_animals", "people", "regulated_freight", "illegal_goods",
+	} {
+		c, found := find(cfg.Goods.Categories, code)
+		switch {
+		case !found:
+			t.Errorf("%s is missing from the default catalogue; Docs/01 §2 and Docs/05 §4 "+
+				"put it out of scope", code)
+		case c.Carried:
+			t.Errorf("%s is carried; Docs/01 §2 and Docs/05 §4 put it out of scope", code)
+		}
+	}
+}
+
+func TestTheCatalogueIsReplacedWholeByOneVariable(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("GOODS_CATEGORIES",
+		`[{"code":"widgets","label":"Widgets","description":"Boxed.","carried":true,"provisional":false},`+
+			`{"code":"anvils","label":"Anvils","carried":false,"provisional":true}]`)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(cfg.Goods.Categories) != 2 {
+		t.Fatalf("loaded %d categories, want the 2 configured: %+v",
+			len(cfg.Goods.Categories), cfg.Goods.Categories)
+	}
+
+	widgets, _ := find(cfg.Goods.Categories, "widgets")
+	if widgets.Label != "Widgets" || widgets.Description != "Boxed." ||
+		!widgets.Carried || widgets.Provisional {
+		t.Errorf("widgets = %+v, want the configured record verbatim", widgets)
+	}
+
+	// Replaced whole rather than merged. A category the platform has withdrawn must not go on
+	// being served because it happens to be in the compiled default.
+	if _, found := find(cfg.Goods.Categories, "dangerous_goods"); found {
+		t.Error("dangerous_goods survived an override; the default is merged rather than replaced")
+	}
+}
+
+func TestAnUnusableCatalogueIsRefusedAtStartup(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"not JSON", `general_freight,dangerous_goods`},
+		{"an empty array", `[]`},
+		{"no code", `[{"label":"Nameless","carried":true}]`},
+		{"a code that is not lower snake case", `[{"code":"General Freight","label":"X","carried":true}]`},
+		{"a duplicate code", `[{"code":"a","label":"A","carried":true},{"code":"a","label":"B","carried":true}]`},
+		{"no label", `[{"code":"a","carried":true}]`},
+		{"nothing carried", `[{"code":"a","label":"A","carried":false}]`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("GOODS_CATEGORIES", tc.in)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load accepted a catalogue with %s", tc.name)
+			}
+		})
+	}
+}
+
+func find(cs []GoodsCategory, code string) (GoodsCategory, bool) {
+	for _, c := range cs {
+		if c.Code == code {
+			return c, true
+		}
+	}
+	return GoodsCategory{}, false
 }

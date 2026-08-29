@@ -958,10 +958,13 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-56a** | M2 | `contracts/statuses.yaml` produces the Go, Dart and TypeScript forms of all three status vocabularies, and a test fails when any of the seven generated files is stale — *see below* |
 | **SHIP-57** | M2 | The transition guard — and the database refuses a status change that did not come through it — *see below* |
 | **SHIP-57a** | M2 | `job_status_history` — actor, reason and both clocks, append-only |
+| **SHIP-58** | M2 | The goods catalogue — thirteen categories from **one environment variable**, served at `GET /v1/goods-categories` and stored on the job as a code. **Refused categories are served too**, with `carried: false`, which is what lets a client say what Shipper will not take and lets SHIP-59 refuse a publication by name; a *draft* may still name one, because `Docs/09` puts the prohibition on publish. `000410` deliberately has **no `CHECK` naming the categories** — a list in a constraint would make X-4's answer a migration. Every entry carries `provisional: true`, which is §5's condition for X-9's reduced form — *see §4* |
+| **SHIP-59** | M2 | The prohibited-goods rule — a job in a category the catalogue does not carry cannot be published, and the refusal **names the category and quotes the catalogue's own wording** rather than answering `validation_failed`. **The rule names no category**: Docs/01 §2's four and Docs/05 §4's fifth live in configuration, and `TestTheProhibitionNamesNoCategoryOfItsOwn` publishes all five against a catalogue that carries them to prove it. Because the wording comes from the catalogue, the explanation moves when the policy does, with no release. The rule lands before the endpoint that applies it, which is what the `SHIP-63 → SHIP-59` edge is for — *see below* |
 | **SHIP-59a** | M2 | Geocoding adapter — deterministic stub, and not-found is an outcome, not an error |
 | **SHIP-60** | M2 | The address value object — validated, normalised, and resolved where the platform can; a failed lookup never fails the job — *see below* |
 | **SHIP-61** | M2 | `POST /v1/jobs` — the first authenticated state-changing endpoint in the service — *see below* |
 | **SHIP-62** | M2 | `PATCH /v1/jobs/{id}` — a partial edit of a draft, and a stranger's edit is indistinguishable from no job at all — *see below* |
+| **SHIP-63** | M2 | `POST /v1/jobs/{id}/publish` — **the endpoint the whole marketplace was waiting on.** Until it existed nothing anywhere moved a job to `Open`, so no provider had ever seen a job through the product and every finished ticket downstream of publication had only been driven by hand-written rows. Four checks, in an order that is itself a decision: the goods are carried (SHIP-59) **first**, so a customer whose load will never be accepted is not sent away to fill in a form; then `Docs/04` §2's email-and-phone verification, then its per-job declaration, then the required fields — all of them in one answer. Publishing an already-open job is absorbed and **re-checks nothing**. `000411` records the declaration per job rather than per account — *see below* |
 | **SHIP-64** | M2 | `POST /v1/jobs/{id}/cancel` — the first endpoint that moves a job, and so the first real client of the status guard — *see below* |
 | **SHIP-65** | M2 | `GET /v1/jobs/{id}` — the job in full to its owner, and byte-identical 404s to everybody else — *see below* |
 | **SHIP-66** | M2 | `GET /v1/jobs` — the caller's own jobs, keyset-paged; the first client of `internal/pagination` — *see below* |
@@ -1051,6 +1054,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-160** | M6 | `POST /v1/admin/jobs/{id}/unpublish` — the job moves to `Cancelled` through the one guarded transition, with the reason written into **both** `job_status_history` and `audit_log`. **No new domain event and no `internal/notifications` edit**: the transition already emits `job.status_changed`, which `StatusRules` routes to the customer, so "and the customer notified" is a consequence of the move rather than a second announcement of it. An **awarded** job is refused — Docs/02 §2 has no such row — *see below* |
 | **SHIP-161** | M6 | `POST /v1/admin/users/{id}/standing` — restrict, suspend or reinstate, one endpoint and one audit action with both ends in its metadata. **No migration and no new enforcement**: `users.status` has existed since `000002` and `internal/identity` already refuses a suspended account at sign-in *and at refresh*, which is where a suspension takes effect. The recorded reason lives in `audit_log.reason` rather than a second column, because a mutable copy of an immutable fact is the one somebody later corrects — *see below* |
 | **SHIP-162** | M6 | `POST` and `GET /v1/admin/notes` — a note attaches to a **user or a job**, in a table of its own (`000802`) that no user-facing endpoint reads or joins. "Never user-visible" is demonstrated **in `make verify` by reading the job back as its customer** and failing if the note's text is in the response, because no test in `internal/admin` can make a claim about another domain's endpoint. Reading is gated on the **subject's** read permission, so `support` reads the history and cannot add to it. The subject is deliberately **not** a foreign key — a note outlives its subject — *see below* |
+| **X-9** | X | **The prohibited-goods list, taken in reduced form.** Thirteen categories — six carried, seven refused — approved by the repository owner rather than by a legal adviser, and **every entry carries `provisional: true` on the wire** so a client can see which answer it is reading. Every refused entry traces to a line already closed: `Docs/01` §2's out-of-scope list names dangerous goods, live animals, people and specialist regulated freight, and `Docs/05` §4's draft position adds illegal goods; `temperature_controlled` and `high_value_negotiables` are the owner's own and are the two most likely to move. **X-4 stays open and the `X-9 → X-4` edge is untouched** — §5's condition for taking a Track-X row in reduced form, and §4 carries what is still owed. It releases SHIP-58, and behind it SHIP-59 and SHIP-63 — *see §4* |
 | **X-6** | X | **Proof-exception jobs auto-complete on the ordinary 72-hour rule.** Track X's first closed ticket, and a decision rather than code: `Docs/02` §6.1 gains the rule and its reasoning, §7 loses the bullet. What made it decidable after eight waves is SHIP-117 — an exception-completed job now enters the moderation queue, so review happens either way and blocking auto-completion would add none — *see below* |
 | **SHIP-83a** | M3 | The provider feed moves off the `{id}` slot: `GET /v1/jobs/open` and `/v1/jobs/open/{id}` become **`GET /v1/fleet/jobs` and `GET /v1/fleet/jobs/{id}`**, gone rather than aliased. That frees the whole four-segment `GET /v1/jobs/{id}/<literal>` space four earlier tickets each paid a workaround for, **demonstrated by registering one** rather than asserted — `TestFourSegmentJobLiteralsCanBeRegistered` attaches the real route table plus a probe route and fails if the mux refuses the pair — *see below* |
 | **SHIP-96a** | M3 | `GET /v1/fleet/jobs/{id}` widens from eligibility to **relationship**: a provider reads a job they hold any bid on — live or closed, and therefore the job they were awarded — for as long as the bid exists, in the same budget-stripped shape the feed serves. One SQL predicate (`readable` = `eligible OR the caller holds a bid`), one column list, one response type; **bidding is deliberately not widened with it**. A provider with neither relationship gets exactly what a missing job gets. The budget guard gained a **word-level** check, because a sentence defeats a closed key set — *see below* |
@@ -16641,6 +16645,7 @@ exemption list is the work item.
 | Ticket | Exists | Missing |
 |---|---|---|
 | ~~**SHIP-149**~~ | ~~`audit_log` table, append-only triggers, tests~~ | **Closed.** SHIP-150 built the write helper — see §3. On `7d7caf0` the only `INSERT INTO audit_log` in the repository was four statements in `migrations/schema_test.go`, and no Go code wrote an entry; `internal/admin/audit.go` and `postgres_audit.go` now do, and `migrations/audit_log_test.go` adds the `Docs/10` §3.4 pairing that could not be written while there was no Go vocabulary to pair |
+| **X-9** | Thirteen categories in configuration, marked provisional per entry, served at `GET /v1/goods-categories` and enforced at publication | **A legal adviser's review, which is X-4.** The *Done when* is "category list approved and ready to load as reference data" and the list is loaded and enforced; what is provisional is the *approval*, not the mechanism. §5 set the terms and they are met: the owner approved it, the reference data says so, X-4 is open, and this row is the record. **What closes it is one edit and no code** — `GOODS_CATEGORIES` replaces the catalogue whole, so the reviewed answer arrives as an environment variable rather than a release. `provisional` is per entry precisely so a review that confirms eleven and queries two can land as it comes. **`Docs/01` §8's demo gate already carries the caveat**: a provisional list is enough to demonstrate the mechanism and is not enough to put in front of public users |
 | **SHIP-158** | `GET /v1/admin/moderation/cancellations`, both outcomes, with the provider's cancellation and completion counts | **The provider on a `returned_to_market` entry, once that path is built.** `Docs/02` §6.2 closes every bid when a provider cancels after award, so no `Accepted` bid survives and the join that names the provider finds nothing — on precisely the outcome that most needs one. `bids` has no column recording which offer *was* accepted; adding one is a migration in `internal/bidding`'s block. Not yet reachable — neither transition has an endpoint — so nothing is wrong today and it will be the day one arrives |
 | **SHIP-77** | The job detail screen, the derived timeline, the available actions | The transition history its *Done when* implies. "Full job detail with **status timeline**" — and no endpoint serves one, so the timeline is derived from the current status and refuses to date what it cannot date. See §9 |
 | **SHIP-120** | The token landing at `/j/<job-id>#<token>` — the credential in the **fragment**, which no server receives, moved to `sessionStorage` and stripped from the address bar, with the job identifier carried independently of it. The six fields `GET /v1/driver/jobs/{id}` serves, and SHIP-121's controls over them | **The delivery detail its *Done when* names.** "Opening the link shows only that job's delivery detail" — the *only that job's* half is demonstrated, and the *delivery detail* half is not: the endpoint serves **no pickup, no drop-off, no goods and no contact**, so a driver cannot see where to go. `Docs/03` §3's Prepare stage puts all four on this screen — *"views pickup/delivery, goods notes, contact guidance"* — which makes this a product gap rather than only a bookkeeping one. **Recorded in place on both sides and owned by nobody**: `internal/delivery/http.go:1168` says the fields are SHIP-120's to add and that the lane could touch no Go, and `apps/driver-portal/lib/delivery.ts:55` calls the same absence *"a gap rather than a decision"*. The shape is small and additive, so no route moves — `driverJobResponse` gains the two locations, the goods description and a contact, from a port into `jobs` that `delivery` does not yet declare. **This is the seventh instance of the shape `Docs/09` names at SHIP-121a** — a client ticket whose real precondition is a route on the served surface, which no dependency column records — and the only one of the seven with no `<n>a` row. See below |
@@ -16658,11 +16663,20 @@ but for the budget for two waves, and SHIP-67 closed it with the column and the 
 §10's note that a ticket can be both done and partly done still stands. **SHIP-118 left this table at
 wave 9**, closed by SHIP-123 exactly as SHIP-65 was closed by SHIP-67.
 
-**The live rows are now eight — SHIP-158, SHIP-77, SHIP-120, SHIP-22, SHIP-102, SHIP-139,
-SHIP-143 and SHIP-79a — and for the second consecutive pass the sentence counting them was *right*
-when the pass arrived.** It read seven and named those seven, which measured correctly against the
-table. **Adding SHIP-22 is what makes it wrong, and it is corrected in the same commit that adds the
-row** — the discipline the paragraph below was written to record, now applied twice running.
+**The live rows are now nine — X-9, SHIP-158, SHIP-77, SHIP-120, SHIP-22, SHIP-102, SHIP-139,
+SHIP-143 and SHIP-79a — and for the third consecutive pass the sentence counting them was *right*
+when the pass arrived.** It read eight and named those eight, which measured correctly against the
+table. **Adding X-9 is what makes it wrong, and it is corrected in the same commit that adds the
+row** — the discipline the paragraph below was written to record, now applied three times running.
+
+**X-9 is the first Track-X row this table has ever carried, and the shape is worth naming because
+§5 invented it deliberately rather than discovering it.** Every other row here is a ticket whose
+*code* is incomplete. X-9's mechanism is complete and its **approval** is provisional, which is a
+different kind of debt and would have been invisible anywhere else in this file: the done list
+counts it, §3 describes it, and neither has a place to say that a lawyer has not seen the list. The
+instrument that makes it visible to a *client* rather than only to a reader is the per-entry
+`provisional` flag, which is why §5 made marking the reference data a condition of the reduced form
+rather than a nicety.
 
 **The earlier failures are why it is worth a sentence at all.** The pass before this one found *"the
 live rows are now six — SHIP-158, SHIP-77, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a"*, which
@@ -18917,6 +18931,36 @@ Kept, struck, because the shape recurs and this is the second instance of it. **
 
 ## 9. Open recommendations nobody has decided
 
+### The required-field set for publication is a judgement, and it is the owner's to confirm
+
+**SHIP-63 had to decide what a job must say before providers can bid on it, and no document says.**
+`Docs/09`'s *Done when* asks it to "validate required fields" and names none. `Docs/01` §4.1 lists
+what a customer *may* put on a job — "pickup/drop-off locations, date windows, goods description,
+dimensions/weight, vehicle requirement, handling notes, and optional maximum budget" — but it is a
+**capability list rather than a specification**: only the budget is marked optional, and reading the
+rest as mandatory would refuse a job for having no handling notes, which is the ordinary case rather
+than an incomplete one.
+
+**What shipped:** pickup, drop-off, a goods description, a goods category, and the *start* of the
+pickup window. The test applied was **can a provider act on this** — where from, where to, when, and
+what.
+
+**The arguable entry is size.** Weight and dimensions are **not** required. A provider choosing
+between a van and a tray truck wants them, and a job without them will attract vaguer bids or none.
+They were left optional because refusing to publish is the more expensive failure: a customer who
+cannot say what their pallet weighs would be stopped at the last step of the flow with no way
+forward, whereas a provider who needs the number can ask on the job's message thread (`Docs/02` §5).
+
+**This is a product decision recorded as an engineering one, which is why it is here.** The whole
+set lives in one function — `publishable` in `internal/jobs/publish.go` — precisely so that changing
+it is one edit and one test, and `publishableFields` in `publish_test.go` is deliberately the
+*minimum* that publishes, so a field added to the set without an argument fails a test rather than
+passing quietly. **If the owner wants size required, say so and it is a ten-minute change.**
+
+**The related question nobody has asked yet:** whether a job with no size attracts worse bids is
+measurable once the demonstration has data, and SHIP-186's seed set is the first place it could be
+looked at.
+
 **~~What the next release is for.~~ Decided by the owner on 20 August 2026 — a hosted demonstration,
 not a pilot.** Shipper is being built to sell rather than to launch, so store publishing, pilot
 recruitment and production hardening stop being the destination and a demonstration a prospective
@@ -21035,10 +21079,10 @@ still updated in the same change that finishes a ticket — it has simply moved 
 document. `make status` reads it, counts it against the backlog, and cross-checks it against
 what commit subjects claim.
 
-A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is in the list**, and its eight live rows — **SHIP-158, SHIP-77, SHIP-120, SHIP-22, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a** — are all in it, which is
+A ticket belongs there only when its *Done when* line in `Docs/09` is demonstrable. **Every ticket §4 names is in the list**, and its nine live rows — **X-9, SHIP-158, SHIP-77, SHIP-120, SHIP-22, SHIP-102, SHIP-139, SHIP-143 and SHIP-79a** — are all in it, which is
 not a contradiction to be tidied away. **This sentence was wrong at three consecutive
 reconciliations and it is right at this one, because it was re-read rather than restated**: §4's
-non-struck first cells were listed off the tree and each of the eight checked against
+non-struck first cells were listed off the tree and each of the nine checked against
 `Docs/11-done.txt` by name — SHIP-22 included, which is in the list because it is done and partly
 done at once. It named SHIP-149, SHIP-77 and SHIP-118 three passes ago and SHIP-77 and
 SHIP-151 two passes ago, each time correctly at the moment of writing and wrongly by the next merge.

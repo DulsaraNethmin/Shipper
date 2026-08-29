@@ -751,6 +751,43 @@ func (w *contractWorld) makeProviderEligible(t *testing.T) {
 		uuid.New(), w.providerID, contractServiceState)
 }
 
+// readyToPublish makes the seeded customer and job satisfy SHIP-63's preconditions.
+//
+// Two of them, and neither is the endpoint's own logic — which is why they are fixture work rather
+// than something the case body could express:
+//
+//   - **The phone.** insertContractUser verifies the email and not the phone, which was correct
+//     while nothing checked the second. Docs/04 §2 requires both before publishing, so this fills
+//     the gap for the one route that asks. It is done here rather than in insertContractUser so
+//     that the default fixture keeps saying what it has always said about an account.
+//   - **The job.** seedJob writes an id and an owner, because every route before this one acted on
+//     a job rather than reading it. Publication is the first that asks whether the job says enough
+//     to be bid on.
+//
+// The category is testGoodsConfig()'s carried entry rather than a real one — cmd/api's catalogue is
+// deliberately not the shipped list, so that nothing here can pass for a reason it does not state.
+func (w *contractWorld) readyToPublish(t *testing.T) {
+	t.Helper()
+
+	if _, err := w.pool.Exec(t.Context(),
+		`UPDATE users SET phone_verified_at = now() WHERE id = $1`, w.customerID); err != nil {
+		t.Fatalf("verifying the customer's phone: %v", err)
+	}
+
+	if _, err := w.pool.Exec(t.Context(), `
+		UPDATE jobs SET
+			pickup_line = '12 Smith Street', pickup_suburb = 'Newtown',
+			pickup_state = 'NSW', pickup_postcode = '2042',
+			dropoff_line = '40 Bourke Street', dropoff_suburb = 'Melbourne',
+			dropoff_state = 'VIC', dropoff_postcode = '3000',
+			goods_description = 'Two-seater sofa, wrapped',
+			goods_category = 'cmd_api_carried',
+			pickup_window_start = now() + interval '3 days'
+		WHERE id = $1`, w.jobID); err != nil {
+		t.Fatalf("completing the job: %v", err)
+	}
+}
+
 // openToBidding is the pair every bidding route needs: the job published, and the provider allowed
 // to see it. Named once because no caller wants one without the other.
 func (w *contractWorld) openToBidding(t *testing.T) {
@@ -1031,10 +1068,22 @@ var contractCases = map[string]contractCase{
 	"GET /v1/app/minimum-version": {auth: asAnonymous, want: 200},
 	"GET /v1/app/policy":          {auth: asAnonymous, want: 200},
 
+	// SHIP-58. Anonymous like the two above and for the same reason — the app renders the
+	// job form from it, which it may do before anybody has signed in. The catalogue it
+	// answers with is testGoodsConfig()'s rather than the shipped one; what is driven here
+	// is the wire shape, and internal/jobs is where the list's contents are exercised.
+	"GET /v1/goods-categories": {auth: asAnonymous, want: 200},
+
 	// Bidding — every one of these needs the job past Draft (SHIP-17c).
 	"POST /v1/jobs/{id}/bids": {auth: asProvider, want: 201,
 		setup: func(t *testing.T, w *contractWorld) { w.openToBidding(t) },
 		body:  func(w *contractWorld) string { return contractOffer(45000) }},
+
+	// SHIP-63. readyToPublish supplies what Docs/04 §2 and publishable() require; the
+	// refusals are exercised in internal/jobs against a real database.
+	"POST /v1/jobs/{id}/publish": {auth: asCustomer, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.readyToPublish(t) },
+		body:  func(*contractWorld) string { return `{"accepts_terms":true}` }},
 
 	"POST /v1/jobs/{id}/extend": {auth: asCustomer, want: 200,
 		setup: func(t *testing.T, w *contractWorld) { w.advanceJobTo(t, jobs.StatusOpen) },

@@ -28,11 +28,12 @@ const EventStatusChanged = "job.status_changed"
 // whoever owns the invariant being protected (Docs/10 §3.2) — and for the award that is
 // `bidding`, which moves a job inside a transaction of its own without importing this package.
 type Service struct {
-	events  EventSink
-	clock   clock.Clock
-	geo     Geocoder
-	bidders Bidders
-	store   postgresStore
+	events    EventSink
+	clock     clock.Clock
+	geo       Geocoder
+	bidders   Bidders
+	catalogue Catalogue
+	store     postgresStore
 }
 
 // NewService builds the domain service.

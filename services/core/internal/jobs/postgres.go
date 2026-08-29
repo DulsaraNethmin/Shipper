@@ -63,14 +63,14 @@ const jobColumns = `
 	COALESCE(dropoff_line, ''), COALESCE(dropoff_suburb, ''),
 	COALESCE(dropoff_state, ''), COALESCE(dropoff_postcode, ''),
 	dropoff_latitude, dropoff_longitude, COALESCE(dropoff_formatted, ''),
-	COALESCE(goods_description, ''),
+	COALESCE(goods_description, ''), COALESCE(goods_category, ''),
 	COALESCE(length_cm, 0), COALESCE(width_cm, 0), COALESCE(height_cm, 0),
 	COALESCE(weight_kg, 0),
 	COALESCE(vehicle_requirement, ''), COALESCE(handling_notes, ''),
 	pickup_window_start, pickup_window_end,
 	dropoff_window_start, dropoff_window_end,
 	COALESCE((budget * 100)::bigint, 0),
-	expires_at, expiry_warned_at,
+	expires_at, expiry_warned_at, terms_accepted_at,
 	created_at, updated_at`
 
 // scanJob reads one row of [jobColumns].
@@ -89,6 +89,8 @@ func scanJob(row pgx.Row) (Job, error) {
 		dropoffStart, dropoffEnd *time.Time
 
 		expiresAt, expiryWarnedAt *time.Time
+
+		termsAcceptedAt *time.Time
 	)
 
 	if err := row.Scan(
@@ -97,14 +99,14 @@ func scanJob(row pgx.Row) (Job, error) {
 		&pickupLat, &pickupLng, &j.Pickup.Formatted,
 		&j.Dropoff.Line, &j.Dropoff.Suburb, &j.Dropoff.State, &j.Dropoff.Postcode,
 		&dropoffLat, &dropoffLng, &j.Dropoff.Formatted,
-		&j.GoodsDescription,
+		&j.GoodsDescription, &j.GoodsCategory,
 		&j.Dimensions.LengthCm, &j.Dimensions.WidthCm, &j.Dimensions.HeightCm,
 		&j.WeightKg,
 		&j.VehicleRequirement, &j.HandlingNotes,
 		&pickupStart, &pickupEnd,
 		&dropoffStart, &dropoffEnd,
 		&j.BudgetCents,
-		&expiresAt, &expiryWarnedAt,
+		&expiresAt, &expiryWarnedAt, &termsAcceptedAt,
 		&j.CreatedAt, &j.UpdatedAt,
 	); err != nil {
 		return Job{}, err
@@ -115,6 +117,9 @@ func scanJob(row pgx.Row) (Job, error) {
 	}
 	if expiryWarnedAt != nil {
 		j.ExpiryWarnedAt = *expiryWarnedAt
+	}
+	if termsAcceptedAt != nil {
+		j.TermsAcceptedAt = *termsAcceptedAt
 	}
 
 	// ck_jobs_pickup_coordinate_is_a_pair means one of these being present implies the other,
@@ -215,6 +220,12 @@ func draftArgs(j Job) []any {
 		nullTime(j.PickupWindow.Start), nullTime(j.PickupWindow.End),
 		nullTime(j.DropoffWindow.Start), nullTime(j.DropoffWindow.End),
 		nullCents(j.BudgetCents),
+
+		// Last rather than beside goods_description, which is where it belongs by meaning.
+		// Appending keeps every placeholder below its existing number; slotting it into the
+		// middle would renumber twelve of them across three statements, which is the edit
+		// that silently shifts a value into the wrong column.
+		nullText(j.GoodsCategory),
 	)
 }
 
@@ -232,7 +243,7 @@ const draftColumns = `
 	vehicle_requirement, handling_notes,
 	pickup_window_start, pickup_window_end,
 	dropoff_window_start, dropoff_window_end,
-	budget`
+	budget, goods_category`
 
 // draftValues is insertDraft's VALUES list, one entry per name in draftColumns and in the same
 // order. $1 and $2 are the id and the customer, so the draft's own values start at $3.
@@ -252,7 +263,7 @@ const draftValues = `
 	$22, $23,
 	$24, $25,
 	$26, $27,
-	($28::bigint)::numeric / 100`
+	($28::bigint)::numeric / 100, $29`
 
 // isCustomer reports whether the account exists and is a customer account.
 //
@@ -321,7 +332,8 @@ func (postgresStore) updateDraft(ctx context.Context, r db.Runner, j Job) (Job, 
 			weight_kg = $20, vehicle_requirement = $21, handling_notes = $22,
 			pickup_window_start = $23, pickup_window_end = $24,
 			dropoff_window_start = $25, dropoff_window_end = $26,
-			budget = ($27::bigint)::numeric / 100
+			budget = ($27::bigint)::numeric / 100,
+			goods_category = $28
 		WHERE id = $1
 		RETURNING ` + jobColumns
 
@@ -628,4 +640,59 @@ func (postgresStore) history(ctx context.Context, r db.Runner, jobID uuid.UUID) 
 		return nil, fmt.Errorf("jobs: reading the history of %s: %w", jobID, err)
 	}
 	return out, nil
+}
+
+// contactVerification reads whether the customer has verified their email and phone (SHIP-63).
+//
+// Reading `users` from this domain is sanctioned rather than a boundary crossed, on exactly the
+// reasoning [postgresStore.isCustomer] gives: the table is in the shared migration block precisely
+// because it is read across the whole service (Docs/10 §9.2), and `jobs.customer_id` already
+// references it. What is not sanctioned — and is not done — is importing internal/identity to ask.
+//
+// The columns are timestamps rather than booleans, which is 000002's decision and a good one: "a
+// boolean answers 'is it verified'; a timestamp answers that and also 'since when'". This
+// operation needs only the boolean, so it asks the database for that and leaves the instants
+// where they are — a job has no use for the date somebody confirmed their phone.
+//
+// A missing account reports neither verified, rather than an error, for the reason isCustomer
+// gives: the only caller holds a token naming that account, so the row being gone means it was
+// removed underneath a live session, and "you may not publish" is a truthful answer to that.
+func (postgresStore) contactVerification(
+	ctx context.Context,
+	r db.Runner,
+	id uuid.UUID,
+) (contactVerification, error) {
+	const q = `
+		SELECT email_verified_at IS NOT NULL, phone_verified_at IS NOT NULL
+		FROM users WHERE id = $1`
+
+	var v contactVerification
+	err := r.QueryRow(ctx, q, id).Scan(&v.email, &v.phone)
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return contactVerification{}, nil
+	case err != nil:
+		return contactVerification{}, fmt.Errorf("jobs: read the verification of %s: %w", id, err)
+	}
+	return v, nil
+}
+
+// acceptTerms records the declaration that publishes a job (SHIP-63).
+//
+// `IS NULL` in the WHERE clause rather than an unconditional SET, so that a job which somehow
+// reaches this twice keeps the first acceptance. [Service.Publish] already returns early for a job
+// that is Open, so this is belt and braces — but the alternative is a statement whose only
+// safeguard is that its caller checked, and Docs/04 §2 makes this the record the platform relies
+// on if what turns up at the pickup is not what the job described.
+//
+// It does not report a row that was not updated. Nothing here needs to distinguish "set it" from
+// "it was already set": both mean the job has an acceptance, which is what the caller is about to
+// rely on.
+func (postgresStore) acceptTerms(ctx context.Context, r db.Runner, id uuid.UUID, at time.Time) error {
+	const q = `UPDATE jobs SET terms_accepted_at = $2 WHERE id = $1 AND terms_accepted_at IS NULL`
+
+	if _, err := r.Exec(ctx, q, id, at.UTC()); err != nil {
+		return fmt.Errorf("jobs: record the declaration on %s: %w", id, err)
+	}
+	return nil
 }

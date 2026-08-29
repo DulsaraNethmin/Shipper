@@ -78,6 +78,9 @@ func (s *Service) CreateDraft(ctx context.Context, r db.Runner, customerID uuid.
 	if err := fields.validate(); err != nil {
 		return Job{}, err
 	}
+	if err := s.checkDraftCategory(fields); err != nil {
+		return Job{}, err
+	}
 
 	customer, err := s.store.isCustomer(ctx, r, customerID)
 	if err != nil {
@@ -127,6 +130,9 @@ func (s *Service) UpdateDraft(ctx context.Context, r db.Runner, customerID, jobI
 
 	fields := f.normalise()
 	if err := fields.validate(); err != nil {
+		return Job{}, err
+	}
+	if err := s.checkDraftCategory(fields); err != nil {
 		return Job{}, err
 	}
 
@@ -180,6 +186,12 @@ func (f DraftFields) normalise() DraftFields {
 		tidy := collapse(*f.VehicleRequirement)
 		out.VehicleRequirement = &tidy
 	}
+
+	// Trimmed only. A category code is matched against the catalogue exactly, so folding case
+	// here would quietly accept "General_Freight" and store the code the customer did not send
+	// — and the next release, which reads the stored value back, would find it unknown. The
+	// catalogue's codes are lower snake case and a client sends one of them verbatim.
+	out.GoodsCategory = trimmed(f.GoodsCategory)
 
 	return out
 }
@@ -296,6 +308,9 @@ func (f DraftFields) applyTo(j Job) Job {
 
 	if f.GoodsDescription != nil {
 		j.GoodsDescription = *f.GoodsDescription
+	}
+	if f.GoodsCategory != nil {
+		j.GoodsCategory = *f.GoodsCategory
 	}
 	if f.LengthCm != nil {
 		j.Dimensions.LengthCm = *f.LengthCm

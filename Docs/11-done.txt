@@ -60,6 +60,7 @@
 
 # Track X — External dependencies
 X-6
+X-9
 
 # M0 — Foundation
 SHIP-1
@@ -136,10 +137,13 @@ SHIP-56
 SHIP-56a
 SHIP-57
 SHIP-57a
+SHIP-58
+SHIP-59
 SHIP-59a
 SHIP-60
 SHIP-61
 SHIP-62
+SHIP-63
 SHIP-64
 SHIP-65
 SHIP-65a
