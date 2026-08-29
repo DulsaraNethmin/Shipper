@@ -16816,6 +16816,16 @@ load a staging configuration and neither set the variable, so both failed on the
 message a forgetful deployment would get. That is the guard working before it was asked to: the
 second of those tests is the demonstration instance, and `stub` is the honest answer for it.
 
+**Running it found a defect this ticket introduced, and no test would have.** `jobsHandler` is
+called once per route during attach, so `newGeocoder` runs nine times on every boot — it always did,
+and building nine stubs in silence cost nothing anybody noticed. Saying which transport is in use
+turned that into **nine identical boot lines**, in the same change whose comment claims one line in
+the boot log is findable where noise is not. The logging is now behind a `sync.Once` and measured at
+one line rather than assumed; the *construction* is deliberately left alone, because nine stubs cost
+nothing and nine idle HTTP clients are worth tidying in a ticket that is about that. The general
+point is the one this file keeps paying for: a log line is output, and output is only checked by
+looking at it.
+
 **Done when:** `GEOCODING_TRANSPORT` selects the implementation with no code change and
 `geocoding.UseStub` no longer exists — verified by `TestGeocodingDefaultsToTheStubInEveryEnvironment`,
 `TestGeocodingHTTPRefusesAMissingBaseURL`, `TestGeocodingRefusesAnUnrecognisedTransport`,
