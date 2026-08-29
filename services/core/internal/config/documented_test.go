@@ -102,6 +102,22 @@ func TestNothingIsDocumentedThatIsNotRead(t *testing.T) {
 		"TEST_DATABASE_URL": true,
 		"TEST_REDIS_URL":    true,
 		"TEST_TEMPLATE_DB":  true,
+
+		// Read by cmd/seed, not by config (SHIP-186).
+		//
+		// The two passwords are deliberately outside config.Load and this is the entry that
+		// records why. config.Load runs in every process, and a value it demands is a value
+		// cmd/api needs to start — so putting them there would make the API refuse to boot
+		// without a seed password, which is both wrong and the kind of coupling that gets
+		// resolved by inventing a default. Defaulting is the one thing these must never have:
+		// a committed default would open every demonstration instance deployed from this
+		// repository. cmd/seed reads them itself and refuses to run without them.
+		//
+		// SEED_API_BASE_URL is here for a plainer reason: it names the address of the API
+		// *from outside*, which no process serving that API has any use for.
+		"SEED_USER_PASSWORD":  true,
+		"SEED_ADMIN_PASSWORD": true,
+		"SEED_API_BASE_URL":   true,
 	}
 
 	source, err := os.ReadFile(configSource)

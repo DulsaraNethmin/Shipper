@@ -88,11 +88,32 @@ question.
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 224 | 697 |
-| Remaining | 41 | 134 |
+| **Done** | 225 | 702 |
+| Remaining | 40 | 129 |
 | **Total** | 265 | 831 |
 
-**Measured on `ship-15au-status-gate-and-reconciliation`, whose base is `develop` at `8f553cd`.**
+**Measured on `ship-186-demo-seed-dataset`, whose base is `develop` at `3f9b8af`.** `make status` on
+this branch prints **225 / 265 and 702 / 831** with both guards green, and the figures above were read
+off that run rather than added up beside it.
+
+**The movement is SHIP-186, and it is the demonstration's content rather than its plumbing.** M8 goes
+to **8 of 12**; the totals move 224 → **225** and 697 → **702**. `make seed` populates a marketplace by
+driving the public API — the shape was chosen by the schema rather than by preference, and §3 carries
+the argument and the four things the run found that no reading would have.
+
+**It empties §6's startable set again, one pass after X-5 filled it.** SHIP-186 was the only startable
+code row in the backlog for exactly one pass. Every remaining row now waits on a decision, and **four
+of the five are the owner's to take rather than a third party's to grant** — X-10 needs nobody outside
+the building, and SHIP-156 and SHIP-174 need a `Docs/09` row that does not exist.
+
+**The gate that caught this pass's own mistake was `Docs/11-done.txt`.** The commit landed, `make
+status` exited 1 naming SHIP-186 as *landed in git but not in Docs/11-done.txt*, and the totals above
+were wrong by one ticket and five points until the list was edited. Worth recording because it is the
+opposite failure from wave 21's: that one printed correct totals behind a non-zero exit, and this one
+printed *stale* totals behind a non-zero exit. Both are only visible in `$?`.
+
+**The pass beneath it, measured on `ship-15au-status-gate-and-reconciliation`, whose base is `develop`
+at `8f553cd`.**
 `make status` on this branch prints **224 / 265 and 697 / 831** with both guards green, and the
 figures above were read off that run rather than added up beside it. A parser over `Docs/09`'s
 dependency column and `Docs/11-done.txt`, written for this pass, reproduced those counts and all
@@ -119,9 +140,12 @@ Wales**. §3 carries the reasoning and the procedural finding beneath it.
 
 **It ends the run of passes in which no code row was startable.** SHIP-186 — the demonstration seed
 dataset, 5 points — has been waiting on X-5 alone, through an edge §6 recorded and no parser can
-see, because `Docs/09` gives its dependency column SHIP-63 and nothing else. **It is startable now,
-and it is the only code row in the backlog that is**: every other row with its dependencies met
-carries a strike, and every remaining Track X row needs a registrar, a card, an adviser or a store.
+see, because `Docs/09` gives its dependency column SHIP-63 and nothing else. ~~**It is startable now,
+and it is the only code row in the backlog that is**~~ — **and it was startable for exactly one pass:
+SHIP-186 is built and §3 carries it.** The observation the sentence was making still holds for
+everything else: every other row with its dependencies met carries a strike, and every remaining
+Track X row needs a registrar, a card, an adviser or a store. §6 is back to no startable code row,
+which is the state this paragraph was written to say had ended.
 
 **The pass beneath it:** measured on `ship-15at-m8-m9-backlog-rows`, whose base is `develop` at `806b933`. `make status`
 on this branch prints **208 / 265 and 648 / 831** with both guards green, and the figures above were
@@ -1171,6 +1195,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-200** | M9 | A mail catcher in the development stack. `make up` starts Mailpit, `deploy/.env.example` points the stack's SMTP at it, and a verification code is read in a browser at `localhost:8025` rather than out of the API log. **The code default is untouched** — `internal/config` still resolves an unset `EMAIL_TRANSPORT` to the console, so a machine with no `deploy/.env` behaves exactly as it did; what changed is the example file, and the two are not in conflict. **The ports are fixed rather than per-worktree on purpose**, unlike `STORAGE_BUCKET`: a mailbox a person reads is not something two trees collide over the way a listing or a count is. Storage is in-memory, so there is no volume and a restart empties it. **The finding is that pointing the example file anywhere breaks two things that read the console, and neither would have failed at review** — `make verify` greps the server log for `email (console, not sent)`, and `config_test.go`'s `clearEnv` did not carry a single `EMAIL_*` or `SMS_*` key while `make` exports `deploy/.env` wholesale. The harness now pins both transports for its own run, and `clearEnv` carries all twenty-three keys — *see below* |
 | **SHIP-201** | M9 | The mail and SMS adapters' documentation says what the packages do. Three files still described the world before SHIP-187a and SHIP-187b, each carrying the same three false statements: that two implementations exist (email has three), that the choice is made in `cmd/api` from `SHIPPER_ENV` (it is `EMAIL_TRANSPORT` and `SMS_TRANSPORT`, in `internal/config`), and that a vendor would be named at SHIP-33 or SHIP-36 — both of which closed without naming one, after which SHIP-187a made naming unnecessary. Each package comment now carries a short note saying the environment **used to** decide, because a deleted function is the first thing a reader who knows the package looks for. **`sms/doc.go` still says two, and that is not the stale claim** — SMS genuinely has two and no third transport a gateway could want, and the file now states it as a complete set rather than a snapshot — *see below* |
 | **X-5** | X | **The pilot metropolitan area is Sydney, New South Wales.** Track X's third closed ticket, and the second that is a decision rather than code. `Docs/01` §8 named the radius and left the city open; it now names both. **The radius chose the city rather than the other way round** — a 150 km ring from the Sydney CBD reaches the Central Coast, the Blue Mountains, Wollongong and the Southern Highlands, which is the regional half §8 says the radius exists to capture, and every one of them is in New South Wales, so the single-state constraint costs nothing. **The 50 km first proposed for it was refused because §8 had already closed the radius at 150 km with an argument** — *see below* |
+| **SHIP-186** | M8 | **The demonstration dataset, written through the product's own API rather than into its tables.** `make seed` populates three verified providers with fleets and service areas, two open jobs, a third under competing offers, a delivery in transit and one completed delivery with a photograph — and it is the first code to depend on X-5, because a job needs a city. **The shape was forced twice over.** A second composition root would have been a second copy of the eight adapter types joining `bidding` and `delivery` in `cmd/api`, free to drift with nothing to report that it had; and writing rows directly is refused by the schema, because SHIP-57's trigger will not accept a job whose status moved without the history row describing the move. So every job here was published by a customer, every bid placed by a provider the platform ruled eligible, and every milestone recorded on a job-scoped driver token. **Two things have no endpoint and are the only SQL**: confirming an address and a number sent to a mailbox nobody owns, and the first administrator, which no authenticated administrator endpoint can create. **Idempotency is a read before every write on a key the product already carries** — a job by its goods description, a vehicle by its registration, a bid by who offered it — with no marker column and no reliance on the idempotency middleware, whose keys do not survive their own Redis TTL. Measured on a clean database: a second run leaves ten tables at identical counts and `audit_log` one row larger, because the administrator did sign in — *see below* |
 
 SHIP-149 and SHIP-167 were pulled a long way forward deliberately. Audit is impossible to backfill, and the version gate cannot be retrofitted to builds already on devices — so it has to exist before SHIP-25 puts anything on one.
 
@@ -17013,6 +17038,105 @@ opposite shape: a decision that **was** written down, in the very section the an
 recorded in, and was nearly overwritten by a question that did not know it existed.
 
 
+### SHIP-186 — the seed had two possible shapes and the schema chose one of them
+
+**The question was where the data comes from, and it looked like a matter of taste until it was not.**
+Three shapes were available: a second composition root importing the domain services, direct SQL, or a
+client driving the public API.
+
+**Direct SQL was eliminated by the schema rather than by preference.** SHIP-57's trigger refuses a `jobs`
+row whose status moved without a `job_status_history` row written in the same transaction describing
+exactly that move — so a job cannot be inserted at `Delivered` at all, and reproducing the history, the
+audit entries and the outbox events by hand would be a second implementation of the transitions, which is
+the thing the invariant exists to prevent. That is the guard working on a caller it was never written
+for.
+
+**The second composition root was eliminated by counting it.** `bidding` and `delivery` are wired through
+eight adapter types that live in `cmd/api` — `negotiatedJobs`, `awardableJobs`, `presentedJobs`,
+`offerableVehicles`, `offerorDirectory`, `jobLifecycle`, `acceptedBids`, `jobCustomers` — each translating
+one domain's sentinels into another's vocabulary, each carrying an argument in its header for why it
+translates the way it does. A seed wiring its own services copies all eight and is then free to drift,
+with no compiler and no test to say it had.
+
+**So the seed is a client, and two things have no endpoint for it to call.** Confirming an address and a
+number, because `POST /v1/auth/register` sends a token to a mailbox and a code to a handset that the
+demonstration's accounts do not have — the acceptance harness solves the same problem by scraping the
+console transport out of the API's own stdout, which works when the harness started the process and does
+not when the API is a container elsewhere. And the first administrator, which `000801`'s header already
+calls a bootstrap INSERT. Both are in `accounts.go` and nothing else is.
+
+**What that costs, recorded rather than glossed: the seed demonstrates no registration.** A seeded account
+skips it. That is the right trade for a dataset — `Docs/01` §8's gate has the buyer register their own —
+but the seed is not a test of `internal/identity` and must not be read as one.
+
+#### The constraint that shaped the data, and it is a finding about the product
+
+**A bid must promise a pickup in the future, and a completed delivery needs milestones in the past.** Both
+are true at once for every carried job the seed builds, because it places the bid and records the
+milestones seconds apart. `POST /v1/jobs/{id}/bids` refuses "Enter a collection time in the future";
+`RecordedAt` is the actor's clock and `000601` is explicit that it is *not* bounded against `now()`, which
+is the only reason the past half is legal at all.
+
+So the two times cannot be made to agree, and the dataset keeps them close and says so: the demonstration's
+carried jobs read as work a driver got to ahead of the slot they quoted for. `demoJob.CarriedFrom` exists
+because deriving the milestone times from the pickup window produced a delivery four days before the bid
+that won it.
+
+#### Four things the run found that no reading would have
+
+Each of these failed at run time with a message that was true and about the wrong thing:
+
+- **`operates_as` is `individual` or `business`, not a trading name.** A legal name was refused as
+  `Choose individual or business`.
+- **`offered_by` is which *side* made the standing offer**, not who the provider is — a counter-offer is
+  the same negotiation with the other party speaking, so the provider stays in `provider.id` throughout.
+  Matching bids on `offered_by` found nothing and re-bid on every run.
+- **The provider assigns the driver, not the customer**, and the endpoint answers a customer with `404 No
+  such job` rather than a 403. Who drives is the winning provider's decision; the customer never chose a
+  person.
+- **Statuses reach the wire lower-cased and milestones snake-cased.** `"Draft"` never matched `"draft"`, so
+  the publish step silently never ran and the next call was refused for a reason two steps removed from the
+  cause. The seed now reads both from the domains' own constants through `.Wire()`.
+
+**Three of the four were silent in the same way**: the request that failed was not the request that was
+wrong. That is the shape of every hour this ticket cost, and it is why
+`TestEveryDeclaredBidderCouldActuallyBid` exists — it reproduces two of `fleet.eligible`'s four clauses
+against the declaration, so a provider who could never see the job they are declared to bid on fails a
+unit test in milliseconds instead of a run against a live stack.
+
+#### Verified by mutation
+
+Four guards, each broken deliberately and each failing by name: a phone moved outside ACMA's fictitious
+range, two jobs given one goods description, a bidder's postcodes moved off the pickups it bids on, and a
+job put in a category Shipper refuses. Restored from a file copy and confirmed with `shasum -c` against a
+manifest written before the first mutation — `git diff` proves nothing here, because the package is
+untracked and every file in it reads as clean whatever was done to it.
+
+#### `make check` gave a false pass for as long as the package was untracked
+
+**`make lint-spelling` is `git grep`, and `git grep` does not see untracked files.** `make check` ran
+green three times on this branch while `services/core/cmd/seed/` held twelve uses of the standard
+library's RGBA type and one HTTP authorisation header, both spelled the American way because neither
+spelling was ours to choose. The first `git add` turned the same tree red.
+
+This is the same class as the wave-5 false pass and it needs no fix to the script — searching tracked
+files is the right behaviour for a linter, and `.gitignore` exists precisely so that build output is not
+linted. What is worth carrying is the working rule: **a new package's first `make check` means nothing
+until `git add`.** Every other gate in this repository reads the working tree, which is what makes this
+one's blindness invisible; `make test` and `make vet` compiled and ran the same files perfectly happily.
+
+Both matches were the documented case — a standard library import path and a header name fixed by
+RFC 9110 — and both are marked on the line, with the imported package aliased to `colour` so the
+American form appears exactly once in the file rather than thirteen times.
+
+#### What is deliberately not here
+
+**No `scripts/verify/` section.** M8 has none at all, so this breaks no convention — but the reason it was
+not added is worth naming rather than leaving to inference: `make verify` has not been run since wave 21,
+wave 21 changed it, and a section added to a harness that cannot currently be got green is a section
+nobody has demonstrated. Whoever repairs the harness should add it, and the acceptance criterion is
+already a single command that exits non-zero.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -17385,12 +17509,13 @@ same discipline every pass here uses: a parser over `Docs/09`'s dependency colum
 `Docs/11-done.txt` that reproduced `make status` cell for cell — 265 rows, 831 points, 224 done,
 697 points, and all eleven milestone denominators — before a figure below was written.
 
-**Twelve rows have every dependency met: 39 points. One of them is a code row, and it is startable
-for the first time.**
+**Eleven rows have every dependency met: 34 points, and none of them is a code row.** The twelfth was
+SHIP-186, which was the one startable code row for exactly one pass and is now done — §3 has it. The set
+is back to what it was before X-5 closed: **every remaining row waits on a decision, and four of the five
+decisions are somebody's to take rather than a third party's to grant.**
 
 | Ticket | Pts | Area | In scope for the demonstration? |
 |---|---|---|---|
-| **SHIP-186** | 5 | **Demo seed dataset — start here.** One command populates verified providers, open jobs, bids in flight, a delivery in progress and one completed delivery with photograph proof; idempotent, and no real personal information. Its declared dependency is SHIP-63, merged at `c89fa0e`; the edge that actually held it was **X-5, which no parser could see**, and X-5 closed on this branch. **It is the only startable code row in the backlog** | **Yes — and it is the demonstration's content** |
 | **X-11** | 2 | Demonstration hostname. A registrar and three DNS records. **Releases the most: SHIP-188, 189, 190, 191 and 202, at 15 points** | **Yes — it blocks the entire M8 chain** |
 | **X-12** | 3 | Maps project and its two API keys. Needs a card and a billing account with a budget alert, no third-party approval. **Releases 26 points**, the largest set behind any Track X row | No — and §5 says why the demo does not need it |
 | **X-10** | 3 | Firebase project. No third party; the Android half is an hour. Releases SHIP-144, 145, 146 at 10 points | Yes — but nothing in the demo gate walks a push |
@@ -19398,7 +19523,7 @@ replacement order is §6's table. The rule itself is untouched and resumes for e
   Dockerfile anywhere in this repository and no infrastructure-as-code of any kind.
 - **Push is in, Android only.** X-10 needs no third party. The iOS leg needs an APNs key from the
   Apple Developer Program and goes with the rest of the store chain.
-- **Seeded data gets a row** (SHIP-186). Nothing seeds anything today.
+- **Seeded data gets a row** (SHIP-186). ~~Nothing seeds anything today.~~ Built — `make seed`, §3.
 - **X-9 is taken in reduced form** rather than by editing its dependency on X-4. §5 has the reasoning
   and the precedent.
 - **No existing `Docs/09` row is re-marked.** The deferral lives here and in §5, where a decision
@@ -19410,9 +19535,15 @@ replacement order is §6's table. The rule itself is untouched and resumes for e
    `deploy/docker-compose.yml` plus three application containers behind a TLS terminator, rather than
    a managed platform — **Kafka is the deciding factor**, and managed Kafka costs more per month than
    everything else in the demonstration combined. Not decided; it is SHIP-188's to settle.
-2. **Whether the demonstration ships with a prepared login.** A buyer who has to register four
-   accounts to see a marketplace will not see a marketplace. SHIP-186's *Done when* does not say, and
-   somebody should decide before it is built.
+2. **~~Whether the demonstration ships with a prepared login.~~ Decided by the owner on 30 August 2026
+   — yes, and the seed creates them.** A customer, three providers and a bootstrap administrator, so a
+   buyer sees the marketplace from every side without registering anything; registration stays open for
+   anyone who wants to walk it. **The passwords come from the environment and the seed has no default
+   for either**, which is the half of the decision worth carrying: a committed default would be a
+   working credential for every demonstration instance ever deployed from this repository, and M8's
+   whole point is that the instance answers at a public hostname. `SEED_USER_PASSWORD` and
+   `SEED_ADMIN_PASSWORD` are separate because the administrator can read every account on the
+   instance.
 3. **SHIP-156 is still a plan gap and the re-scope does not close it.** Ten passes have carried the
    strike. There is no `reports` table, no report route, and **no `Docs/09` row that builds one** —
    so the row reads as startable and is not, in a way no parser can see. Deferring it is not the same
