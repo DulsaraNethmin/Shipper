@@ -1,7 +1,7 @@
 # deploy — local development stack
 
-PostgreSQL, Redis, Kafka and an S3-compatible object store for local development
-(SHIP-2, SHIP-3, SHIP-4, SHIP-15p). Production
+PostgreSQL, Redis, Kafka, an S3-compatible object store and a mail catcher for local
+development (SHIP-2, SHIP-3, SHIP-4, SHIP-15p, SHIP-200). Production
 runs on managed AWS services (`Docs/06` §2); nothing in this directory is a deployment
 artefact.
 
@@ -21,6 +21,14 @@ make reset         # stop and destroy all data
 | Kafka 3.9 (KRaft) | `kafka:9092` | `localhost:29092` | Domain events |
 | MinIO | `minio:9000` | `localhost:9000` | Proof photographs and verification documents, private, reached only by pre-signed URL |
 | MinIO console | — | `localhost:9001` | A browser view of the bucket. Nothing depends on it |
+| Mailpit | `mailpit:1025` | `localhost:1025` | Every email the platform sends in development, caught rather than delivered |
+| Mailpit mailbox | — | `localhost:8025` | A browser view of the catcher. Where a verification code is read |
+
+Mailpit's two ports are **fixed rather than per-worktree**, unlike `STORAGE_BUCKET`. Every
+worktree shares one stack, and a mailbox a person reads is not something two trees collide
+over the way a listing or a count is. Its storage is in-memory, so it has no volume and a
+restart empties it — which is the right state for a mailbox whose entire contents are
+yesterday's test registrations.
 
 The Go service runs **on the host** during development, not in a container, which is why
 every service publishes a port. `make run` starts it against the stack.

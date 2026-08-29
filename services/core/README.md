@@ -11,7 +11,7 @@ app, admin panel, and driver portal all consume it (`Docs/06` §2.1).
 All commands run from the repository root. See the root `Makefile`.
 
 ```
-make up            # start Postgres, Redis, Kafka
+make up            # start Postgres, Redis, Kafka, the object store and the mail catcher
 make migrate-up    # apply migrations
 make run           # run the service on :8080
 curl localhost:8080/health

@@ -123,6 +123,22 @@ done
 # shellcheck disable=SC1091
 [[ -f deploy/.env ]] && source deploy/.env
 
+# The harness reads the verification token and the OTP out of the service's own log, which only
+# the console transports write (40-identity.sh, SHIP-31 and SHIP-34). So it pins them for every
+# binary it starts, rather than inheriting whatever the developer has.
+#
+# This became load-bearing at SHIP-200. `make` exports deploy/.env wholesale, and that file now
+# points the development stack at the mail catcher — so without these two lines a registration
+# would be delivered to Mailpit, no "email (console, not sent)" line would ever be written, and
+# the section would fail reporting that no verification email was logged. It was a latent break
+# before the catcher existed: a developer who set EMAIL_TRANSPORT=http broke `make verify` and
+# nothing said why.
+#
+# Exported rather than passed per launch because five sections start a binary of their own, and
+# a list that has to be repeated is one a sixth section forgets.
+export EMAIL_TRANSPORT=console
+export SMS_TRANSPORT=console
+
 POSTGRES_USER="${POSTGRES_USER:-shipper}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-shipper}"
 POSTGRES_DB="${POSTGRES_DB:-shipper}"

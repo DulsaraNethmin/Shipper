@@ -287,8 +287,9 @@ Read the diff at the first gate, not the second — by the time work reaches a `
 All run from the repository root. `make` with no target lists them.
 
 ```
-make up             Start Postgres, Redis, Kafka and the object store, waiting until each
-                    is healthy, then create this worktree's bucket
+make up             Start Postgres, Redis, Kafka, the object store and the mail catcher,
+                    waiting until each is healthy, then create this worktree's bucket.
+                    Mail sent in development is read at http://localhost:8025
 make down           Stop the stack, keeping data
 make reset          Stop the stack and destroy all data
 make ps / logs      Stack status; follow stack logs
@@ -366,7 +367,7 @@ services/core/        Go — the versioned public API and domain
   internal/testsupport/ pgtest and redistest — real infrastructure for tests
   internal/validate/  field-level validation in the error contract's shape
   migrations/         SQL schema history, in reserved per-domain blocks
-deploy/               docker-compose for local Postgres, Redis, Kafka, MinIO
+deploy/               docker-compose for local Postgres, Redis, Kafka, MinIO, Mailpit
 scripts/              verify-foundation.sh — the acceptance harness; the checks are
                       one file per milestone or domain in scripts/verify/, so a track
                       adds a file and edits none. Also check-spelling.sh and

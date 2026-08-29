@@ -1,4 +1,4 @@
-# Local development stack: PostgreSQL, Redis, Kafka, object storage.
+# Local development stack: PostgreSQL, Redis, Kafka, object storage, mail catcher.
 #
 # This is a development convenience, not a deployment artefact. Production runs on managed
 # AWS services (Docs/06 §2). Nothing here should acquire production responsibilities —
@@ -185,6 +185,52 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+
+  # --- SHIP-200 -----------------------------------------------------------------------
+  # The mail catcher. Every message the platform sends in development lands here instead of
+  # in an inbox, and is read in a browser at http://localhost:8025.
+  #
+  # It exists because the alternative was reading a verification code out of the API log.
+  # The console transport prints the whole body precisely so that was possible, and it works
+  # — but it is the one step of the customer journey a person cannot walk the way a customer
+  # walks it, and Docs/01 §8 now requires the whole of that journey to be drivable through
+  # the product's own interfaces.
+  #
+  # No credential and no TLS, deliberately. This accepts anything on 1025, which is what
+  # makes EMAIL_SMTP_ENCRYPTION=none and an empty username correct in deploy/.env.example.
+  # A catcher that needed configuring to catch would defeat its purpose, and it holds nothing
+  # worth protecting — mail that was never going to leave the machine.
+  #
+  # Storage is in-memory on purpose, so there is no volume below: a restarted catcher is an
+  # empty mailbox, which is the right state for one whose entire contents are yesterday's
+  # test registrations. Postgres, Redis and Kafka keep their volumes because losing their
+  # data costs a `make migrate-up` or a re-seed; losing this costs nothing.
+  mailpit:
+    image: axllent/mailpit:v1.31.0
+    container_name: shipper-mailpit
+    restart: unless-stopped
+    environment:
+      # Accept any credential rather than requiring none, so a developer who copies a
+      # username and password out of a staging configuration is not met with a refusal that
+      # looks like the platform's fault.
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    ports:
+      # Fixed rather than per-worktree, and that is the SHIP-200 clause rather than an
+      # oversight. COMPOSE_PROJECT_NAME is pinned in the Makefile so every worktree shares
+      # one stack; a catcher whose port varied would be a second thing each tree has to set,
+      # and unlike STORAGE_BUCKET there is nothing here for two trees to collide over — a
+      # mailbox read by a person is not asserted on by a test.
+      - "${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+    healthcheck:
+      # Mailpit's own readiness subcommand, which is in the image and needs no shell, no
+      # curl and no wget — the image is a scratch build carrying the one binary.
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
 volumes:
   postgres-data:
