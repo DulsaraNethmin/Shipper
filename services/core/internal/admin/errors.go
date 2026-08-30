@@ -86,6 +86,33 @@ var (
 	// answer.
 	ErrDisputeVanished = errors.New("admin: a dispute was refused as a duplicate of a row that is not there")
 
+	// ErrMessageNotOnJob means a report named a message that is not on the job in the path
+	// (SHIP-155a).
+	//
+	// The check `fk_reports_message` cannot make: the foreign key establishes that the message
+	// exists, and whether it belongs to *this* job is a comparison between two tables. `000506`'s
+	// header records `internal/bidding` in the same position.
+	//
+	// **Reachable only by somebody already established as party to the job**, which is what makes
+	// it safe to disclose plainly — see [JobMessages]. A stranger never gets this far; they get
+	// [ErrNotAParty] first, whatever message id they sent.
+	//
+	// Answered as a field-level problem naming `message_id` rather than as a 404, and the
+	// distinction is which thing was not found: the job *was* found and the caller is party to
+	// it, so what is wrong is a field in the body (Docs/10 §4.6). It takes no code of its own,
+	// which is [ErrNoteSubjectMissing]'s treatment of the same shape — a subject id that names
+	// the wrong thing is a validation failure, and the message says which field and why.
+	ErrMessageNotOnJob = errors.New("admin: that message is not on that job")
+
+	// ErrReportVanished means the unique index refused a duplicate report and no row exists for
+	// the key that caused it.
+	//
+	// [ErrDisputeVanished] one table over, and impossible for the same reason: intake has no
+	// DELETE path, and the row that caused the conflict is committed by the time the conflict is
+	// visible. It is here so that an impossible state becomes a 500 with a cause in the log
+	// rather than a reply that invents an answer.
+	ErrReportVanished = errors.New("admin: a report was refused as a duplicate of a row that is not there")
+
 	// ErrNotInTransaction means a service method that writes two tables was handed a connection
 	// pool rather than a transaction.
 	//

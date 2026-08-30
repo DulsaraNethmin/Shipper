@@ -179,6 +179,11 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		Expiry:        expiry,
 
 		DisputeWorkflow: disputeWorkflow,
+
+		// SHIP-155a. The real party and message adapters, like the workflow above: the whole of
+		// what intake refuses is read out of `jobs`, `bids` and `job_messages`, so a stub would
+		// prove that `admin` writes a row and nothing about who was allowed to.
+		Reports: NewReports(testParties{}, testMessages{}),
 	}
 }
 

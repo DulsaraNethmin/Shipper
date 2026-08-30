@@ -55,6 +55,37 @@ type JobParties interface {
 	PartyOn(ctx context.Context, r db.Runner, jobID, userID uuid.UUID) (party Party, isParty bool, err error)
 }
 
+// JobMessages is whether a message belongs to a job (SHIP-155a).
+//
+// One method, answering the one question this domain has about `job_messages`: is the message a
+// reporter named actually on the job they named. Not who wrote it, not what it says, not when — a
+// port is what a domain needs rather than what the other domain has.
+//
+// # This exists because no foreign key can answer it
+//
+// `fk_reports_message` establishes that the message exists. That the message is on *this* job is a
+// comparison between two tables, which a foreign key cannot express and a CHECK may not contain a
+// subquery to make. `000506`'s header records `internal/bidding` in the same position, for the same
+// reason, and reaching the same answer: the domain makes the comparison in Go before it writes.
+//
+// # Why it does not disclose, unlike the answer above it
+//
+// [JobParties] folds "no such job" into "not your party" deliberately, because telling them apart
+// would leak that somebody else's job exists. This one needs no such care and gets none: it is
+// reached **only after** the caller has been established as a party to the job (see [Reports.Raise]),
+// so the only thing a false answer tells them is that a message id they supplied is not on their own
+// job — which is the truth they asked for and are entitled to.
+//
+// The message being on the job is all that is checked. **Not that the reporter can see it**: a
+// customer is party to every conversation on their job and the awarded provider to their own, and
+// the awarded provider is the only provider a [JobParties] answer can name — so on the rows this
+// endpoint can reach, party and visibility coincide. If SHIP-156 or a later ticket widens who counts
+// as a party, that stops being true and this port's contract is where the widening has to be
+// answered.
+type JobMessages interface {
+	MessageOnJob(ctx context.Context, r db.Runner, jobID, messageID uuid.UUID) (onJob bool, err error)
+}
+
 // JobMove is what the guarded transition did, in terms this domain can act on.
 //
 // The four values are the four outcomes of Docs/02 §2's table as seen from one caller: it moved,

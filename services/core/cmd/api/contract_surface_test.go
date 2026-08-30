@@ -1148,6 +1148,17 @@ var contractCases = map[string]contractCase{
 				`"occurred_at":"` + time.Now().Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`
 		}},
 
+	// SHIP-155a. Driven at 201 rather than 200 because a report is always written: unlike a
+	// dispute there is no "already open" refusal, so the first call on a fresh world creates one.
+	// `deliveryUnderWay` is reused for the *party* it establishes rather than for the status —
+	// nothing about a report depends on where the job is in its lifecycle.
+	"POST /v1/jobs/{id}/reports": {auth: asCustomer, want: 201,
+		setup: func(t *testing.T, w *contractWorld) { w.deliveryUnderWay(t) },
+		body: func(*contractWorld) string {
+			return `{"subject_type":"job","reason":"prohibited_goods",` +
+				`"description":"Listed as garden supplies; the photographs show gas cylinders."}`
+		}},
+
 	"GET /v1/admin/disputes/{id}": {auth: asAdmin, want: 200,
 		setup: func(t *testing.T, w *contractWorld) { w.raiseDispute(t) },
 		path:  func(w *contractWorld) string { return "/v1/admin/disputes/" + w.disputeID.String() }},

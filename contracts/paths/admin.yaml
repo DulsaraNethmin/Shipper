@@ -324,6 +324,286 @@ Dispute:
         renders only this is showing a filing time as though it were the incident.
       example: '2026-08-13T02:15:30.000Z'
 
+# --- reporting a job or a message (SHIP-155a) ---------------------------------------------------
+
+Reports:
+  post:
+    operationId: raiseReport
+    summary: Report a job or a message
+    tags: [Reports]
+    security:
+      - BearerAccessToken: []
+    description: |
+      Tells Shipper that something is wrong with a job's listing, or with one message on it
+      (SHIP-155a). This is the first step of Docs/04 §6 — "receive a report" — and it produces the
+      second of Docs/04 §5's moderation queues.
+
+      Only a party to the job may call it: the customer who owns it, or the provider whose bid was
+      accepted. Everybody else — a provider who bid and lost, a customer looking at somebody else's
+      job, an account with no connection to it at all — gets the same `404` a job that does not
+      exist gets. Which jobs exist and who won them is commercial information nobody published.
+
+      ## Reporting changes nothing about the job
+
+      **This is the difference from raising a dispute, and it is deliberate.** A dispute moves the
+      job to `disputed` and freezes it; a report moves nothing at all. Docs/02 §2 has no transition
+      for one, and Docs/04 §6 has an administrator choose the outcome — no action, a warning,
+      content removal, cancellation, restriction, suspension or escalation — *after* they have
+      reviewed it.
+
+      If a report froze a job, either party could stop the other's delivery on their own say-so. So
+      a report is a message to Shipper about content or conduct; a dispute is about a delivery that
+      went wrong. Use `POST /v1/jobs/{id}/disputes` for the second.
+
+      Because nothing is frozen, **a job can carry any number of reports** — from both parties, for
+      different reasons, about the job and about individual messages. There is no "already
+      reported" refusal.
+
+      ## What to send
+
+      Reporting the listing itself:
+
+      ```json
+      {
+        "subject_type": "job",
+        "reason": "prohibited_goods",
+        "description": "Listed as garden supplies; the photographs show gas cylinders."
+      }
+      ```
+
+      Reporting one message in the conversation:
+
+      ```json
+      {
+        "subject_type": "message",
+        "message_id": "0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1",
+        "reason": "dealing_outside_shipper",
+        "description": "Asked me to cancel here and pay cash on the day."
+      }
+      ```
+
+      **A report names a job or a message, never both.** `message_id` is required when
+      `subject_type` is `message` and must be absent otherwise; sending both is refused rather than
+      resolved in your favour, because picking either half would file the report against something
+      you did not choose. The message must be on the job in the path — one from another job answers
+      `422` naming `message_id`.
+
+      ## Retrying
+
+      **A retry** reuses its `Idempotency-Key`. It answers `200` with the report the first attempt
+      raised, and writes nothing — whether the retry arrives a second later or a day later, because
+      the guarantee is a unique index in the database rather than a cached response.
+
+      Reusing one key for a *different* report is refused with `idempotency_key_reused`. That
+      includes the same reason against a different message: one key per action.
+    parameters:
+      - $ref: '#/JobID'
+      - $ref: '#/IdempotencyKey'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/ReportIntake'
+    responses:
+      '201':
+        description: |
+          The report is recorded. **The job is unchanged** — no status moved.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Report'
+      '200':
+        description: |
+          This `Idempotency-Key` had already raised this report. Nothing was written and the
+          original is returned — the same shape as `201`, so a client that does not care which
+          happened parses one type.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/Report'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../openapi.yaml#/components/responses/Unauthenticated'
+      '404':
+        $ref: '../openapi.yaml#/components/responses/NotFound'
+      '409':
+        description: |
+          One of two:
+
+          | `error.code` | What happened |
+          |---|---|
+          | `idempotency_key_reused` | This key already raised a *different* report on this job — another reason, or another message. Generate a new one |
+          | `idempotency_request_in_progress` | An identical request is still being handled. Retry in a moment |
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '422':
+        description: |
+          One or more fields were rejected (`validation_failed`). `error.details` carries one entry
+          per field, with the JSON path the client sent.
+
+          **`message_id` appears here in three different situations**, and the message says which:
+          it is missing on a `message` report, present on a `job` report, or names a message that is
+          not on this job.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ReportIntake:
+  type: object
+  additionalProperties: false
+  required: [subject_type, reason, description]
+  description: |
+    What is wrong and what it is wrong with. The job is in the path and the reporter is the token.
+    Unknown fields are refused, so a client typo fails loudly rather than being silently ignored.
+
+    There is no `occurred_at` here, unlike a dispute: the subject of a report is something still
+    there to be looked at, so a moderator opens it rather than reconstructing when it happened.
+  properties:
+    subject_type:
+      type: string
+      enum: [job, message]
+      description: |
+        Whether this is about the job's own listing or about one message on it. Docs/04 §5's second
+        queue is "reported jobs or messages" — these two.
+      example: job
+    message_id:
+      type: string
+      format: uuid
+      description: |
+        Which message. **Required when `subject_type` is `message`, and must be absent otherwise.**
+        It must be a message on the job in the path.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    reason:
+      type: string
+      enum:
+        - prohibited_goods
+        - misleading_listing
+        - dealing_outside_shipper
+        - abusive_or_threatening
+        - suspected_fraud
+        - safety_concern
+        - other
+      description: |
+        What is wrong. One list covers both subject kinds, because a message can describe
+        prohibited goods and a listing can be abusive.
+
+        | Value | Use it for |
+        |---|---|
+        | `prohibited_goods` | Goods Shipper does not carry — dangerous, live, illegal or specialist regulated freight (Docs/01 §2, Docs/05 §4) |
+        | `misleading_listing` | The job does not describe what is actually being moved |
+        | `dealing_outside_shipper` | Being asked to take the job, or the payment arrangement, off the platform |
+        | `abusive_or_threatening` | Abuse or a threat, in the listing or in a message |
+        | `suspected_fraud` | Something that looks like a scam or criminal activity |
+        | `safety_concern` | An urgent safety problem |
+        | `other` | Anything else |
+
+        **Filing under `other` with a good description is better than filing under the nearest
+        wrong heading** — an administrator triages from this field.
+      example: prohibited_goods
+    description:
+      type: string
+      minLength: 1
+      maxLength: 4000
+      description: |
+        What is wrong, in your own words. Required: a reason on its own is a category, and somebody
+        reads this before deciding what to do (Docs/04 §6). Line breaks are kept.
+      example: Listed as garden supplies; the photographs show gas cylinders.
+
+Report:
+  type: object
+  additionalProperties: false
+  required: [id, job_id, subject_type, raised_by, reason, description, raised_at]
+  description: |
+    One report, as the person who raised it sees it.
+
+    Nothing an administrator writes appears here and nothing ever will — internal support notes are
+    a separate record that is never user-visible (Docs/01 §4.6).
+
+    **The job's status is not echoed, because nothing about it changed.**
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: The report's identifier.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    job_id:
+      type: string
+      format: uuid
+      description: |
+        The job reported, or the job the reported message is on. Present on both kinds — it is the
+        context a moderator opens.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    subject_type:
+      type: string
+      enum: [job, message]
+      description: What the report is about.
+      example: job
+    message_id:
+      type: string
+      format: uuid
+      description: |
+        The message reported. **Absent when `subject_type` is `job`** rather than null.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    raised_by:
+      type: string
+      enum: [customer, provider]
+      description: |
+        Which side of this job the platform agreed you were on, resolved from the job and its
+        accepted bid rather than from anything you sent.
+      example: customer
+    reason:
+      type: string
+      enum:
+        - prohibited_goods
+        - misleading_listing
+        - dealing_outside_shipper
+        - abusive_or_threatening
+        - suspected_fraud
+        - safety_concern
+        - other
+      description: What you said was wrong.
+      example: prohibited_goods
+    description:
+      type: string
+      description: What you wrote, trimmed at the ends and otherwise unchanged.
+      example: Listed as garden supplies; the photographs show gas cylinders.
+    raised_at:
+      type: string
+      format: date-time
+      description: |
+        When the platform received the report, in UTC, on the platform's clock. The only instant a
+        report carries.
+      example: '2026-08-30T02:15:30.000Z'
+
 # --- parameters ------------------------------------------------------------------------------
 
 JobID:

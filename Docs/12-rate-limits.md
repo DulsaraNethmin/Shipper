@@ -143,8 +143,8 @@ application bucket — which is a deployment decision, not this document's.
 
 ## 5. The assignment
 
-All 88 routes on `services/core/cmd/api/routes_golden.txt`, generated from the manifest rather than
-listed by hand. Counts: `Unlimited` 1, `Credential` 5, `Message` 3, `Upload` 3, `Write` 37,
+All 89 routes on `services/core/cmd/api/routes_golden.txt`, generated from the manifest rather than
+listed by hand. Counts: `Unlimited` 1, `Credential` 5, `Message` 3, `Upload` 3, `Write` 38,
 `Read` 35, `PublicRead` 4.
 
 | Method | Path | Auth | Class |
@@ -228,6 +228,7 @@ listed by hand. Counts: `Unlimited` 1, `Credential` 5, `Message` 3, `Upload` 3, 
 | POST | `/v1/jobs/{id}/milestones` | user | `Write` |
 | POST | `/v1/jobs/{id}/proof-uploads` | user | `Upload` |
 | POST | `/v1/jobs/{id}/publish` | user | `Write` |
+| POST | `/v1/jobs/{id}/reports` | user | `Write` |
 | POST | `/v1/notifications/device-tokens` | user | `Write` |
 | DELETE | `/v1/notifications/device-tokens/current` | user | `Write` |
 | GET | `/v1/notifications/preferences` | user | `Read` |
