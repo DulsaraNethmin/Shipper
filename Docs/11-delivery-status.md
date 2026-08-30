@@ -10,7 +10,24 @@
 
 `make status` prints the machine-checkable half — which tickets have a commit claiming them. It cannot see nuance, so **this file is authoritative** for anything a commit subject does not capture: partly finished tickets, external blockers, and what is safe to start next.
 
-**Last updated:** 2026-08-20, on **`ship-15ar-demo-rescope`** — a scope pass, and the first in this
+**Last updated:** 2026-08-30, on **`ship-15av-owed-backlog-rows`** — a pass that writes the two rows
+§6 has recorded as owed for eleven consecutive passes and nobody has written. `Docs/09` gains
+**SHIP-155a**, which creates the reports SHIP-156's queue exists to list, and **X-13**, which procures
+the observability account SHIP-174 needs. **It closes no ticket, it adds no §3 entry, and it takes no
+decision that was the owner's** — §1 has the arithmetic and §6 has what it does to the board, which is
+that the startable set gains a code row for the first time since SHIP-186 closed.
+
+**This line itself was ten days and four passes stale when the pass opened, which is the same class of
+drift as everything else this file catches and the first instance of it in this file's own header.**
+`git blame` puts it at `eb8a11e`, 2026-08-20, on `ship-15ar-demo-rescope`; four commits have edited
+the file since — `e164201`, `da0d068`, `94459fc` and `5559b68` — and every one of them maintained §1
+and left the header saying a different branch and an older date. **Nothing reads this line**, which is
+exactly why it drifted: `make status` parses §3 and `Docs/11-done.txt` and never looks at the top of
+the file, so a stale header fails no gate and misdirects only a person. That is `Docs/09`'s
+hand-maintained-header failure in a second file, and the answer is the same — **whoever edits §1
+moves this line in the same change.**
+
+**The pass beneath it:** 2026-08-20, on **`ship-15ar-demo-rescope`** — a scope pass, and the first in this
 file's history that changes where the work is *going* rather than reporting where it is. `Docs/01`
 §8 now carries **two gates**: a demonstration a prospective buyer can drive unaided, in front of the
 pilot release that was always the target. `Docs/09` gains **M8** — six rows, nineteen points — and
@@ -89,22 +106,36 @@ question.
 | | Tickets | Points |
 |---|---|---|
 | **Done** | 225 | 702 |
-| Remaining | 40 | 129 |
-| **Total** | 265 | 831 |
+| Remaining | 42 | 134 |
+| **Total** | 267 | 836 |
 
-**Measured on `ship-186-demo-seed-dataset`, whose base is `develop` at `3f9b8af`.** `make status` on
-this branch prints **225 / 265 and 702 / 831** with both guards green, and the figures above were read
-off that run rather than added up beside it.
+**Measured on `ship-15av-owed-backlog-rows`, whose base is `develop` at `b75325a`.** `make status` on
+this branch prints **225 / 267 and 702 / 836** with both guards green, and the figures above were read
+off that run rather than added up beside it. **The done column does not move**: this pass closes no
+ticket, and the denominator moved because two rows were added.
 
-**The movement is SHIP-186, and it is the demonstration's content rather than its plumbing.** M8 goes
-to **8 of 12**; the totals move 224 → **225** and 697 → **702**. `make seed` populates a marketplace by
-driving the public API — the shape was chosen by the schema rather than by preference, and §3 carries
-the argument and the four things the run found that no reading would have.
+**The movement is the two rows §6 has been owed for eleven passes, and writing them is the whole of
+the pass.** `Docs/09` goes 265 → **267** tickets and 831 → **836** points; Track X goes to **13 rows**
+and M6 to **23**. **SHIP-155a** creates the reports SHIP-156's queue was written to list, and
+**X-13** procures the observability account SHIP-174 needs. Neither is new scope — both are
+prerequisites the plan assumed and never wrote down.
 
-**It empties §6's startable set again, one pass after X-5 filled it.** SHIP-186 was the only startable
-code row in the backlog for exactly one pass. Every remaining row now waits on a decision, and **four
-of the five are the owner's to take rather than a third party's to grant** — X-10 needs nobody outside
-the building, and SHIP-156 and SHIP-174 need a `Docs/09` row that does not exist.
+**It also refills §6's startable set with a code row, which was not the objective and is the more
+useful outcome.** SHIP-155a's only dependency is SHIP-97, which landed in wave 4, so **the moment the
+row exists it is startable** — 3 points, no Track-X edge, and the first code row on the board since
+SHIP-186 closed. **That is the argument for writing an owed row rather than carrying its strike, stated
+as a measurement rather than as a principle**: the work was startable the whole time and no instrument
+here could say so, because a parser over the dependency column cannot report a ticket nobody wrote.
+
+**What this changes about the strikes is their kind, not their number.** SHIP-156 and SHIP-174 are
+still not startable and both still show struck below — but each is now struck by **a row with an ID**
+rather than by a sentence in this file. `make status` counts them among the 42 remaining exactly as
+before; the difference is that a person can now be handed X-13, and SHIP-155a can be built.
+
+**What this pass did *not* do is take a decision that was the owner's.** X-13 procures an account and
+names no plan or spend; SHIP-155a specifies a table and an endpoint and leaves the reason list to the
+migration that writes it, on 000800's precedent. **The four decisions in §9 and the five in §5 are
+untouched.**
 
 **The gate that caught this pass's own mistake was `Docs/11-done.txt`.** The commit landed, `make
 status` exited 1 naming SHIP-186 as *landed in git but not in Docs/11-done.txt*, and the totals above
@@ -17358,6 +17389,7 @@ what changed is how much of it is in the way of anything anybody is building nex
 | **X-10** Firebase project | SHIP-144, 145, 146 | Still binds, needs no third party, and its Android half can be done today |
 | **X-11** Demonstration hostname | SHIP-188, 189, 190, 191, 202 | **Binds hardest of anything here.** 15 points and the whole demonstration chain, for a registrar and three DNS records |
 | **X-12** Maps project and keys | SHIP-193 to 199 | **Newly binding, and it changed reason rather than state.** SHIP-192 built the transport seam in wave 21, so 26 points of M9 now wait on a key rather than on unwritten code |
+| **X-13** Observability account | SHIP-174, and SHIP-175 to 177 and 184 behind it | **Written this pass and deferred on arrival**, which is the honest state rather than a contradiction: nothing in the demo gate reads a dashboard. It exists so that 10 points of M7 are blocked on a row somebody can be handed instead of on a strike in §6 |
 
 **None of those five rows is cancelled and none should be closed.** They are deferred, they still
 gate the pilot exactly as written, and the day a buyer wants a store listing they bind again on the
@@ -17392,7 +17424,12 @@ indistinguishable from one that was finished**, and that is the whole reason §4
 
 ### The pilot table, unchanged
 
-**Track X is ten tickets now and one of them is closed.** X-6 was decided in wave 9 and is in the done list; the other nine have not started, none of them is code, and all of them are slow.
+**Track X is thirteen tickets now and three of them are closed.** X-5, X-6 and X-9 are in the done
+list — `make status` prints **X 3 / 13** — and the other ten have not started, none of them is code,
+and all of them are slow. **The sentence this replaces read "ten tickets now and one of them is
+closed" and was two rows and two closures out of date**, having survived X-11, X-12, X-5's closure
+and X-9's reduced-form closure without being recounted. It is the §1-and-header failure a third
+time in one file: a hand-maintained count beside a table that is the truth.
 
 | Ticket | Gates |
 |---|---|
@@ -17408,6 +17445,7 @@ indistinguishable from one that was finished**, and that is the whole reason §4
 | **X-11** Demonstration hostname | SHIP-188, SHIP-189, SHIP-202 directly; SHIP-190 and SHIP-191 behind them. **15 points, the largest set any open Track X row gates** |
 | **X-12** Maps project and two API keys | SHIP-193 and SHIP-197 directly; SHIP-194 to 199 behind them. **26 points, and binding only since wave 21** |
 | **X-10** Firebase project and push credentials | **SHIP-144, SHIP-145** — both declare the edge in `Docs/09` — and the unmet half of **SHIP-139** and **SHIP-143**, which are done in reduced form (§4) |
+| **X-13** Observability account and ingestion credential | **SHIP-174** declares the edge; SHIP-175, SHIP-176, SHIP-177 and SHIP-184 sit behind it and declare none of their own. **10 points, and it is the cheapest row on this table at 2** |
 
 **X-1 → X-2 is the longest pole in the entire plan.** Apple's organisational enrolment commonly takes one to two weeks *after* a D-U-N-S number issues, and obtaining one that does not exist adds more. Every other M0 ticket proceeds without it, so starting costs nothing and waiting costs weeks of finished code with nowhere to put it.
 
@@ -17418,6 +17456,16 @@ X-5 needs no third party at all — it is a decision somebody can make this week
 **The set behind X-10 is four rows and not five, and the correction matters because the wrong figure is written in §3.** A wave-10 lane's §3 paragraph says *"SHIP-139, SHIP-140, SHIP-143, SHIP-144 and SHIP-145 all sit behind a project no row anywhere asks anybody to create"*, and §4 — which is the section that decides this — lists **SHIP-139 and SHIP-143 only**. Re-read against the backlog on `4fd7fd5`: **SHIP-140 is not in the category.** Its *Done when* is *"tokens bind to a device session and clear on sign-out"*, which is a platform property the tables and the endpoints demonstrate whatever string a device registers; whoever supplies a real token is SHIP-143's business and it is already declared reduced. **A ticket named in a neighbouring sentence is not a ticket in the category**, and §3 is a lane's to correct rather than this pass's, so the correction is recorded here.
 
 **The test that would have caught it, stated so the next one is cheaper: for every external service in `Docs/06`'s stack table, name the Track-X row that procures it.** Datadog has none either — SHIP-174 is struck in §6 for exactly that, and the strike is doing the work an X row would do more honestly. AWS has none. The others are either local (PostgreSQL, Redis, Kafka, MinIO) or already covered.
+
+**The test was run again this pass and it has now paid for itself twice.** Datadog's row exists:
+**X-13**, written on this branch, and SHIP-174 declares the edge. **AWS still has none and
+deliberately does not get one**, which is the distinction the test does not itself draw and which is
+worth writing down beside it: `Docs/06` names AWS as the *pilot's* deployment target, and nothing open
+depends on an account. SHIP-188's criterion is a hostname with HTTPS over it, not a vendor, so a row
+procuring AWS would gate nothing and would read as a hosting decision the demonstration had taken.
+**A row that gates nothing is not the same kind of object as a row that gates ten points**, and adding
+one for symmetry would put a fictitious blocker on the board — the opposite of the failure the test
+exists to catch. Whichever pilot row first cannot be built without it is the row that names it.
 
 ### X-12 became binding without moving, and no instrument here reports that event
 
@@ -17504,15 +17552,18 @@ still governs the next proposal: §9 has the entry, the two measured blockers an
 
 ## 6. Ready to start now
 
-**Recomputed on `ship-15au-status-gate-and-reconciliation` over `develop` at `8f553cd`**, by the
-same discipline every pass here uses: a parser over `Docs/09`'s dependency column and
-`Docs/11-done.txt` that reproduced `make status` cell for cell — 265 rows, 831 points, 224 done,
-697 points, and all eleven milestone denominators — before a figure below was written.
+**Recomputed on `ship-15av-owed-backlog-rows` over `develop` at `b75325a`**, by the same discipline
+every pass here uses: a parser over `Docs/09`'s dependency column and `Docs/11-done.txt` that
+reproduced `make status` cell for cell — 267 rows, 836 points, 225 done, 702 points, and all eleven
+milestone denominators — before a figure below was written. It also re-derived the forward-edge count
+`Docs/09`'s header maintains by hand: **still exactly ten**, unmoved by either new row, as that
+header predicts for an edge into Track X and as `SHIP-156 → SHIP-155a` satisfies by sorting.
 
-**Eleven rows have every dependency met: 34 points, and none of them is a code row.** The twelfth was
-SHIP-186, which was the one startable code row for exactly one pass and is now done — §3 has it. The set
-is back to what it was before X-5 closed: **every remaining row waits on a decision, and four of the five
-decisions are somebody's to take rather than a third party's to grant.**
+**Eleven rows have every dependency met: 33 points, and one of them is a code row.** The count is
+unchanged and the set is not — two rows left it and two joined. **SHIP-156 and SHIP-174 left**,
+because each now declares a dependency that is open; **SHIP-155a and X-13 joined**, because they were
+written this pass. That is the mechanism working rather than the board moving: nothing was built, and
+a row that was startable all along is now visible as startable.
 
 | Ticket | Pts | Area | In scope for the demonstration? |
 |---|---|---|---|
@@ -17520,10 +17571,12 @@ decisions are somebody's to take rather than a third party's to grant.**
 | **X-12** | 3 | Maps project and its two API keys. Needs a card and a billing account with a budget alert, no third-party approval. **Releases 26 points**, the largest set behind any Track X row | No — and §5 says why the demo does not need it |
 | **X-10** | 3 | Firebase project. No third party; the Android half is an hour. Releases SHIP-144, 145, 146 at 10 points | Yes — but nothing in the demo gate walks a push |
 | **X-4** | 3 | Legal brief | Only through SHIP-172 now. X-9 was taken in reduced form at `c89fa0e`, and X-7 and X-8 stopped binding at the re-scope. §5 |
+| **X-13** | 2 | **New this pass.** Observability account and its ingestion credential. No third party beyond a signup and a card; releases SHIP-174 and, behind it, SHIP-175, 176, 177 and 184 at 10 points | No — nothing in the demo gate reads a dashboard |
 | **X-1, X-3** | 4 | D-U-N-S, Play Console | **Deferred.** Nothing is being published to a store |
-| ~~SHIP-156~~ | 3 | **Strike carried, eleventh consecutive pass, re-measured again this time.** No `reports` table in any migration, no report route on `routes_golden.txt`, no `Docs/09` row that builds one — the two migration files matching `reports` are both the verb in a comment. Blocked *internally* — a gap in the plan, not a dependency. **It is also the whole of M6's remainder**, which is worth saying because a milestone at 21 of 22 reads as nearly finished and this row has no owner | Deferred |
+| **SHIP-155a** | 3 | **New this pass, and the only startable code row on the board.** A party to a job reports the job or one message on it. Its single dependency, SHIP-97, landed in wave 4, so it has been buildable for seventeen waves and was invisible because nobody had written the row. Touches `internal/admin` and migration block 800–899 alone | No — but it is the row that makes SHIP-156 buildable, and it needs no decision from anybody |
+| ~~SHIP-156~~ | 3 | **The strike is discharged and the row is not startable, which are different things.** Eleven passes recorded "no `Docs/09` row builds a report"; SHIP-155a now does, so SHIP-156 is blocked on an open ticket like any other row rather than on a gap in the plan. **It stops being M6's whole remainder** — M6 is 21 of 23, and the two open rows are a chain | Deferred |
 | ~~SHIP-172~~ | 5 | Struck by X-4, which no parser can see. **The only code row X-4 still gates**; SHIP-159 and SHIP-171 both discharged theirs. §5 | Deferred |
-| ~~SHIP-174~~ | 3 | Struck — needs a Datadog account, and no Track-X row procures one. **Eleven passes and still no row**, which is the X-10 shape this file has now recorded four times | Deferred |
+| ~~SHIP-174~~ | 3 | **Strike discharged the same way.** It needed a Datadog account and no Track-X row procured one; **X-13 does**, and SHIP-174 declares the edge. Twelve passes from first record to row | Deferred |
 | ~~SHIP-178~~ | 3 | Struck — needs store-console access, which is X-2 and X-3, both deferred | Deferred |
 | ~~SHIP-182~~ | 5 | The strike lifted when SHIP-188 was specified and the ticket stays deferred. A demonstration does not need a restore rehearsal | Deferred |
 
@@ -17535,14 +17588,30 @@ lost is the one that matters to whoever picks the work up — *blocked on a thir
 a decision the owner can take in a minute* are not the same state, and this table now separates them
 in its last column rather than in prose underneath.
 
-**Three of the five strikes are the same shape and it is worth naming once.** SHIP-156 needs a
-`reports` table nobody has specified, SHIP-174 needs a Datadog account no row procures, and SHIP-178
-needs a store console. **Only the third of those is blocked on a Track X row that exists.** The other
-two are struck against nothing at all — no ticket, no owner, no date — which means `make status`
-counts them among the 41 remaining and no instrument here will ever report them as stalled. This file
-has recorded that shape four times under other names (X-10, X-11, X-12, and `SHIP-159 → X-4`), and
-each time the answer was to write the row. **Two rows are still owed: the reports schema and the
-observability account.**
+**The two owed rows are written, and this is the paragraph that owed them.** It read, for five
+consecutive handoffs: *"Three of the five strikes are the same shape… SHIP-156 needs a `reports` table
+nobody has specified, SHIP-174 needs a Datadog account no row procures… struck against nothing at all
+— no ticket, no owner, no date… This file has recorded that shape four times under other names (X-10,
+X-11, X-12, and `SHIP-159 → X-4`), and each time the answer was to write the row. **Two rows are still
+owed: the reports schema and the observability account.**"* Both now exist — **SHIP-155a** and
+**X-13** — and SHIP-178 is unchanged, still struck by X-2 and X-3, which is the one of the three that
+was always blocked on a row that existed.
+
+**What that cost, measured, is the argument for doing it sooner next time.** Two rows, 5 points, and
+about an hour of reading — against **eleven passes** in which SHIP-156's strike was re-measured
+correctly and could not be acted on, and **twelve** for SHIP-174's. The measurements were never the
+problem. **A strike is a note a person has to read and believe; a row is an object `make status`
+counts, a dependency column points at, and a parser can report.** SHIP-155a proves the difference in
+one figure: it has been buildable since wave 4, and the instant it was written the startable set could
+see it.
+
+**The shape has now been recorded six times and closed six times, so state the rule rather than the
+sixth instance.** X-10, X-11, X-12, `SHIP-159 → X-4`, SHIP-155a and X-13 were each a prerequisite the
+plan assumed and never wrote down, each invisible to every instrument here for the same reason —
+**`make status` counts rows, `make verify` exercises endpoints, and neither can report a thing that is
+missing from the plan itself.** The rule: **when a strike in this section names something that does
+not exist, the pass that notices writes the row.** Carrying it forward is the failure, and carrying it
+forward *with a correct measurement attached* is the failure that looks most like diligence.
 
 **The handoff also carried `SHIP-159` as blocked on X-4, and SHIP-159 is done.** It is in
 `Docs/11-done.txt` and shipped in wave 15 with `admin.ExpiryQueue.LeadTimes` honouring the design
@@ -17593,6 +17662,15 @@ plus 17 is 75, and 183 less 70 less 38 is 75 — the two roads meet only once th
 **SHIP-63 is still the single row that matters most** — 5 points, and until it exists no job reaches
 `Open`, no provider sees one, and none of the 208 finished tickets can be reached through the
 product at all.
+
+**The 75 above is unchanged by this pass and the two figures beside it are not, which is worth one
+sentence so nobody tries to reconcile them.** SHIP-155a and X-13 are both **out of demonstration
+scope** — a moderation endpoint and an observability account, neither on `Docs/01` §8's gate — so the
+in-scope total stays at 75. What moved is the board the subtraction starts from: the derivation above
+begins at *"57 open rows at 183 points"*, measured on the tree that wrote it, and the same quantity on
+`b75325a` plus this branch is **42 open rows at 134 points**. **Both are right for their own tree and
+neither is the other's replacement**, which is precisely why the figures in this file name the ref they
+were measured on.
 
 ### What this section said before the re-scope, kept for its reasoning
 
