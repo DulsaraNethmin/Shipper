@@ -71,6 +71,7 @@ type Handler struct {
 	expiry        *ExpiryQueue
 	disputes      *DisputeWorkflow
 	reports       *Reports
+	reportQueue   *ReportQueue
 	pool          *pgxpool.Pool
 	log           *slog.Logger
 }
@@ -151,6 +152,15 @@ type HandlerServices struct {
 	// both would need the [Jobs] port for one half of its work, and the whole point of
 	// [NewReports] taking no such port is that a report *cannot* move a status.
 	Reports *Reports
+
+	// ReportQueue is Docs/04 §5's second moderation queue, from the reading end (SHIP-156).
+	//
+	// **Beside [Reports] rather than folded into it**, and for the reason [DisputeWorkflow] sits
+	// beside [Disputes]: they are the same document's stages on opposite credentials. Folding
+	// them together would also put two ports over `jobs` and `job_messages` onto the intake
+	// service, and the enforcement that a report *cannot* move a job status is precisely that
+	// [Reports] holds nothing it could move one with.
+	ReportQueue *ReportQueue
 }
 
 // NewHandler wires the handlers to the services.
@@ -255,6 +265,14 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// nobody having anything to report.
 		return nil, errors.New("admin: a handler needs the report intake service")
 	}
+	if s.ReportQueue == nil {
+		// SHIP-156. The same argument once more, and here it guards the *reading* end of the
+		// queue the check above guards the producer of: a nil discovered at the first request
+		// is a console that cannot open Docs/04 §5's second queue at all, which — because
+		// nothing else in the console lists a report — is indistinguishable from nobody
+		// having reported anything.
+		return nil, errors.New("admin: a handler needs the report queue service")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
@@ -274,6 +292,7 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		expiry:        s.Expiry,
 		disputes:      s.DisputeWorkflow,
 		reports:       s.Reports,
+		reportQueue:   s.ReportQueue,
 		pool:          pool,
 		log:           log,
 	}, nil
@@ -992,6 +1011,16 @@ func apiError(err error) error {
 	case errors.Is(err, ErrDisputeStateUnrecognised):
 		return fieldProblem("state", fmt.Errorf(
 			"that is not a dispute queue; use one of %s", strings.Join(disputeStateNames(), ", ")))
+
+	// --- Docs/04 §5's second moderation queue, from the reading end (SHIP-156) ----------------
+
+	case errors.Is(err, ErrReportNotFound):
+		// Disclosed plainly, like the three 404s above and unlike the one on report intake: the
+		// caller holds `moderation.read` over every report on the platform, and the
+		// indistinguishability intake needs is a rule about strangers rather than about the
+		// console.
+		return httpx.NewError(http.StatusNotFound, httpx.CodeNotFound,
+			"No such report.").WithCause(err)
 
 	case errors.Is(err, ErrAdminUnavailable):
 		// 503 rather than 500: a dependency is not answering, and retrying is the right
@@ -4142,6 +4171,343 @@ func disputeIDFrom(r *http.Request) (uuid.UUID, error) {
 	if err != nil {
 		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
 			"The dispute id in the path is not a valid identifier.").WithCause(err)
+	}
+	return id, nil
+}
+
+// --- SHIP-156: the reported jobs and messages queue ----------------------------------------------
+
+// reportEntryResponse is one report as the queue shows it.
+//
+// **Every field is always present**, `message_id` included, which is `disputeSummaryResponse`'s
+// arrangement and the opposite of `reportResponse`'s next door. The two are answering different
+// clients: intake replies to the reporter's own app, where an absent `message_id` and an empty one
+// say the same thing and `omitempty` keeps the payload honest about what was sent. A console renders
+// a table, and a key that is sometimes there is a column that sometimes exists.
+//
+// **No description**, which [ReportEntry] makes structural: there is nowhere on the struct behind
+// this to put one, so no change to this mapping can acquire it. **Nothing commercial**, on
+// Docs/01 §4.3 — and held to its key set by TestTheReportQueueShapeCarriesNothingCommercial.
+type reportEntryResponse struct {
+	// ID is the report, and what the detail endpoint's path names.
+	ID string `json:"id"`
+
+	// JobID is the job reported, or the job the reported message is on. **Not unique on this
+	// queue**: a job may carry any number of reports (`000805`).
+	JobID string `json:"job_id"`
+
+	// JobStatus is where that job is now, for triage — Docs/02 §1's stored form. A report on an
+	// open listing is a different urgency from one on a delivery that finished a fortnight ago.
+	JobStatus string `json:"job_status"`
+
+	// SubjectType is `job` or `message`. Clients branch on this rather than on whether
+	// `message_id` is empty.
+	SubjectType string `json:"subject_type"`
+
+	// MessageID is the reported message, or an empty string on a report about the job itself.
+	MessageID string `json:"message_id"`
+
+	// ReporterID is the account that reported it, and ReporterParty is which side of *this job*
+	// they were on — resolved by the platform at intake from the job and its accepted bid, not
+	// their account role.
+	ReporterID    string `json:"reporter_id"`
+	ReporterParty string `json:"reporter_party"`
+
+	Reason string `json:"reason"`
+
+	// RaisedAt is the platform's clock and the only instant a report holds. What the queue is
+	// ordered by, and what Docs/04 §8's acknowledgement target is measured from.
+	RaisedAt string `json:"raised_at"`
+}
+
+func reportEntryFrom(e ReportEntry) reportEntryResponse {
+	messageID := ""
+	if e.Subject == ReportSubjectMessage {
+		messageID = e.MessageID.String()
+	}
+
+	return reportEntryResponse{
+		ID:            e.ID.String(),
+		JobID:         e.JobID.String(),
+		JobStatus:     e.JobStatus,
+		SubjectType:   e.Subject.String(),
+		MessageID:     messageID,
+		ReporterID:    e.ReporterID.String(),
+		ReporterParty: string(e.ReporterParty),
+		Reason:        e.Reason.Wire(),
+		RaisedAt:      timestamp(e.RaisedAt),
+	}
+}
+
+// ReportQueue handles GET /v1/admin/reports (SHIP-156).
+//
+// Docs/04 §5's **second** moderation queue — "reported jobs or messages" — and the first thing in
+// the console that can see what SHIP-155a has been recording. Nothing else lists a report:
+// `GET /v1/admin/jobs` searches jobs, which needs a moderator to already know which job to look at,
+// and this answers that question.
+//
+// **Oldest first**, like the verification queue and the open half of the dispute queue, because
+// Docs/04 §8 sets an acknowledgement target and the oldest entry is the one closest to breaching it.
+// The account and job searches are newest-first for the opposite reason: looking somebody up is not
+// a queue.
+//
+// **A path under `/admin` rather than under the job**, unlike intake. `routes_admin.go` drew the line
+// when it registered `POST /v1/jobs/{id}/reports`: that is a party reporting their own job, scoped to
+// the caller by construction, and this is every report on the platform, scoped to nothing.
+//
+// [PermissionModerationRead], which permissions.go has named SHIP-156 for since it was written and
+// which every administrator role holds — looking is what the least-privileged role exists to be able
+// to do. Acting on what is found is a different permission on a different endpoint (SHIP-160,
+// SHIP-161).
+func (h *Handler) ReportQueue() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionModerationRead); err != nil {
+			return err
+		}
+
+		query, err := reportQueryFrom(r)
+		if err != nil {
+			return err
+		}
+
+		// One more than asked for, so "is there another page" is answered by the rows rather
+		// than by a second COUNT — the arrangement every other paged read in this package uses.
+		query.Limit++
+
+		entries, err := h.reportQueue.Queue(r.Context(), query)
+		if err != nil {
+			return apiError(err)
+		}
+
+		var next string
+		if len(entries) == query.Limit {
+			last := entries[len(entries)-2]
+			next = pagination.Cursor{
+				timestamp(last.RaisedAt),
+				last.ID.String(),
+			}.Encode()
+			entries = entries[:len(entries)-1]
+		}
+
+		out := make([]reportEntryResponse, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, reportEntryFrom(e))
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, pagination.NewPage(out, next))
+		return nil
+	})
+}
+
+// reportQueryFrom reads the page parameters.
+//
+// **No filter to validate**, unlike [Handler.jobQueryFrom] and [disputeQueryFrom] — reportqueue.go's
+// header records why this queue has none.
+func reportQueryFrom(r *http.Request) (ReportQuery, error) {
+	values := r.URL.Query()
+
+	limit, err := pagination.Limit(values.Get("limit"))
+	if err != nil {
+		return ReportQuery{}, err
+	}
+
+	after, err := decodeReportCursor(values.Get("cursor"))
+	if err != nil {
+		return ReportQuery{}, err
+	}
+	return ReportQuery{Limit: limit, After: after}, nil
+}
+
+// decodeReportCursor reads the two fields this queue's ordering is total on.
+//
+// A cursor this endpoint did not issue is a 400 rather than an empty page: a client that sent one
+// has a bug, and answering "nothing here" would let it page for ever through a queue it never saw.
+func decodeReportCursor(raw string) (ReportCursor, error) {
+	if raw == "" {
+		return ReportCursor{}, nil
+	}
+
+	fields, err := pagination.Decode(raw, 2)
+	if err != nil {
+		return ReportCursor{}, err
+	}
+
+	raisedAt, err := time.Parse(time.RFC3339, fields[0])
+	if err != nil {
+		return ReportCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	id, err := uuid.Parse(fields[1])
+	if err != nil {
+		return ReportCursor{}, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"That cursor is not one this endpoint issued.").WithCause(err)
+	}
+
+	return ReportCursor{RaisedAt: raisedAt, ID: id}, nil
+}
+
+// reportedJobResponse is the job a report is about, as the report screen shows it.
+//
+// **No budget, and nowhere in this shape to put one** (Docs/01 §4.3) — [ReportedJob] carries none,
+// so this is structural rather than a discipline. **No addresses and no contact details** either,
+// per Docs/01 §5.1. What a moderator opens for the bids, the amounts and the status history is
+// `GET /v1/admin/jobs/{id}`, which is where [DisputeSummary] already recorded that decision belongs.
+type reportedJobResponse struct {
+	ID         string `json:"id"`
+	CustomerID string `json:"customer_id"`
+
+	// Status is Docs/02 §1's stored form.
+	Status string `json:"status"`
+
+	// GoodsDescription is the listing text — the thing a `misleading_listing` or
+	// `prohibited_goods` report is *about*. Always present; empty on a draft that never reached
+	// the details step (`000404`).
+	GoodsDescription string `json:"goods_description"`
+
+	CreatedAt string `json:"created_at"`
+}
+
+// conversationMessageResponse is one message on the job, as a moderator reads it.
+//
+// **No idempotency key**, which [ConversationMessage] makes structural: it is the sender's own value
+// and it identifies nothing a console can use.
+type conversationMessageResponse struct {
+	ID string `json:"id"`
+
+	// ProviderID is which negotiation this message belongs to — **the provider the conversation
+	// is with, not the author** (`000506`). A job carries one conversation per provider who bid,
+	// and this is what separates them.
+	ProviderID string `json:"provider_id"`
+
+	// SentBy is who wrote it, `customer` or `provider`. A different fact from `provider_id`: a
+	// customer's message in a negotiation carries the provider's identifier and `customer` here.
+	SentBy string `json:"sent_by"`
+
+	Body      string `json:"body"`
+	CreatedAt string `json:"created_at"`
+}
+
+// reportDetailResponse is one report with the job and the conversation it is about.
+//
+// **The idempotency key is not here and will not be**, for `AdminDisputeDetail`'s reason: it is the
+// reporter's own value coming back at somebody who did not send it, and a response carrying it
+// invites a reader to treat it as an identifier the platform issued. [Report.Key] is read from the
+// row and dropped here.
+type reportDetailResponse struct {
+	ID string `json:"id"`
+
+	SubjectType string `json:"subject_type"`
+
+	// MessageID is the reported message, or an empty string on a report about the job itself.
+	// Always present, for [reportEntryResponse]'s reason.
+	MessageID string `json:"message_id"`
+
+	ReporterID    string `json:"reporter_id"`
+	ReporterParty string `json:"reporter_party"`
+
+	Reason string `json:"reason"`
+
+	// Description is what the reporter wrote, as it was stored — trimmed, with its line breaks
+	// intact. This is the field the queue deliberately does not carry.
+	Description string `json:"description"`
+
+	RaisedAt string `json:"raised_at"`
+
+	// Job is what was reported, or what the reported message was said about.
+	Job reportedJobResponse `json:"job"`
+
+	// Conversation is every message on the job, oldest first within each negotiation — Docs/04 §6
+	// step 2's "communications". Always present; an empty array rather than `null` when nothing
+	// was said, which is ordinary.
+	Conversation []conversationMessageResponse `json:"conversation"`
+}
+
+func reportDetailFrom(d ReportDetail) reportDetailResponse {
+	messageID := ""
+	if d.Report.Subject == ReportSubjectMessage {
+		messageID = d.Report.MessageID.String()
+	}
+
+	conversation := make([]conversationMessageResponse, 0, len(d.Conversation))
+	for _, m := range d.Conversation {
+		conversation = append(conversation, conversationMessageResponse{
+			ID:         m.ID.String(),
+			ProviderID: m.ProviderID.String(),
+			SentBy:     m.SentBy,
+			Body:       m.Body,
+			CreatedAt:  timestamp(m.CreatedAt),
+		})
+	}
+
+	return reportDetailResponse{
+		ID: d.Report.ID.String(),
+
+		SubjectType: d.Report.Subject.String(),
+		MessageID:   messageID,
+
+		ReporterID:    d.Report.ReporterID.String(),
+		ReporterParty: string(d.Report.ReporterParty),
+
+		Reason:      d.Report.Reason.Wire(),
+		Description: d.Report.Description,
+
+		RaisedAt: timestamp(d.Report.CreatedAt),
+
+		Job: reportedJobResponse{
+			ID:               d.Job.ID.String(),
+			CustomerID:       d.Job.CustomerID.String(),
+			Status:           d.Job.Status,
+			GoodsDescription: d.Job.GoodsDescription,
+			CreatedAt:        timestamp(d.Job.CreatedAt),
+		},
+
+		Conversation: conversation,
+	}
+}
+
+// OpenReport handles GET /v1/admin/reports/{id} (SHIP-156).
+//
+// The *Done when*'s "with the job and conversation in context", and the endpoint the queue exists to
+// lead to. Docs/04 §6 step 2 is the sentence it serves: "review the affected job, user profile,
+// communications, and history" — the job and the communications are here, the profile is
+// `GET /v1/admin/users` and the history is `GET /v1/admin/jobs/{id}`.
+//
+// **The conversation is the whole job's rather than one negotiation's**, and [JobConversations]
+// argues why. The reported message, when there is one, is identified within it by `message_id`.
+//
+// [PermissionModerationRead], like the queue: this is the same screen opened.
+func (h *Handler) OpenReport() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := h.permitted(r, PermissionModerationRead); err != nil {
+			return err
+		}
+
+		reportID, err := reportIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		detail, err := h.reportQueue.Report(r.Context(), reportID)
+		if err != nil {
+			return apiError(err)
+		}
+
+		httpx.WriteJSON(w, http.StatusOK, reportDetailFrom(detail))
+		return nil
+	})
+}
+
+// reportIDFrom reads and parses the {id} path parameter on the report route.
+//
+// A sixth function beside [jobIDFrom], [userIDFrom], [reviewIDFrom], [providerIDFrom] and
+// [disputeIDFrom] rather than a shared one, for the reason userIDFrom records: the message names the
+// thing, and on this route the thing in the path is a report rather than the job it is about.
+func reportIDFrom(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		return uuid.Nil, httpx.NewError(http.StatusBadRequest, httpx.CodeBadRequest,
+			"The report id in the path is not a valid identifier.").WithCause(err)
 	}
 	return id, nil
 }

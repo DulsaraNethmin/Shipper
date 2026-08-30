@@ -113,6 +113,25 @@ var (
 	// rather than a reply that invents an answer.
 	ErrReportVanished = errors.New("admin: a report was refused as a duplicate of a row that is not there")
 
+	// ErrReportNotFound means there is no report with that identifier (SHIP-156).
+	//
+	// **Disclosed plainly, unlike intake's [ErrNotAParty]**, and the difference is who is asking.
+	// A stranger raising a report about somebody else's job gets one answer for "no such job" and
+	// "not your job", because telling them apart would confirm that the job exists. The caller
+	// here holds `moderation.read` over every report on the platform, and there is nothing being
+	// kept from them. [ErrDisputeNotFound] takes the same position for the same reason.
+	ErrReportNotFound = errors.New("admin: no such report")
+
+	// ErrReportedJobVanished means the [ReportedJobs] port answered without a job a report names
+	// (SHIP-156).
+	//
+	// Impossible rather than unlikely: `fk_reports_job` is ON DELETE RESTRICT (`000805`), so
+	// nothing in this platform can remove a job while a report points at it. It is here so that
+	// the impossible state becomes a 500 with a cause in the log rather than a queue entry
+	// carrying a blank status, which would read as a rendering fault and be looked for in the
+	// console. [ErrReportVanished] is the same treatment of the same kind of contradiction.
+	ErrReportedJobVanished = errors.New("admin: a report names a job the job lookup did not answer for")
+
 	// ErrNotInTransaction means a service method that writes two tables was handed a connection
 	// pool rather than a transaction.
 	//

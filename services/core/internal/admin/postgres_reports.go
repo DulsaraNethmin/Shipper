@@ -169,3 +169,120 @@ func (postgresStore) reportsOn(ctx context.Context, r db.Runner, jobID uuid.UUID
 	}
 	return reports, nil
 }
+
+// --- SHIP-156: the reported jobs and messages queue ----------------------------------------------
+
+// reportEntryColumns is every column of a queue entry, in the order [scanReportEntry] reads them.
+//
+// **Deliberately not [reportColumns].** The description is up to four thousand characters of
+// somebody setting out what is wrong, and a page of fifty is two hundred thousand of them that
+// nothing on a queue screen renders — [disputeSummaryColumns] made the same cut for the same reason.
+// It is structural as well as a saving: [ReportEntry] has nowhere to put a description, so widening
+// this list fails to compile rather than quietly making the queue heavy.
+//
+// `idempotency_key` is absent for a second reason that is not about size. It is the reporter's own
+// value, it identifies nothing an administrator can use, and a column read is the first step towards
+// a field on the wire.
+const reportEntryColumns = `
+	id, job_id, subject_type, message_id, reporter_id, reporter_party, reason, created_at`
+
+// reportQueue is Docs/04 §5's second moderation queue: every report, oldest first.
+//
+// # Oldest first, and the ordering is the document's
+//
+// Docs/04 §8 sets an acknowledgement target, so the oldest entry is the one closest to breaching it —
+// the same reasoning `idx_disputes_open` and the verification queue are both built on. This reads
+// `idx_reports_queue`, which `000805` created as `(created_at, id)` and which nothing read until this
+// ticket.
+//
+// **There is no predicate and no second statement**, unlike the dispute queue. That queue has two
+// halves because a dispute is open or settled and the two are ordered oppositely; a report has no
+// such state — `000805` records at length why there is no `resolved_at` and no status vocabulary on
+// this table — so there is one queue, one ordering and one index.
+//
+// # The cursor is the whole index key, which is why the tie-break is free
+//
+// `(created_at, id)` is exactly `idx_reports_queue`, so the row constructor is matched against the
+// index rather than served from the heap — the widening `000804` deliberately did not make to
+// `000800`'s index, made here at creation because this is a platform-wide queue rather than the
+// tens-of-rows read `admin_notes` gets.
+//
+// An absent cursor is passed as NULL rather than as a zero time, because `> (NULL, …)` is NULL
+// rather than true — the trap the dispute queue, the audit search and the account search all record.
+func (postgresStore) reportQueue(ctx context.Context, r db.Runner, q ReportQuery) ([]ReportEntry, error) {
+	const stmt = `
+		SELECT ` + reportEntryColumns + `
+		FROM reports
+		WHERE ($1::timestamptz IS NULL OR (created_at, id) > ($1, $2::uuid))
+		ORDER BY created_at ASC, id ASC
+		LIMIT $3`
+
+	var after, afterID any
+	if !q.After.Zero() {
+		after, afterID = q.After.RaisedAt.UTC(), q.After.ID
+	}
+
+	rows, err := r.Query(ctx, stmt, after, afterID, q.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("admin: reading the report queue: %w", err)
+	}
+	defer rows.Close()
+
+	entries := make([]ReportEntry, 0)
+	for rows.Next() {
+		entry, err := scanReportEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("admin: reading the report queue: %w", err)
+	}
+	return entries, nil
+}
+
+// scanReportEntry reads one row of [reportEntryColumns].
+//
+// [scanReport]'s arrangement and its reason: a column added to the list and not here is a scan
+// mismatch at the first call, which is the failure worth having.
+func scanReportEntry(row pgx.Row) (ReportEntry, error) {
+	var (
+		e         ReportEntry
+		messageID *uuid.UUID
+	)
+
+	if err := row.Scan(
+		&e.ID, &e.JobID, &e.Subject, &messageID, &e.ReporterID, &e.ReporterParty,
+		&e.Reason, &e.RaisedAt,
+	); err != nil {
+		return ReportEntry{}, fmt.Errorf("admin: reading a report queue entry: %w", err)
+	}
+
+	// NULL means what the zero value says: this report is about the job itself.
+	if messageID != nil {
+		e.MessageID = *messageID
+	}
+	return e, nil
+}
+
+// reportByID is one report with everything the reporter sent.
+//
+// found is false when there is no such report, which the caller turns into [ErrReportNotFound] —
+// disclosed plainly, unlike intake's 404, because the caller here is an administrator holding a
+// permission over the moderation queues. [postgresStore.disputeByID] takes the same position.
+func (postgresStore) reportByID(ctx context.Context, r db.Runner, reportID uuid.UUID) (Report, bool, error) {
+	const q = `
+		SELECT ` + reportColumns + `
+		FROM reports
+		WHERE id = $1`
+
+	rep, err := scanReport(r.QueryRow(ctx, q, reportID))
+	switch {
+	case errors.Is(err, db.ErrNoRows):
+		return Report{}, false, nil
+	case err != nil:
+		return Report{}, false, fmt.Errorf("admin: reading report %s: %w", reportID, err)
+	}
+	return rep, true, nil
+}

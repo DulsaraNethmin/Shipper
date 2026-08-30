@@ -163,6 +163,15 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		t.Fatalf("building the dispute workflow: %v", err)
 	}
 
+	// SHIP-156. The real lookups over `jobs` and `job_messages`, on the same reasoning as the
+	// two above: what the queue is *for* is showing a report beside the job and the conversation
+	// it is about, and a double would prove that `admin` reads its own table and nothing about
+	// whether the context it renders belongs to the right job.
+	reportQueue, err := NewReportQueue(testReportedJobs{}, testMessages{}, pool)
+	if err != nil {
+		t.Fatalf("building the report queue: %v", err)
+	}
+
 	return HandlerServices{
 		Disputes:      testDisputeService(t),
 		Credentials:   creds,
@@ -184,6 +193,11 @@ func testServices(t *testing.T, creds *Credentials, pool *pgxpool.Pool, clk cloc
 		// what intake refuses is read out of `jobs`, `bids` and `job_messages`, so a stub would
 		// prove that `admin` writes a row and nothing about who was allowed to.
 		Reports: NewReports(testParties{}, testMessages{}),
+
+		// SHIP-156. `testMessages` is handed to both, which is exactly what cmd/api does with
+		// jobMessageLookup — one adapter, two interfaces, and intake holding it through the
+		// narrow one so it cannot read a conversation.
+		ReportQueue: reportQueue,
 	}
 }
 

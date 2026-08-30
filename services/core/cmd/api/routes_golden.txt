@@ -14,6 +14,8 @@ GET    /v1/admin/moderation/exceptions          admin        read         v1
 GET    /v1/admin/moderation/expiring-documents  admin        read         v1
 GET    /v1/admin/notes                          admin        read         v1
 POST   /v1/admin/notes                          admin        write        v1
+GET    /v1/admin/reports                        admin        read         v1
+GET    /v1/admin/reports/{id}                   admin        read         v1
 POST   /v1/admin/sessions                       public       credential   v1
 DELETE /v1/admin/sessions/current               admin        write        v1
 GET    /v1/admin/suspensions                    admin        read         v1
