@@ -10,9 +10,10 @@
 
 `make status` prints the machine-checkable half — which tickets have a commit claiming them. It cannot see nuance, so **this file is authoritative** for anything a commit subject does not capture: partly finished tickets, external blockers, and what is safe to start next.
 
-**Last updated:** 2026-08-30, on **`ship-155a-report-intake`** — the pass that builds the
-first of the two rows the pass before it wrote. `SHIP-155a` is closed: a party to a job can
-report the job or one message on it, and SHIP-156 now has something to list.
+**Last updated:** 2026-08-30, on **`ship-156-report-queue`** — the pass that builds the second
+of the two rows, one pass after the first. `SHIP-156` is closed: an administrator can open
+`Docs/04` §5's second moderation queue and read a report beside the job and the conversation it is
+about. **M6 is complete at 23 / 23.**
 
 **This line itself was ten days and four passes stale when the pass opened, which is the same class of
 drift as everything else this file catches and the first instance of it in this file's own header.**
@@ -102,42 +103,86 @@ question.
 
 | | Tickets | Points |
 |---|---|---|
-| **Done** | 226 | 705 |
-| Remaining | 41 | 131 |
+| **Done** | 227 | 708 |
+| Remaining | 40 | 128 |
 | **Total** | 267 | 836 |
 
-**Measured on `ship-155a-report-intake`, whose base is `develop` at `7f03d12`.** `make status` on
-this branch prints **226 / 267 and 705 / 836** with both guards green, and the figures above were read
-off that run rather than added up beside it. **The denominator does not move**: this pass adds no row,
-and closes exactly one — `SHIP-155a`, at 3 points, which takes M6 to **22 / 23**.
+**Measured on `ship-156-report-queue`, whose base is `develop` at `4ab2591`.** `make status` on this
+branch prints **227 / 267 and 708 / 836** with both guards green, and the figures above were read off
+that run rather than added up beside it. A parser over `Docs/09`'s dependency column and
+`Docs/11-done.txt`, written for this pass, reproduces it cell for cell — 267 rows, 836 points, 227
+done, 708 points, and all eleven milestone denominators — before anything below was written. **The
+denominator does not move**: this pass adds no row, and closes exactly one — `SHIP-156`, at 3 points.
 
-**This is the row the pass before it wrote, built on the next pass, and the gap between the two is
-the argument for writing an owed row.** `SHIP-155a`'s only dependency is SHIP-97, which landed in
-wave 4 — so the work had been buildable for seventeen waves and was invisible because nobody had
-written the row down. It was written on 30 August and built on 30 August. **Eleven passes had
-re-measured the strike it discharges** and none of them could act on it.
+**M6 is complete: 23 / 23.** The fifth milestone to close, after M1, M2, M3 and M4 — read off the
+same `make status` run, not counted by hand. Nothing in M6 is partly done and nothing in it is
+blocked. **Which wave closed the four before it is deliberately not stated here**, because this pass
+did not measure it and a figure nobody measured is how §1 has gone wrong four times.
 
-**What it produces is a table nothing had: `reports` (`000805`).** `POST /v1/jobs/{id}/reports` lets
-the customer who owns a job, or the provider whose bid was accepted, report the job's listing or one
-message on the conversation — with a reason from a closed list and a description. SHIP-156's queue
-now has a producer.
+**Both halves of Docs/04 §5's second moderation queue now exist, and they were written one pass
+apart after eleven passes of neither.** SHIP-155a built the producer on 30 August and this built the
+reader on 30 August. The strike that named the gap had been re-measured correctly for eleven
+consecutive passes and was actionable on none of them, because what it named — a table that creates
+reports — existed in no row. Writing the row cost one pass; carrying the strike cost eleven.
 
-**The modelling decision worth carrying forward is that a report moves no job status.** `Docs/02` §2
-has no transition for one and `Docs/04` §6 puts the outcome in an administrator's hands, so raising a
-report changes nothing about the job. That is the one place this departs from `disputes` (`000800`),
-which freezes the job deliberately — and the reason is that **a report that froze a job would hand
-either party a unilateral freeze over the other's delivery, on their own say-so**. It is enforced
-rather than intended: `admin.Reports` holds no `Jobs` collaborator, so there is nothing it could move
-a status with.
+**The finding this pass produces is about the board rather than the code, and it is the one to carry
+forward: there is now no unstruck code row anybody can start.** §6 re-derives the startable set at
+**ten rows and 30 points**, down from eleven and 33 — SHIP-156 left it by being built and *nothing
+joined*, so the set shrank rather than moving along the chain the way it did last pass. Seven of the
+ten are
+Track X. Of the three code rows, two are struck by a third party (SHIP-172 behind X-4's legal brief,
+SHIP-178 behind the store consoles) and the third, SHIP-182, is deferred by a scope decision the
+owner has already taken.
+
+**That sentence has been wrong here before and this time it is measured.** §6 recorded an empty
+startable set for four passes when it was six rows, and the wave-21 handoff's "every remaining code
+row waits on a Track-X decision" was wrong about SHIP-186, which waited on X-5 and needed nobody
+outside this building. So the claim above is stated as three named rows with their strikes re-read
+against `Docs/09` today — line 744 for SHIP-172, and X-4's own row, which has an empty dependency
+column and is therefore startable itself.
+
+**What SHIP-156 serves is two endpoints rather than one, and the split is where the weight is.**
+`GET /v1/admin/reports` is the queue, oldest first over `idx_reports_queue` — the index `000805`
+created with a `(created_at, id)` tie-break for exactly this cursor, and which nothing read until
+now. `GET /v1/admin/reports/{id}` is the report opened, with the job and the conversation. A single
+endpoint carrying the conversation on every entry would be fifty negotiations assembled to render a
+list somebody scans; `AdminDisputes` beside `AdminDispute` made the same split for the same reason.
+
+**The decision worth carrying forward is that the conversation is the whole job's, and is returned
+for a report about the job as readily as one about a message.** `job_messages` is keyed
+`(job_id, provider_id)` (`000506`), so a job carries one conversation per provider who bid. Scoping
+the read to the reported message's own negotiation would answer well for a message report and answer
+*nothing* for a report about the listing — which is the majority kind, and the one whose reporter has
+most likely been *told* something rather than read something. `Docs/04` §6 step 2 asks a reviewer to
+read the communications on every review, and this is that sentence taken literally.
 
 ## 2. Branch state
 
 | Branch | At | Holds |
 |---|---|---|
 | `main` | PR #19 | **Wave 1, released 11 August 2026.** Now well behind `develop` |
-| `develop` | wave 21 merged, at `8f553cd` | Everything below. **Cut new branches from here** |
+| `develop` | at `4ab2591` | Everything below. **Cut new branches from here** |
 
-**`develop` is 568 commits ahead of `main` at `8f553cd`, and holds twenty-one waves.** The other two
+**`develop` is 582 commits ahead of `main` at `4ab2591`.** The other two readings, measured on that
+ref by this pass rather than adjusted from the figures below: `--first-parent` **133**, `--no-merges`
+**446**. `origin/develop` points at `4ab2591` too, so `develop` is **0 ahead of its remote** and the
+owner's gate has been taken on everything in it.
+
+**Four first-parent merges have landed since `8f553cd`, and no direct commit on `develop`.**
+`git rev-list --count --first-parent --no-merges 8f553cd..develop` returns **0**; the first-parent
+delta is 133 − 129 = **4**. **The rest of this section still describes the tree at `8f553cd` and is
+not rewritten here.** This pass was scoped to one ticket, §1, §3 and §6; a reconciliation is what
+re-derives the wave narrative, and rewriting it around four merges nobody has written up would put a
+story where a measurement belongs. **Do not read the paragraphs below as current** — their figures
+are `8f553cd`'s and say so.
+
+**The release check below was run on `8f553cd` and this pass did not re-run it.** Every commit on
+either branch changes it, and four have landed since — so re-run the pair immediately before cutting
+the release rather than reading the hashes as still true.
+
+### At `8f553cd`, when wave 21 was the tip
+
+**`develop` was 568 commits ahead of `main` at `8f553cd`, and held twenty-one waves.** The other two
 readings, re-measured on that ref rather than adjusted: `--first-parent` **129**, `--no-merges`
 **436**.
 
@@ -808,6 +853,7 @@ The file's own header says which invocation demonstrates which claim.
 | **SHIP-136** | M5 | Nine domain events from `bidding` and `delivery`, declared in each domain's own `events.go` with **no edit to `internal/events`** — the seam SHIP-135 left, used as intended. `shipper.bid` and `shipper.delivery` carry traffic for the first time. The delivery events exist because **the job's status does not carry everything `Docs/01` §4.4 asks an actor to record**: an absorbed late milestone moves nothing and so emitted nothing at all before this. Two of §4.5's six lines cannot be met and are **named rather than narrowed away** — *see below* |
 | **SHIP-149** | M6 | `audit_log`, append-only enforced by trigger — *see §4* |
 | **SHIP-155a** | M6 | `POST /v1/jobs/{id}/reports` — the **producer** `Docs/04` §5's second moderation queue never had, so SHIP-156 has something to list. A party to the job reports the listing **or one message on it**, with a reason from a closed list and a description. **Raising one moves no job status** — `Docs/02` §2 has no transition and `Docs/04` §6 puts the outcome in an administrator's hands — which is the single departure from `disputes` (`000800`) and is enforced by `admin.Reports` holding no `Jobs` port at all. The reason list is a **derivation** from `Docs/01` §2, `Docs/05` §4, `Docs/03` and `Docs/04` §6's escalation sentence rather than a quotation, because no document enumerates one — *see below* |
+| **SHIP-156** | M6 | `GET /v1/admin/reports` and `GET /v1/admin/reports/{id}` — `Docs/04` §5's second moderation queue, from the reading end, and **the row that closes M6**. The queue is oldest-first over `idx_reports_queue`, which `000805` created with a `(created_at, id)` tie-break for exactly this cursor and which nothing read until now. **Two endpoints rather than one**, on `AdminDisputes`/`AdminDispute`'s split: a description is four thousand characters and a conversation two thousand a message, so the queue triages and the report screen is what somebody opens. **The conversation is the whole job's and is returned for both kinds of report** — `job_messages` is keyed `(job_id, provider_id)`, so scoping it to the reported message's own negotiation would answer nothing for a report about the listing, which is the majority kind. **There is deliberately no filter** — *see below* |
 | **SHIP-163** | M6 | `POST /v1/jobs/{id}/disputes` — `Docs/04` §7's intake fields, and raising one **freezes the job** through the guard. M6's first code, and the first endpoint in `admin` — which is a **user** endpoint, not an administrative one. It writes **no audit row**, and the category list is a **reading** of `Docs/02` §5 rather than a quotation — *see below* |
 | **SHIP-137** | M5 | The notification consumer — **a service of its own, `cmd/notifier`, rather than a sixth `cmd/worker` task**, because a worker pass *is* a transaction and a consumer must commit its topic offsets strictly after one. `internal/notifications` opens: the routing table, recipient resolution through a `Parties` port `cmd/notifier` fills, and dispatch that reads a channel column and knows nothing about events. Idempotence is `uq_notifications_event_recipient_channel` rather than anything the consumer remembers. **Push is declared and unsendable** — SHIP-139 and SHIP-140 do not exist, so `Rules` writes no push row rather than rows nothing can complete — *see below* |
 | **SHIP-139** | M5 | The Firebase adapter — and **`Pusher` returns `(rejected bool, err error)`**, because a sentinel expresses "a dead token is normal traffic" and does not enforce it, and could not even have been the adapter's own: a domain may not import an adapter. `000702` adds a **fourth notification status**, `undeliverable`, because `failed` is deliberately retried forever and `sent` would be untrue. **No Firebase project exists**; the credential is a closure and the exchange from a service-account key needs a `go.mod` change — *see below* |
@@ -16818,6 +16864,134 @@ wave 21 changed it, and a section added to a harness that cannot currently be go
 nobody has demonstrated. Whoever repairs the harness should add it, and the acceptance criterion is
 already a single command that exits non-zero.
 
+### SHIP-155a and SHIP-156 — `Docs/04` §5's second queue, both ends, one pass apart
+
+**This entry covers both tickets**, and it is written here rather than as two because they are one
+screen split across two credentials — and because SHIP-155a's row above says *see below* and nothing
+was below it until now. The pass that built it recorded the decisions in its commit and its handoff
+and left §3 owing the write-up; that is the gap this closes.
+
+**The queue had no producer for eleven passes and no reader for one.** SHIP-156's *Done when* is
+"reports surface with the job and conversation in context" and nothing anywhere created a report:
+no `reports` table, no route, and no row that built one. The strike was re-measured correctly on
+eleven consecutive passes and was actionable on none of them, because what it named was missing from
+the *plan* rather than from the code. SHIP-155a was written on 30 August, built the same day, and
+SHIP-156 followed it.
+
+#### What SHIP-155a built
+
+`POST /v1/jobs/{id}/reports`, `RequireUser` — the reporter is a customer or a provider on the
+ordinary access token, not an administrator. `000805` adds `reports`: `subject_type` plus a nullable
+`message_id` held together by `ck_reports_subject`, so a report names a job or one message and never
+both; the reporter's account *and* which side of the job they were on, resolved by the platform from
+the job and its accepted bid rather than taken from the request; a reason from a closed list; a
+description; and `uq_reports_idempotency`, partial and scoped per job, so a retry answers with the
+report already raised rather than raising a second.
+
+**Raising one moves no job status**, which is the single departure from `disputes` (`000800`) and the
+decision worth carrying. `Docs/02` §2 has no transition for a report and `Docs/04` §6 puts the outcome
+in an administrator's hands after review; a report that froze a job would hand either party a
+unilateral freeze over the other's delivery on their own say-so. **It is enforced rather than
+intended**: `admin.Reports` holds no `Jobs` collaborator at all, so there is nothing on the type that
+could move a status, and adding the field is a deliberate act a reviewer would see.
+
+#### What SHIP-156 built
+
+`GET /v1/admin/reports` and `GET /v1/admin/reports/{id}`, both `RequireAdmin` behind
+`moderation.read` — the permission `permissions.go` has named this ticket for since it was written.
+The queue is oldest first, because `Docs/04` §8 sets an acknowledgement target and the oldest entry is
+the one closest to breaching it, and it reads `idx_reports_queue` — the index `000805` created with a
+`(created_at, id)` tie-break *for this cursor* and which nothing read until now.
+
+**Two endpoints rather than one, and the split is where the weight is.** A description is four
+thousand characters and a message two thousand; a queue carrying either is a page nobody loads twice.
+So the queue triages — who reported what about which job, when, and **where that job has got to** —
+and the report screen is what somebody opens. `AdminDisputes` beside `AdminDispute` made the same
+split for the same reason, and `ReportEntry` has nowhere to put a description, so the saving is
+structural rather than a discipline.
+
+#### The three decisions a later ticket should not undo without reading this
+
+**1. The conversation is the whole job's, and it is returned for a report about the job as readily as
+one about a message.** `job_messages` is keyed `(job_id, provider_id)` (`000506`), so a job carries
+one conversation per provider who bid on it. Scoping the read to the reported message's own
+negotiation would answer well for a message report and answer *nothing* for a report about the
+listing — which is the majority kind, and the one whose reporter has most likely been *told*
+something rather than read something. `Docs/04` §6 step 2 asks a reviewer to read the communications
+on **every** review, and there is deliberately no branch on `subject_type` in
+`ReportQueue.Report`. **Mutation:** branching the read on the subject; both
+`TestAReportAboutTheJobOpensOntoTheConversationToo` and
+`TestTheConversationIsTheWholeJobsRatherThanOneNegotiation` fail, each reporting an empty
+conversation.
+
+**2. There is no filter on the queue, and the absence is a decision.** The dispute queue takes
+`state` because a dispute *has* two states ordered by two different clocks; the exception queue takes
+`ground` because `Docs/04` §5's fourth queue is four situations the document made one screen. A report
+has neither — `000805` records why there is no `resolved_at` and no status vocabulary — and §5's
+second queue is one situation. The narrowing somebody will want first is by reason, for `Docs/04`
+§6's escalation sentence: `safety_concern`, `suspected_fraud` and `abusive_or_threatening`. Adding it
+later keeps the path, the cursor, the ordering and the shape, exactly as SHIP-157 widened SHIP-117's
+queue.
+
+**3. A losing bidder still cannot report, and SHIP-156 did not widen it.** SHIP-155a resolves the
+reporter's side through `JobParties.PartyOn`, which answers from the job's customer and the holder of
+the *accepted* bid — so on an `Open` job with no award the only party is the customer, and a provider
+browsing a misleading listing cannot report it. That is what SHIP-155a's *Done when* asks for and it
+was followed literally. **Building the queue was the moment to reconsider and it was reconsidered:**
+widening it means every provider who can see a job can fill a moderator's queue, which is a decision
+that costs a row and a second port rather than a quiet change. It stays as it is, and this is the
+second place it is written down.
+
+#### How the criterion was demonstrated
+
+**38 Go tests across the two tickets, counted with `grep -c '^func Test'` on this branch rather than
+carried.** SHIP-155a has **27** — 14 service tests against real PostgreSQL in
+`internal/admin/reports_test.go`, 6 vocabulary tests in `report_test.go`, and 7 schema tests in
+`migrations/reports_test.go`. SHIP-156 has **11**, all against real PostgreSQL, in
+`internal/admin/reportqueue_test.go`. On top of those, two fixtures on the contract surface drive both
+new routes through the real router and validate the responses against `contracts/paths/admin.yaml`.
+
+**SHIP-155a's handoff reported 26 and the measured figure is 27** — it counted 13 service tests where
+there are 14. Trivial in itself and recorded because of what it is an instance of: **a figure copied
+from a handoff is not a figure**, which is this file's oldest lesson arriving for the sixth time and
+the first time in a test count. The correction cost one `grep -c`.
+
+The
+queue fixture asserts on the *page* rather than only the status, because an empty collection
+validates the envelope and none of the fields inside it — which on this route would be the whole
+endpoint.
+
+**Three guards were established by mutation rather than believed**, with the file copied aside and
+checksummed first per `CLAUDE.md`:
+
+| Mutation | Outcome |
+|---|---|
+| `ORDER BY created_at ASC, id ASC` reversed to `DESC` | `TestTheReportQueueIsOldestFirst` fails on entry 0 |
+| The cursor's row constructor reduced to `created_at > $1` | `TestTheReportQueuePagesWithoutRepeatingOrSkipping` fails, naming two reports never returned |
+| The same reduced to `created_at >= $1` | The same test fails, naming a report repeated on page 2 |
+| The missing-job check in `ReportQueue.Queue` disabled | `TestAReportNamingAJobTheLookupCannotFindIsAContradiction` fails: the queue answers 1 entry and a nil error |
+
+**The paging mutation is the one worth reading, because the first version of the test did not catch
+it.** The fixture originally seeded three pairs of reports sharing an instant and read them two at a
+time, which puts every page boundary on a *group edge* — where a cursor comparing `created_at` alone
+happens to be correct. The mutation passed. The fixture is now two groups of three read two at a
+time, so a boundary falls *inside* a tie, and both reductions fail it. **A paging test can be written
+so that the thing it exists to catch cannot fail it**, and the only reason this one is not still in
+that state is that the mutation was applied.
+
+#### What is deliberately not here
+
+**No `scripts/verify/` section, for the second ticket running, and the reason is unchanged.** §3's
+check count is maintained by `make verify` / `make verify-update` and by nothing else, so a section
+added without running `verify-update` leaves the harness failing on its own count for whoever next
+runs it — and `make verify` has not been run since wave 21. Writing unexecutable shell into the
+acceptance harness would also be adding an unverified claim to the thing that exists to verify
+claims.
+
+**Both tickets now owe one.** `scripts/verify/90-admin.sh` should gain a section covering intake and
+both reads, and `make verify-update` must run in the same change. What covers the criterion
+meanwhile is the 38 Go tests and the two contract fixtures above, all of which `make check` runs.
+
 ## 4. Partly done — do not treat these as finished
 
 | Ticket | Exists | Missing |
@@ -17202,23 +17376,44 @@ still governs the next proposal: §9 has the entry, the two measured blockers an
 
 ## 6. Ready to start now
 
-**Recomputed on `ship-155a-report-intake` over `develop` at `7f03d12`**, by the same discipline
-every pass here uses: a parser over `Docs/09`'s dependency column and `Docs/11-done.txt` that
-reproduced `make status` cell for cell — 267 rows, 836 points, 226 done, 705 points, and all eleven
-milestone denominators — before a figure below was written. It also re-derived the forward-edge count
-`Docs/09`'s header maintains by hand: **still exactly ten**. This pass adds no row and removes none,
-so there was nothing that could have moved it — the figure is re-derived rather than carried, which
-is the only way it stays worth reading.
+**Recomputed on `ship-156-report-queue` over `develop` at `4ab2591`**, by the same discipline every
+pass here uses: a parser over `Docs/09`'s dependency column and `Docs/11-done.txt` that reproduced
+`make status` cell for cell — 267 rows, 836 points, 227 done, 708 points, and all eleven milestone
+denominators — before a figure below was written. It also re-derived the forward-edge count
+`Docs/09`'s header maintains by hand: **still exactly ten, across nine tickets**, and the ten are
+listed in that header. This pass adds no row and removes none, so there was nothing that could have
+moved it — re-derived rather than carried, which is the only way it stays worth reading.
 
-**Eleven rows have every dependency met: 33 points, and one of them is a code row.** Both figures are
-unchanged from the pass before and the set is not: **SHIP-155a left it by being built, and SHIP-156
-joined because SHIP-155a was what it waited on.** The code row moved along the chain by exactly one
-link, which is what a discharged dependency looks like from here.
+**Ten rows have every dependency met: 30 points, and none of them is a startable code row.** Both
+figures moved, and they moved *down*: eleven and 33 last pass. **SHIP-156 left the set by being built
+and nothing joined it**, so unlike last pass — where SHIP-155a's departure let SHIP-156 in — the set
+shrank rather than moving one link along the chain. There is no twelfth row waiting behind SHIP-156;
+M6 is finished.
 
-**That is the second half of the argument the last pass made, and it took one pass to land rather
-than eleven.** SHIP-156's strike had been re-measured correctly for eleven consecutive passes and was
-never actionable, because what it named — a table that creates reports — existed in no row. The row
-was written, then built, and SHIP-156 is now blocked on nothing.
+**Three code rows remain in the table and all three are unavailable, for two different reasons that
+should not be run together.** SHIP-172 and SHIP-178 are struck by third parties — a legal adviser and
+the store consoles — and SHIP-182 is not struck at all: its strike lifted when SHIP-188 was specified,
+and it stays here only because the owner's re-scope decided a demonstration needs no restore
+rehearsal. **The first two nobody in this building can unblock; the third is available the moment
+somebody wants it.**
+
+**This is the sentence §6 has got wrong before, so it is stated as named rows with their strikes
+re-read against `Docs/09` today rather than as a generalisation.** The wave-21 handoff's "every
+remaining code row waits on a Track-X decision" was wrong about SHIP-186, which waited on X-5 and
+needed nobody outside this building, and §6 reported an empty startable set for four passes when it
+was six rows. What was re-read this pass: `Docs/09` line 744, which is where SHIP-172's dependence on
+X-4 lives — it is prose, not a dependency column, so **no parser here can see it** — and X-4's own row
+at line 115, whose dependency column is `—`, which is why X-4 is startable and SHIP-172 is not.
+
+**What this leaves the owner is a board on which every available move is a Track X row**, and §5's
+ordering of them is unchanged by this pass. X-11 still binds hardest.
+
+**The table below carries twelve entries against a count of ten, and the two extras are deliberate.**
+X-1 and X-3 share one row and are two of the ten. **SHIP-156** is struck through because it was built
+this pass and is kept for one pass so the change is visible rather than silent. **SHIP-174** is not
+in the ten at all — its dependency is X-13, which is unbuilt — and it is here because it is the row
+X-13 exists to release, which is the fact a reader deciding what to procure needs. Count the ten from
+the unstruck rows plus SHIP-172, SHIP-178 and SHIP-182.
 
 | Ticket | Pts | Area | In scope for the demonstration? |
 |---|---|---|---|
@@ -17226,9 +17421,9 @@ was written, then built, and SHIP-156 is now blocked on nothing.
 | **X-12** | 3 | Maps project and its two API keys. Needs a card and a billing account with a budget alert, no third-party approval. **Releases 26 points**, the largest set behind any Track X row | No — and §5 says why the demo does not need it |
 | **X-10** | 3 | Firebase project. No third party; the Android half is an hour. Releases SHIP-144, 145, 146 at 10 points | Yes — but nothing in the demo gate walks a push |
 | **X-4** | 3 | Legal brief | Only through SHIP-172 now. X-9 was taken in reduced form at `c89fa0e`, and X-7 and X-8 stopped binding at the re-scope. §5 |
-| **X-13** | 2 | Written last pass, unbuilt and unstarted. Observability account and its ingestion credential. No third party beyond a signup and a card; releases SHIP-174 and, behind it, SHIP-175, 176, 177 and 184 at 10 points | No — nothing in the demo gate reads a dashboard |
+| **X-13** | 2 | Written two passes ago, unbuilt and unstarted. Observability account and its ingestion credential. No third party beyond a signup and a card; releases SHIP-174 and, behind it, SHIP-175, 176, 177 and 184 at 10 points | No — nothing in the demo gate reads a dashboard |
 | **X-1, X-3** | 4 | D-U-N-S, Play Console | **Deferred.** Nothing is being published to a store |
-| **SHIP-156** | 3 | **The only startable code row on the board, and it became one this pass.** The admin queue for reported jobs and messages. Both dependencies are now met — SHIP-152 landed in wave 12 and **SHIP-155a was built here**, so the producer its *Done when* assumes exists. It closes M6 on its own: M6 is 22 of 23 and SHIP-156 is the 23rd | No — but it is the row that finishes a milestone, and it needs no decision from anybody |
+| ~~SHIP-156~~ | 3 | **Built this pass and gone from the set.** It closed M6 at 23 / 23, and **released nothing**: a scan of every dependency column in `Docs/09` finds no row that names it. Kept for one pass so the change is visible | Built |
 | ~~SHIP-172~~ | 5 | Struck by X-4, which no parser can see. **The only code row X-4 still gates**; SHIP-159 and SHIP-171 both discharged theirs. §5 | Deferred |
 | ~~SHIP-174~~ | 3 | **Strike discharged the same way.** It needed a Datadog account and no Track-X row procured one; **X-13 does**, and SHIP-174 declares the edge. Twelve passes from first record to row | Deferred |
 | ~~SHIP-178~~ | 3 | Struck — needs store-console access, which is X-2 and X-3, both deferred | Deferred |
@@ -19205,6 +19400,35 @@ Kept, struck, because the shape recurs and this is the second instance of it. **
 **That prediction held exactly, and SHIP-83 found the one thing it does not cover.** The source-parsing guard did fire first, and `internal/fleet`'s copy reached SHIP-82's and SHIP-83's new response types with no change to it — they are non-test files in the package it parses. What it cannot do is refuse a budget under a name that is not "budget", because it reads source and can only match a spelling. SHIP-83's serialised-response test is the axis it lacks, and `make verify` now makes the same closed-key-set assertion from outside Go, so neither can be quietly deleted alone.
 
 ## 9. Open recommendations nobody has decided
+
+### `Docs/12` §8's route totals are hand-maintained beside a figure a test holds, and they were wrong three ways
+
+**Found while adding SHIP-156's two rows to `Docs/12` §5, and corrected in the same change.** §8 read
+*"Twelve of the **88** routes key on a network address"* and, four paragraphs later, *"The other
+**75** routes are unaffected by the proxy"*. Against `routes_golden.txt` at `4ab2591` the manifest
+served **89**, so the total was two tickets behind; the remainder was four behind; and **12 + 75 has
+never equalled 88** on any tree, which means the pair was internally inconsistent from the day it was
+written. They now read 91 and 79, measured.
+
+**The figure that did *not* drift is the twelve**, and the reason is the whole point of the finding:
+`TestTheAddressKeyedRoutesEnforceTheirClass` recomputes it from the manifest, so a public route added
+without updating §8 fails the build. §8's own text says exactly this — *"the count is a consequence of
+the route table, and the one way it can be wrong is if somebody edits both to agree on something
+false"* — and the two totals sitting beside that sentence are the case it did not cover, because
+nothing recomputes them.
+
+**§5's headline counts are the counter-example and they are why this is worth a row rather than a
+fix.** `TestTheClassCountsAreWhatTheDocumentClaims` mirrors §5's seven-figure prose line in Go and
+fails when either moves; that test caught this pass's `Read` 35 → 37 immediately. §8's totals have no
+such mirror.
+
+**The recommendation, and nobody has taken it:** either give §8's two totals the same treatment §5's
+counts have — a mirrored constant in `limits_test.go` — or delete them and let the sentence carry only
+the twelve, which is the number a test already holds. **Restating them by hand is the option that has
+now been tried and has produced three errors.** It is a small change and it is deliberately not made
+here, because this pass owns SHIP-156 and a test asserting a figure in a document is a decision about
+how `Docs/12` is maintained.
+
 
 ### The required-field set for publication is a judgement, and it is the owner's to confirm
 

@@ -86,6 +86,138 @@ type JobMessages interface {
 	MessageOnJob(ctx context.Context, r db.Runner, jobID, messageID uuid.UUID) (onJob bool, err error)
 }
 
+// --- SHIP-156: the reported jobs and messages queue ----------------------------------------------
+
+// ReportedJobs is the job a report is about, as much of it as a moderator needs to triage.
+//
+// # Why a second port over `jobs` rather than [JobDirectory]
+//
+// [JobDirectory.OpenJob] already answers with a job — and with every bid on it and every recorded
+// transition, in a transaction that exists to make those three one snapshot. That is the right shape
+// for `GET /v1/admin/jobs/{id}` and the wrong one here twice over: the queue needs the *same* fact
+// about fifty jobs at once, which through that port is fifty transactions and three statements each,
+// and a report screen carrying every bid amount would put the negotiation on a page whose subject is
+// a complaint about wording.
+//
+// So this asks for the one thing both of SHIP-156's endpoints need and nothing else: what the job is
+// and where it has got to. What a moderator opens for the bids and the history is
+// `GET /v1/admin/jobs/{id}`, which is where that decision belongs and where [DisputeSummary] already
+// recorded it.
+//
+// # It is a batch method, and the batch is the point
+//
+// A page of fifty reports names up to fifty jobs, and a port answering one job at a time would make
+// the queue fifty round trips — the N+1 that [JobRecord.BidCount] is a count rather than a bid list
+// to avoid. One `= ANY($1)` answers the page.
+//
+// **Keyed by job rather than returned in order**, because two reports on one job share an entry and
+// a slice would have to carry it twice or the caller would have to match it up. The caller looks
+// each entry's job up by identifier, which cannot mis-align.
+//
+// # A job named by a report always exists, and the caller treats a gap as a contradiction
+//
+// `fk_reports_job` is ON DELETE RESTRICT (`000805`), so nothing can remove a job a report points at.
+// A map missing a key this method was asked for is therefore a broken invariant rather than an
+// ordinary absence, and [ReportQueue] answers it as one — the same position [Reports.alreadyRaised]
+// takes on a duplicate whose row is not there.
+//
+// **The vocabulary stays on the other side.** [ReportedJob.Status] is a plain string for
+// [ExceptionEntry.JobStatus]'s reason: `jobs.Status` is Docs/02 §1's own list generated from
+// `contracts/statuses.yaml` (SHIP-56a), and a copy in this package would shadow a generated one.
+type ReportedJobs interface {
+	// JobsForReports is the context of each job named, keyed by identifier.
+	//
+	// A Runner rather than a pool because [ReportQueue] hands it the same one it read the
+	// reports with; nothing here opens a transaction, for the reason every queue in this package
+	// records — a read owns no invariant (Docs/10 §3.2).
+	JobsForReports(ctx context.Context, r db.Runner, jobIDs []uuid.UUID) (map[uuid.UUID]ReportedJob, error)
+}
+
+// ReportedJob is one job as a report screen shows it.
+//
+// **No budget**, on Docs/01 §4.3's invariant and [JobRecord]'s reasoning: a customer's budget is
+// never exposed in any form, and the safest way to keep an administrative shape clear of one is for
+// it never to have carried it. **No addresses and no contact details** either, per Docs/01 §5.1 —
+// the same closed set [JobRecord] holds, minus the fields a report screen has no use for.
+//
+// **The goods description is here and deliberately so.** It is the listing text, which is precisely
+// what a [ReasonMisleading] or [ReasonProhibitedGoods] report is *about*: a moderator opening one of
+// those is being asked to read the words the reporter objected to, and a screen that named the job
+// without them would send them to a second endpoint to see the subject of the complaint. It is
+// bounded at `jobs`' own `maxGoodsText`.
+type ReportedJob struct {
+	ID         uuid.UUID
+	CustomerID uuid.UUID
+
+	// Status is Docs/02 §1's stored form, reported rather than translated — see [ReportedJobs].
+	Status string
+
+	// GoodsDescription is what the customer said they are sending. Empty on a draft that never
+	// reached the details step, which `000404` allows.
+	GoodsDescription string
+
+	CreatedAt time.Time
+}
+
+// JobConversations is what was said on a job — Docs/04 §6 step 2's "communications" (SHIP-156).
+//
+// A port beside [JobMessages] rather than a second method on it, and the split is
+// interface-segregation rather than tidiness: [Reports.Raise] needs to know whether one message is
+// on a job and has no business being able to read every message on it, and the way to make that true
+// is for the type it holds not to have the method. One adapter in cmd/api satisfies both, because Go
+// interfaces are structural — the segregation costs nothing and buys a constructor that cannot
+// accidentally be handed the wider capability.
+//
+// # Why the whole job rather than one negotiation
+//
+// `job_messages` is keyed `(job_id, provider_id)` (`000506`), so a job carries one conversation per
+// provider who bid on it. A report names a job and may name one message; scoping the read to the
+// reported message's own negotiation would answer well for a message report and answer *nothing* for
+// a report about the job itself — which is the majority kind, and the one whose reporter may well
+// have meant "read what this person has been saying to me".
+//
+// So the read is the job's, and the reported message is identified within it by the report's own
+// `message_id`. That is what "in context" means: the exchange around the thing complained of, rather
+// than the thing complained of quoted on its own.
+//
+// # It is unpaged, on [JobDetail]'s precedent
+//
+// `GET /v1/admin/jobs/{id}` returns every bid and every recorded transition on a job with no cursor,
+// for the reason [JobDetail] records: it is one screen about one job, and a console that had to page
+// it would be a console that sometimes rendered half a negotiation. The same argument holds here and
+// the bound is the same shape — `ck_job_messages_body` caps a message at two thousand characters and
+// the number of them is bounded by how many providers bid.
+type JobConversations interface {
+	// ConversationOn is every message on the job, oldest first within each negotiation.
+	//
+	// Ordered `(provider_id, created_at, id)`, which is `idx_job_messages_conversation`'s own key
+	// (`000506`) — so the ordering is an index scan and the grouping a console renders is the
+	// order it arrives in. Empty is ordinary: most jobs are never discussed.
+	ConversationOn(ctx context.Context, r db.Runner, jobID uuid.UUID) ([]ConversationMessage, error)
+}
+
+// ConversationMessage is one message of a job's negotiation, as a moderator reads it.
+//
+// **No idempotency key**, which the shape makes structural: it is the sender's own value coming back
+// at somebody who did not send it, and it identifies nothing a console can use.
+type ConversationMessage struct {
+	ID uuid.UUID
+
+	// ProviderID is which negotiation this message belongs to — **the provider the conversation
+	// is with, not the author**. `000506` copies that meaning deliberately from
+	// `bids.provider_id`, and a reader who took it for the author would attribute every
+	// customer's message to the provider they were talking to.
+	ProviderID uuid.UUID
+
+	// SentBy is which side wrote it — `customer` or `provider` (`ck_job_messages_sent_by`).
+	// This is the author, and it is a different fact from [ConversationMessage.ProviderID].
+	SentBy string
+
+	Body string
+
+	CreatedAt time.Time
+}
+
 // JobMove is what the guarded transition did, in terms this domain can act on.
 //
 // The four values are the four outcomes of Docs/02 §2's table as seen from one caller: it moved,

@@ -5577,3 +5577,524 @@ ResolutionResult:
       format: uuid
       description: The administrator who settled it, taken from the session.
       example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e9
+
+# --- Docs/04 §5's second moderation queue, from the reading end (SHIP-156) ----------------------
+#
+# `POST /v1/jobs/{id}/reports` above is where a report comes from. These two are where an
+# administrator reads what it wrote, and nothing else in the console can see one: `GET /v1/admin/jobs`
+# searches jobs, which needs a moderator to already know which job to look at.
+#
+# **Two operations rather than one, and the split is the queue's weight.** A report's description is
+# up to four thousand characters and a job's conversation is up to two thousand a message; a queue
+# carrying either is a page nobody loads twice. So the queue triages and the report screen is what
+# somebody opens — `AdminDisputes` beside `AdminDispute` makes the same split for the same reason.
+
+AdminReports:
+  get:
+    operationId: adminReportQueue
+    summary: Reported jobs and messages, one page
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    description: |
+      Docs/04 §5's **second** moderation queue — "reported jobs or messages" — and Docs/04 §6 step 1's
+      "receive a report" from the receiving side (SHIP-156).
+
+      ## Ordering
+
+      **Oldest first.** Docs/04 §8 sets an acknowledgement target, so the entry at the front is the
+      one closest to breaching it. The verification queue and the open half of the dispute queue are
+      ordered the same way and for the same reason; the account and job searches are newest-first
+      because looking somebody up is not a queue.
+
+      ## There is no filter, and that is deliberate
+
+      The dispute queue takes `state` because a dispute *has* two states ordered by two different
+      clocks, and the exception queue takes `ground` because Docs/04 §5's fourth queue is four
+      situations the document made one screen. A report has neither: it carries no state — there is
+      no `resolved_at` and no status vocabulary on the table, because Docs/04 §6's outcomes are
+      recorded in the audit log, the enforcement rows and the job's own history — and §5's second
+      queue is one situation.
+
+      A narrowing by `reason` is the one somebody will want first, for Docs/04 §6's escalation
+      sentence: "urgent safety, suspected criminal activity, or credible threats" are
+      `safety_concern`, `suspected_fraud` and `abusive_or_threatening`. It is not built, and adding
+      it later keeps this path, this cursor, this ordering and this shape — SHIP-157 widened the
+      exception queue exactly that way.
+
+      ## What an entry carries, and what it never will
+
+      Enough to triage: who reported what about which job, when, and **where that job has got to**.
+      A report on an open listing is a different urgency from one on a delivery that finished a
+      fortnight ago, and a moderator cannot tell them apart from the report alone.
+
+      **Not the reporter's description** — that is what `GET /v1/admin/reports/{id}` is for.
+
+      **Nothing commercial, and nowhere in this shape to put any.** A customer's budget is never
+      exposed in any form (Docs/01 §4.3). What a moderator opens for the bids and their amounts is
+      `GET /v1/admin/jobs/{id}`.
+
+      ## A job may appear more than once
+
+      `job_id` is not unique on this queue. Nothing limits a job to one report — two parties
+      complaining about one listing for two reasons are two things a moderator wants to see — and
+      unlike a dispute a report freezes nothing, so there is no "one open report per job" rule.
+
+      ## Permission
+
+      Needs `moderation.read`, which every administrator role holds including `support` — looking is
+      what the least-privileged role exists to be able to do. Acting on what is found is
+      `jobs.unpublish` or `users.restrict` on a different endpoint.
+    parameters:
+      - name: limit
+        in: query
+        required: false
+        description: How many reports to return.
+        schema:
+          type: integer
+        example: 25
+      - name: cursor
+        in: query
+        required: false
+        description: |
+          Where the previous page stopped, taken from `next_cursor`. A cursor this endpoint did not
+          issue is a `400` rather than an empty page — a client that sent one has a bug, and
+          answering "nothing here" would let it page for ever through a queue it never saw.
+
+          It carries both `raised_at` and the report's identifier, because two reports raised in the
+          same instant are ordinary on a platform-wide queue and a cursor on the clock alone would
+          repeat one or skip one at exactly the page boundary.
+        schema:
+          type: string
+    responses:
+      '200':
+        description: One page of reports, oldest first.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/ReportQueuePage'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `moderation.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+AdminReport:
+  get:
+    operationId: adminOpenReport
+    summary: One report, with the job and the conversation it is about
+    tags: [Administration]
+    security:
+      - BearerAdminSession: []
+    parameters:
+      - $ref: '#/ReportID'
+    description: |
+      SHIP-156's *Done when* — "reports surface with the job and conversation in context" — and the
+      screen Docs/04 §6 step 2 describes: "review the affected job, user profile, communications, and
+      history."
+
+      Three of those four are here or one call away. The **job** and the **communications** are in
+      this response; the **profile** is `GET /v1/admin/users`; the **history**, with every bid and
+      every recorded transition, is `GET /v1/admin/jobs/{id}`.
+
+      ## The path names the report, not the job
+
+      Unlike most administrative actions on a job, and more strongly than for a dispute: a job may
+      carry any number of reports at once, so "the report on this job" never identifies one.
+
+      ## The conversation is the whole job's, and it is returned for both kinds of report
+
+      `job_messages` is keyed by job **and provider**, so a job carries one conversation per provider
+      who bid on it. Two consequences worth stating because both are deliberate:
+
+      * A report about **one message** returns every message on the job, not just that message's
+        negotiation. Reading a reported line without the exchange around it is how a quoted price
+        gets mistaken for an offer. The reported message is identified within the list by
+        `message_id`.
+      * A report about **the job itself** returns the conversation too. A party who reports a listing
+        as `abusive_or_threatening` has almost certainly been *told* something rather than read
+        something, and a screen that showed the conversation only for message reports would be blank
+        in the case it is most needed.
+
+      `conversation` is grouped by `provider_id` and oldest-first within each group, so a console
+      renders one thread per provider in the order the rows arrive. It is **not paged**, on the same
+      reasoning as `GET /v1/admin/jobs/{id}` returning every bid and every transition: it is one
+      screen about one job.
+
+      ## What is not here
+
+      **The reporter's idempotency key.** It is on the row — intake needs it to tell a retry from a
+      reused key — and it is dropped before this response. It is the reporter's own value, and a
+      response carrying it invites a console to treat it as an identifier the platform issued.
+
+      **Anything commercial.** `job` carries no budget and no bid amount, and there is nowhere in its
+      shape to put either (Docs/01 §4.3); no addresses and no contact details either (Docs/01 §5.1).
+
+      **An outcome.** Reading a report is not deciding it. Docs/04 §6 step 4's outcomes are recorded
+      by `POST /v1/admin/jobs/{id}/unpublish`, `POST /v1/admin/users/{id}/standing` and the audit
+      log — a report carries no `resolved_at` and no status, and raising one moves no job status at
+      all.
+
+      ## Permission
+
+      Needs `moderation.read` — the same permission as the queue, because this is that screen opened
+      rather than a second capability.
+    responses:
+      '200':
+        description: The report, the job it is about, and what was said on that job.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '#/AdminReportDetail'
+      '400':
+        $ref: '../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        description: |
+          No usable administrator session was presented.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+          WWW-Authenticate:
+            description: The authentication scheme this endpoint accepts.
+            schema:
+              type: string
+            example: Bearer error="invalid_token"
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '403':
+        description: |
+          The session is valid and the role does not hold `moderation.read`
+          (`admin_permission_denied`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '404':
+        description: |
+          No report with that identifier (`not_found`).
+
+          **Disclosed plainly, unlike the `404` on intake.** A stranger reporting somebody else's job
+          gets the same answer a missing job gets, because telling them apart would confirm that the
+          job exists. The caller here holds `moderation.read` over every report on the platform and
+          there is nothing being kept from them.
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+      '500':
+        $ref: '../openapi.yaml#/components/responses/InternalError'
+      '503':
+        description: |
+          A dependency this request needs is not answering (`service_unavailable`).
+        headers:
+          X-Request-Id:
+            $ref: '../openapi.yaml#/components/headers/RequestID'
+        content:
+          application/json:
+            schema:
+              $ref: '../openapi.yaml#/components/schemas/Error'
+
+ReportID:
+  name: id
+  in: path
+  required: true
+  description: The report, from the queue's `id`.
+  schema:
+    type: string
+    format: uuid
+  example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+
+ReportQueuePage:
+  type: object
+  additionalProperties: false
+  required: [data, has_more]
+  description: |
+    The standard collection envelope (`Docs/10` §4.5). `data` is always an array, never `null`.
+  properties:
+    data:
+      type: array
+      items:
+        $ref: '#/ReportQueueEntry'
+    next_cursor:
+      type: string
+      description: |
+        Pass as `cursor` for the next page. Absent when this is the last one.
+      example: MjAyNi0wOC0yMVQxMTozMDowMC4wMDBafDAxOThmMmMx
+    has_more:
+      type: boolean
+      description: |
+        Carried rather than inferred from `next_cursor`, because an absent cursor is also what the
+        *first* request looks like and a client should not have to know the difference.
+      example: false
+
+ReportQueueEntry:
+  type: object
+  additionalProperties: false
+  required:
+    [id, job_id, job_status, subject_type, message_id, reporter_id, reporter_party, reason,
+     raised_at]
+  description: |
+    One report as the queue shows it. **Every field is always present**, `message_id` included — it
+    is an empty string on a report about the job itself, so a console renders one table rather than
+    branching on which keys exist. The intake response next door omits it instead, and the difference
+    is who is reading: that one answers the reporter's own app.
+
+    **No description** — `GET /v1/admin/reports/{id}` carries it. **Nothing commercial, and nowhere
+    in this shape to put any** (Docs/01 §4.3).
+  properties:
+    id:
+      type: string
+      format: uuid
+      description: The report, and what `GET /v1/admin/reports/{id}` names.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    job_id:
+      type: string
+      format: uuid
+      description: |
+        The job reported, or the job the reported message is on. **Not unique on this queue.** Open
+        it with `GET /v1/admin/jobs/{id}` for the listing, the bids and the status history.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    job_status:
+      type: string
+      description: |
+        Where that job is now, in Docs/02 §1's stored form — for triage, not judgement. A report on
+        an `Open` listing is a different urgency from one on a delivery that finished a fortnight
+        ago.
+      example: Delivered
+    subject_type:
+      type: string
+      enum: [job, message]
+      description: |
+        Whether this is about the job's own listing or about one message on it. Branch on this rather
+        than on whether `message_id` is empty.
+      example: message
+    message_id:
+      type: string
+      description: |
+        The reported message, or an **empty string** on a report about the job itself.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2
+    reporter_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e3
+    reporter_party:
+      type: string
+      enum: [customer, provider]
+      description: |
+        Which side of *this job* they were on, resolved by the platform at intake from the job and
+        its accepted bid. Not their account role — being the customer who owns this job is a stronger
+        statement than carrying a customer account.
+      example: customer
+    reason:
+      type: string
+      enum:
+        - prohibited_goods
+        - misleading_listing
+        - dealing_outside_shipper
+        - abusive_or_threatening
+        - suspected_fraud
+        - safety_concern
+        - other
+      description: |
+        Why the reporter says it is wrong. Three of these — `abusive_or_threatening`,
+        `suspected_fraud` and `safety_concern` — are Docs/04 §6's escalation sentence.
+      example: dealing_outside_shipper
+    raised_at:
+      type: string
+      format: date-time
+      description: |
+        When the platform received the report, in UTC. What the queue is ordered by and what Docs/04
+        §8's acknowledgement target is measured from. **The only instant a report carries** — there
+        is no `occurred_at` beside it, unlike a dispute: the subject of a report is a thing still
+        there to be opened rather than an incident that happened out of sight.
+      example: '2026-08-21T11:30:00.000Z'
+
+AdminReportDetail:
+  type: object
+  additionalProperties: false
+  required:
+    [id, subject_type, message_id, reporter_id, reporter_party, reason, description, raised_at,
+     job, conversation]
+  description: |
+    One report with everything the reporter sent, the job it is about, and what was said on that job.
+
+    **There is no top-level `job_id`** — it is `job.id`, once. Two spellings of one fact is a shape a
+    client can find disagreeing with itself.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e5
+    subject_type:
+      type: string
+      enum: [job, message]
+      example: message
+    message_id:
+      type: string
+      description: |
+        The reported message, or an empty string on a report about the job itself. When it is set, it
+        names one of the entries in `conversation`.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2
+    reporter_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e3
+    reporter_party:
+      type: string
+      enum: [customer, provider]
+      example: customer
+    reason:
+      type: string
+      enum:
+        - prohibited_goods
+        - misleading_listing
+        - dealing_outside_shipper
+        - abusive_or_threatening
+        - suspected_fraud
+        - safety_concern
+        - other
+      example: dealing_outside_shipper
+    description:
+      type: string
+      description: |
+        What is wrong, in the reporter's own words, as it was stored — trimmed, with its line breaks
+        intact. This is the field the queue deliberately does not carry.
+      example: |-
+        They are asking to settle off the platform.
+      maxLength: 4000
+    raised_at:
+      type: string
+      format: date-time
+      example: '2026-08-21T11:30:00.000Z'
+    job:
+      $ref: '#/ReportedJob'
+    conversation:
+      type: array
+      items:
+        $ref: '#/ConversationMessage'
+      description: |
+        Every message on the job, grouped by `provider_id` and oldest-first within each group —
+        Docs/04 §6 step 2's "communications". Always present; an empty array rather than `null` when
+        nothing was said, which is ordinary.
+
+ReportedJob:
+  type: object
+  additionalProperties: false
+  required: [id, customer_id, status, goods_description, created_at]
+  description: |
+    The job a report is about, as much of it as a moderator needs to read the complaint.
+
+    **No budget, no bid amount, no addresses and no contact details** (Docs/01 §4.3, §5.1), and there
+    is nowhere in this shape to put any. What a moderator opens for the bids, the amounts and the
+    status history is `GET /v1/admin/jobs/{id}`.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e1
+    customer_id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e0
+    status:
+      type: string
+      description: Docs/02 §1's stored form.
+      example: Delivered
+    goods_description:
+      type: string
+      description: |
+        The listing text — what a `misleading_listing` or `prohibited_goods` report is *about*, which
+        is why it is on this screen rather than a request away. Always present; empty on a draft that
+        never reached the details step.
+      example: Two pallets of garden supplies, Ballarat to Bendigo.
+    created_at:
+      type: string
+      format: date-time
+      example: '2026-08-19T22:05:00.000Z'
+
+ConversationMessage:
+  type: object
+  additionalProperties: false
+  required: [id, provider_id, sent_by, body, created_at]
+  description: |
+    One message on the job.
+
+    **No idempotency key**, which is structural rather than a discipline: it is the sender's own value
+    and it identifies nothing a console can use.
+  properties:
+    id:
+      type: string
+      format: uuid
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e2
+    provider_id:
+      type: string
+      format: uuid
+      description: |
+        Which negotiation this message belongs to — **the provider the conversation is with, not the
+        author**. A job carries one conversation per provider who bid on it, and this is what
+        separates them. A customer's message carries the provider's identifier here and `customer` in
+        `sent_by`.
+      example: 0198f2c1-6b40-7a11-9c3e-2f9a4d51b7e4
+    sent_by:
+      type: string
+      enum: [customer, provider]
+      description: Who wrote it. A different fact from `provider_id` — see above.
+      example: provider
+    body:
+      type: string
+      description: What was written, in the sender's own words.
+      example: Happy to do it Thursday. Cash on the day and we can skip the paperwork.
+      maxLength: 2000
+    created_at:
+      type: string
+      format: date-time
+      example: '2026-08-20T09:14:00.000Z'

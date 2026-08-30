@@ -154,6 +154,44 @@ func init() {
 
 		Route{
 			Method:  http.MethodGet,
+			Pattern: "/admin/reports",
+			Group:   GroupV1,
+
+			// Docs/04 §5's **second** queue (SHIP-156), and the reading end of
+			// `POST /v1/jobs/{id}/reports` above.
+			//
+			// **Under /admin, where that one is under the job**, and the split is the line
+			// that route's own note drew: intake is a party reporting their own job, scoped
+			// to the caller by construction, and this is every report on the platform,
+			// scoped to nothing. Two credentials, two paths.
+			//
+			// RequireAdmin, and `moderation.read` inside the handler, like every other queue.
+			Auth:    RequireAdmin,
+			Limit:   LimitRead,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).ReportQueue() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
+			Pattern: "/admin/reports/{id}",
+			Group:   GroupV1,
+
+			// The *Done when*'s "with the job and conversation in context" (SHIP-156).
+			//
+			// **The path names the report, not the job**, on `GET /v1/admin/disputes/{id}`'s
+			// reasoning and more strongly: a job may carry any number of reports at once
+			// (`000805` has no "one open report per job" and says why), so "the report on
+			// this job" never identifies one.
+			//
+			// The same `moderation.read` as the queue — this is that screen opened, not a
+			// second capability.
+			Auth:    RequireAdmin,
+			Limit:   LimitRead,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).OpenReport() },
+		},
+
+		Route{
+			Method:  http.MethodGet,
 			Pattern: "/admin/users",
 			Group:   GroupV1,
 
@@ -742,6 +780,22 @@ func adminHandler(d Deps) *admin.Handler {
 		panic("cmd/api: admin dispute workflow: " + err.Error())
 	}
 
+	// SHIP-156, the reading end of the queue `reports` above produces into.
+	//
+	// **Two ports and neither is `jobPartiesLookup`**, which is the whole difference between this
+	// and the intake beside it: a party check answers "may this caller report this job", and a
+	// console holding `moderation.read` reads every report on the platform and is party to none
+	// of them. What it needs instead is what each report is *about* — the job, and what was said
+	// on it.
+	//
+	// `jobMessageLookup` is handed to both, and that is Go's structural typing doing exactly what
+	// admin.JobConversations' header asks of it: intake holds the type through an interface with
+	// only `MessageOnJob` on it, so it cannot read a conversation however the adapter grows.
+	reportQueue, err := admin.NewReportQueue(reportedJobLookup{}, jobMessageLookup{}, d.Pool)
+	if err != nil {
+		panic("cmd/api: admin report queue: " + err.Error())
+	}
+
 	handler, err := admin.NewHandler(admin.HandlerServices{
 		Disputes:      svc,
 		Credentials:   creds,
@@ -759,6 +813,7 @@ func adminHandler(d Deps) *admin.Handler {
 
 		DisputeWorkflow: disputeWorkflow,
 		Reports:         reports,
+		ReportQueue:     reportQueue,
 	}, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())
@@ -1106,6 +1161,128 @@ func (jobMessageLookup) MessageOnJob(
 	return onJob, nil
 }
 
+// ConversationOn is every message on the job, in Docs/04 §6 step 2's sense (SHIP-156).
+//
+// **The whole job's, not one negotiation's**, and admin.JobConversations argues why: `job_messages`
+// is keyed `(job_id, provider_id)` (`000506`), so a job carries one conversation per provider who
+// bid on it, and a report about the *listing* names none of them.
+//
+// Ordered `(provider_id, created_at, id)`, which is `idx_job_messages_conversation`'s key verbatim —
+// so the ordering is an index scan rather than a sort, and the grouping a console renders is the
+// order the rows arrive in.
+//
+// **This is the method admin.Reports must not be able to call**, which is why the two ports are
+// declared separately rather than as one interface with both methods on it. Intake holds this same
+// value through admin.JobMessages, which carries only `MessageOnJob`; Go's structural typing means
+// one adapter satisfies both and neither service can reach past the interface it was given.
+//
+// Unpaged, on admin.JobConversations' reading of the JobDetail precedent: one screen about one job.
+func (jobMessageLookup) ConversationOn(
+	ctx context.Context,
+	r db.Runner,
+	jobID uuid.UUID,
+) ([]admin.ConversationMessage, error) {
+	const q = `
+		SELECT id, provider_id, sent_by, body, created_at
+		FROM job_messages
+		WHERE job_id = $1
+		ORDER BY provider_id, created_at, id`
+
+	rows, err := r.Query(ctx, q, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the conversation on %s: %w", jobID, err)
+	}
+	defer rows.Close()
+
+	// An empty slice rather than nil: a job nobody has said anything about is ordinary, and the
+	// handler marshals this straight into a JSON array a console iterates.
+	out := make([]admin.ConversationMessage, 0)
+	for rows.Next() {
+		var m admin.ConversationMessage
+		if err := rows.Scan(&m.ID, &m.ProviderID, &m.SentBy, &m.Body, &m.CreatedAt); err != nil {
+			return nil, fmt.Errorf("cmd/api: reading a message on %s: %w", jobID, err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the conversation on %s: %w", jobID, err)
+	}
+	return out, nil
+}
+
+// reportedJobLookup implements admin.ReportedJobs over `internal/jobs`' rows (SHIP-156).
+//
+// # Why the query is here rather than in a domain
+//
+// It reads `jobs`, which is `internal/jobs`' table, and `admin` may not import that domain — the
+// boundary lint refuses it. jobPartiesLookup, exceptionQueueLookup and jobDirectory are the same
+// arrangement for the same reason, and the composition root is the only place the two packages meet.
+//
+// # It is deliberately narrower than jobDirectory, which already reads this table
+//
+// `jobDirectory.OpenJob` answers with the job, every bid on it and every recorded transition, in a
+// transaction that exists to make those three one snapshot. That is right for
+// `GET /v1/admin/jobs/{id}` and wrong here twice: the queue needs one fact about fifty jobs, which
+// through that port is fifty transactions, and a report screen carrying every bid amount would put
+// the negotiation's commercial detail on a page whose subject is a complaint about wording.
+//
+// **No budget in the column list, and that is the reason to read it here rather than reuse a
+// shape.** Docs/01 §4.3's invariant is enforced server-side, and the narrowest way to enforce it on
+// a new screen is for the statement never to select the column.
+type reportedJobLookup struct{}
+
+// JobsForReports is the context of each job named, keyed by identifier.
+//
+// One statement with `= ANY($1)` rather than one per job: a page of fifty reports names up to fifty
+// jobs, and a round trip each is the N+1 admin.ReportedJobs exists as a batch method to avoid.
+//
+// **A map rather than a slice**, because two reports on one job share an entry — a slice would carry
+// it twice or leave the caller matching rows up by position, which is where an off-by-one puts one
+// job's status beside another job's report.
+//
+// A job the caller asked for and this did not find is simply absent from the map. The caller treats
+// that as a contradiction rather than an absence (admin.ErrReportedJobVanished): `fk_reports_job` is
+// ON DELETE RESTRICT, so nothing can remove a job a report points at.
+func (reportedJobLookup) JobsForReports(
+	ctx context.Context,
+	r db.Runner,
+	jobIDs []uuid.UUID,
+) (map[uuid.UUID]admin.ReportedJob, error) {
+	out := make(map[uuid.UUID]admin.ReportedJob, len(jobIDs))
+	if len(jobIDs) == 0 {
+		return out, nil
+	}
+
+	const q = `
+		SELECT id, customer_id, status, coalesce(goods_description, ''), created_at
+		FROM jobs
+		WHERE id = ANY($1)`
+
+	rows, err := r.Query(ctx, q, jobIDs)
+	if err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the jobs a page of reports is about: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var job admin.ReportedJob
+		// `goods_description` is coalesced in the statement rather than scanned through a
+		// pointer: `000404` makes every draft column nullable, and the absence means the
+		// customer never reached the details step — which the empty string says as well and
+		// which a console renders without a branch.
+		if err := rows.Scan(
+			&job.ID, &job.CustomerID, &job.Status, &job.GoodsDescription, &job.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("cmd/api: reading a job a report is about: %w", err)
+		}
+		out[job.ID] = job
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cmd/api: reading the jobs a page of reports is about: %w", err)
+	}
+	return out, nil
+}
+
 // Compile-time proof that the two adapters satisfy the ports admin declared, which is the only place
 // in the build where that can be established — admin names neither type and neither type names
 // admin, so nothing else links them.
@@ -1113,6 +1290,8 @@ var (
 	_ admin.Jobs                  = disputeLifecycle{}
 	_ admin.JobParties            = jobPartiesLookup{}
 	_ admin.JobMessages           = jobMessageLookup{}
+	_ admin.JobConversations      = jobMessageLookup{}
+	_ admin.ReportedJobs          = reportedJobLookup{}
 	_ admin.ExceptionQueue        = exceptionQueueLookup{}
 	_ admin.CancellationQueue     = cancellationQueueLookup{}
 	_ admin.JobDirectory          = jobDirectory{}

@@ -150,6 +150,8 @@ type contractWorld struct {
 	verificationObjectKey string
 	// disputeID is set by raiseDispute, for the two administrator routes that address one.
 	disputeID uuid.UUID
+	// reportID is set by raiseReport, for the administrator route that addresses one.
+	reportID uuid.UUID
 	// suspensionReviewID is set by suspensionAwaitingApproval, which also leaves a *second*
 	// administrator holding adminToken.
 	suspensionReviewID uuid.UUID
@@ -912,6 +914,47 @@ func (w *contractWorld) raiseDispute(t *testing.T) {
 	w.disputeID = parsed
 }
 
+// raiseReport puts one report on the platform, for the two administrator routes that read them
+// (SHIP-156).
+//
+// Through `POST /v1/jobs/{id}/reports` rather than an INSERT, like raiseDispute above and for its
+// reason: what the queue lists has to be what intake writes, and a fixture that wrote the row
+// directly would let the two drift while both endpoints kept passing.
+//
+// **It reports a message rather than the job**, which is the wider of the two shapes: it exercises
+// `subject_type`, `message_id` and the conversation the report screen opens onto, where a report
+// about the job itself would leave `message_id` empty and prove less.
+func (w *contractWorld) raiseReport(t *testing.T) {
+	t.Helper()
+
+	w.deliveryUnderWay(t)
+
+	// A message for the report to point at. Written directly because `internal/bidding` owns the
+	// endpoint that creates one and driving it here would seed a negotiation this fixture has no
+	// use for — the thing under test is the moderation read, not how a message is posted.
+	messageID := uuid.Must(uuid.NewV7())
+	if _, err := w.pool.Exec(t.Context(), `
+		INSERT INTO job_messages (id, job_id, provider_id, sent_by, body)
+		VALUES ($1, $2, $3, 'provider', 'Cash on the day and we can skip the paperwork.')`,
+		messageID, w.jobID, w.providerID); err != nil {
+		t.Fatalf("seeding a message to report: %v", err)
+	}
+
+	status, body := w.drive(t, http.MethodPost, "/v1/jobs/"+w.jobID.String()+"/reports", asCustomer,
+		`{"subject_type":"message","message_id":"`+messageID.String()+`",`+
+			`"reason":"dealing_outside_shipper",`+
+			`"description":"They are asking to settle off the platform."}`)
+	if status != http.StatusCreated {
+		t.Fatalf("raising a report: status %d, body %v", status, body)
+	}
+	id, _ := body["id"].(string)
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		t.Fatalf("the raised report has no id: %v", body)
+	}
+	w.reportID = parsed
+}
+
 // contractOffer is the body a provider posts to place or revise an offer.
 //
 // The two instants are computed rather than literal because both are validated as future — a fixed
@@ -1162,6 +1205,40 @@ var contractCases = map[string]contractCase{
 	"GET /v1/admin/disputes/{id}": {auth: asAdmin, want: 200,
 		setup: func(t *testing.T, w *contractWorld) { w.raiseDispute(t) },
 		path:  func(w *contractWorld) string { return "/v1/admin/disputes/" + w.disputeID.String() }},
+
+	// SHIP-156. **Both seed a report, and the queue asserts on the page rather than only on the
+	// status.** An empty collection validates the envelope against the contract and none of the
+	// fields inside it, which is the vacuous pass contractCase.assert exists for — and on this
+	// route it would be the whole endpoint.
+	"GET /v1/admin/reports": {auth: asAdmin, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.raiseReport(t) },
+		assert: func(t *testing.T, body map[string]any) {
+			data, _ := body["data"].([]any)
+			if len(data) == 0 {
+				t.Fatal("the report queue answered an empty page against a platform with a report on it")
+			}
+			entry, _ := data[0].(map[string]any)
+			if entry["job_status"] == "" || entry["job_status"] == nil {
+				t.Errorf("the entry carries no job status, which is the job context the "+
+					"queue exists to hydrate: %v", entry)
+			}
+		}},
+
+	"GET /v1/admin/reports/{id}": {auth: asAdmin, want: 200,
+		setup: func(t *testing.T, w *contractWorld) { w.raiseReport(t) },
+		path:  func(w *contractWorld) string { return "/v1/admin/reports/" + w.reportID.String() },
+		assert: func(t *testing.T, body map[string]any) {
+			// The *Done when*'s two halves, on the wire rather than in the domain.
+			job, _ := body["job"].(map[string]any)
+			if job["id"] == nil {
+				t.Errorf("the report opened onto no job: %v", body)
+			}
+			conversation, _ := body["conversation"].([]any)
+			if len(conversation) == 0 {
+				t.Error("the report opened onto an empty conversation, though the message it " +
+					"names is on the job")
+			}
+		}},
 
 	"POST /v1/admin/disputes/{id}/resolution": {auth: asAdmin, want: 200,
 		setup: func(t *testing.T, w *contractWorld) { w.raiseDispute(t) },

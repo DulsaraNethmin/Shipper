@@ -204,6 +204,10 @@ paths:
     $ref: './paths/admin.yaml#/AdminExpiringDocuments'
   /v1/admin/notes:
     $ref: './paths/admin.yaml#/AdminNotes'
+  /v1/admin/reports:
+    $ref: './paths/admin.yaml#/AdminReports'
+  /v1/admin/reports/{id}:
+    $ref: './paths/admin.yaml#/AdminReport'
   /v1/admin/sessions:
     $ref: './paths/admin.yaml#/AdminSessions'
   /v1/admin/sessions/current:
