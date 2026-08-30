@@ -77,6 +77,7 @@ GET    /v1/jobs/{id}/history                    user         read         v1
 POST   /v1/jobs/{id}/milestones                 user         write        v1
 POST   /v1/jobs/{id}/proof-uploads              user         upload       v1
 POST   /v1/jobs/{id}/publish                    user         write        v1
+POST   /v1/jobs/{id}/reports                    user         write        v1
 POST   /v1/notifications/device-tokens          user         write        v1
 DELETE /v1/notifications/device-tokens/current  user         write        v1
 GET    /v1/notifications/preferences            user         read         v1

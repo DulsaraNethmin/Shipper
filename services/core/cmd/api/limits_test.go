@@ -145,11 +145,11 @@ func TestEveryRouteMatchesItsDocumentedClass(t *testing.T) {
 // table can be edited correctly and the sentence above it left alone. The counts are recomputed
 // from the served manifest rather than from the table, so this fails whichever of the two moved.
 func TestTheClassCountsAreWhatTheDocumentClaims(t *testing.T) {
-	// Docs/12 §5: "Counts: Unlimited 1, Credential 5, Message 3, Upload 3, Write 37, Read 35,
+	// Docs/12 §5: "Counts: Unlimited 1, Credential 5, Message 3, Upload 3, Write 38, Read 35,
 	// PublicRead 4."
 	want := map[LimitClass]int{
 		LimitUnlimited: 1, LimitCredential: 5, LimitMessage: 3, LimitUpload: 3,
-		LimitWrite: 37, LimitRead: 35, LimitPublicRead: 4,
+		LimitWrite: 38, LimitRead: 35, LimitPublicRead: 4,
 	}
 
 	got := map[LimitClass]int{}

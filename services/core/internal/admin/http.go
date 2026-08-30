@@ -70,6 +70,7 @@ type Handler struct {
 	evidence      *Evidence
 	expiry        *ExpiryQueue
 	disputes      *DisputeWorkflow
+	reports       *Reports
 	pool          *pgxpool.Pool
 	log           *slog.Logger
 }
@@ -141,6 +142,15 @@ type HandlerServices struct {
 	// reported. One service carrying both would put the audit writer into the constructor of
 	// the one endpoint in this package that deliberately writes no entry.
 	DisputeWorkflow *DisputeWorkflow
+
+	// Reports is the intake of Docs/04 §5's second queue (SHIP-155a).
+	//
+	// **Beside [Disputes] rather than folded into it**, though both are party-facing intake on
+	// the ordinary access token. They are two records with two rules: a dispute freezes the job
+	// and is one at a time, and a report freezes nothing and is unlimited. One service holding
+	// both would need the [Jobs] port for one half of its work, and the whole point of
+	// [NewReports] taking no such port is that a report *cannot* move a status.
+	Reports *Reports
 }
 
 // NewHandler wires the handlers to the services.
@@ -237,6 +247,14 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		// no way to settle it, and Docs/02 §6.1's auto-complete stopped for as long as it lasts.
 		return nil, errors.New("admin: a handler needs the dispute workflow")
 	}
+	if s.Reports == nil {
+		// SHIP-155a. The same argument once more, and here it guards the *producer* of a
+		// moderation queue: a nil discovered at the first request is a report form that fails
+		// at the moment somebody is trying to say something is wrong, and — because SHIP-156
+		// lists what this writes — a queue that stays empty in a way indistinguishable from
+		// nobody having anything to report.
+		return nil, errors.New("admin: a handler needs the report intake service")
+	}
 	if log == nil {
 		return nil, errors.New("admin: a handler needs a logger")
 	}
@@ -255,6 +273,7 @@ func NewHandler(s HandlerServices, pool *pgxpool.Pool, log *slog.Logger) (*Handl
 		evidence:      s.Evidence,
 		expiry:        s.Expiry,
 		disputes:      s.DisputeWorkflow,
+		reports:       s.Reports,
 		pool:          pool,
 		log:           log,
 	}, nil
@@ -428,6 +447,220 @@ func (h *Handler) RaiseDispute() http.Handler {
 		}
 
 		httpx.WriteJSON(w, http.StatusCreated, disputeFrom(dispute))
+		return nil
+	})
+}
+
+// SHIP-155a — reporting a job or a message.
+//
+// The producing end of Docs/04 §5's second moderation queue. See report.go for the vocabulary and
+// reports.go for the rules; what is decided here is the wire shape.
+
+// raiseReportRequest is what a reporter sends.
+//
+// `subject_type` and `message_id` rather than a `subject` object, which is `addNoteRequest`s shape
+// (SHIP-162) for the same pair of facts. Two flat fields are what the constraint holds and what the
+// validation messages can name individually — a nested object would put both problems on one path.
+//
+// **No `job_id`.** It is in the URL, and a body that repeated it would be a second answer to a
+// question the path already asks — [Intake]'s note, and Docs/07 §3's rule about what a client is
+// allowed to assert.
+type raiseReportRequest struct {
+	SubjectType string `json:"subject_type"`
+	MessageID   string `json:"message_id"`
+	Reason      string `json:"reason"`
+	Description string `json:"description"`
+}
+
+// reportResponse is a report as the person who raised it sees it.
+//
+// **Nothing an administrator writes appears here, and nothing ever will** — `disputeResponse`s note,
+// for its reason, and `000805` records the schema half: every column of `reports` is read straight
+// back to its reporter, so a moderator's working note written into one would be a note the reporter
+// reads. SHIP-162's notes are a table of their own precisely so that stays true.
+//
+// **The job's status is not echoed**, and here that is stronger than it is on a dispute: raising a
+// report moves no status at all (report.go), so there is nothing about the job that changed and a
+// field claiming otherwise would be the first thing to suggest a freeze this endpoint deliberately
+// does not perform.
+//
+// The idempotency key is not echoed either. It is the client's own value coming back at it, and
+// putting it in a response invites a client to treat it as an identifier the platform issued.
+type reportResponse struct {
+	ID    string `json:"id"`
+	JobID string `json:"job_id"`
+
+	SubjectType string `json:"subject_type"`
+
+	// MessageID is omitted rather than null on a report about the job itself. `omitempty` is
+	// right here and would be wrong on Evidence next door: an absent id and an empty one are the
+	// same fact — there is no message — whereas an absent list crashes a client that iterates.
+	MessageID string `json:"message_id,omitempty"`
+
+	// RaisedBy is which side of the job the reporter was on, not who they are. The client knows
+	// who it is; what it cannot know without being told is whether the platform agreed they were
+	// the customer or the provider here.
+	RaisedBy string `json:"raised_by"`
+
+	Reason      string `json:"reason"`
+	Description string `json:"description"`
+
+	// RaisedAt is "the moment it was made" — the platform's clock, and the only instant a report
+	// carries. There is no `occurred_at` beside it, unlike a dispute: `000805` records why.
+	RaisedAt string `json:"raised_at"`
+}
+
+func reportFrom(rep Report) reportResponse {
+	out := reportResponse{
+		ID:    rep.ID.String(),
+		JobID: rep.JobID.String(),
+
+		SubjectType: rep.Subject.String(),
+
+		RaisedBy: string(rep.ReporterParty),
+
+		Reason:      rep.Reason.Wire(),
+		Description: rep.Description,
+
+		RaisedAt: timestamp(rep.CreatedAt),
+	}
+	if rep.Subject == ReportSubjectMessage {
+		out.MessageID = rep.MessageID.String()
+	}
+	return out
+}
+
+// reportIntakeFrom turns the request into the domain's shape, reporting what it could not parse.
+//
+// Two fields are parsed here rather than in the domain, and both for [intakeFrom]'s reason: the
+// domain's types cannot hold the malformed value, so the failure has to be reported where the string
+// still exists. An unparsed value is left as its zero so the domain reports it as *required* rather
+// than as invalid — a client that sent nothing should be told the field is missing.
+func reportIntakeFrom(req raiseReportRequest, key string) (ReportIntake, error) {
+	var problems validate.Errors
+
+	var subject ReportSubject
+	switch {
+	case req.SubjectType == "":
+		// Left zero so the domain's Required check reports it.
+
+	case ReportSubject(req.SubjectType).Valid():
+		subject = ReportSubject(req.SubjectType)
+
+	default:
+		problems.Add("subject_type", validate.CodeInvalid,
+			"That is not something you can report. Use one of %s.",
+			strings.Join(reportSubjectNames(), ", "))
+	}
+
+	var reason Reason
+	parsed, known := ReasonFromWire(req.Reason)
+	switch {
+	case req.Reason == "":
+		// Left zero, as above.
+
+	case known:
+		reason = parsed
+
+	default:
+		problems.Add("reason", validate.CodeInvalid,
+			"That is not a reason for reporting. Use one of %s.", strings.Join(ReasonsWire(), ", "))
+	}
+
+	// Left as uuid.Nil when absent, which is what [ReportIntake.problems] reads to decide whether
+	// the subject and the id agree. A malformed one is reported here and not left to that check,
+	// so that "you sent something that is not an identifier" and "you sent no identifier" are
+	// different answers.
+	var messageID uuid.UUID
+	if req.MessageID != "" {
+		id, err := uuid.Parse(req.MessageID)
+		if err != nil {
+			problems.Add("message_id", validate.CodeInvalid,
+				"That is not a valid message identifier.")
+		} else {
+			messageID = id
+		}
+	}
+
+	if err := problems.Err(); err != nil {
+		return ReportIntake{}, err
+	}
+
+	return ReportIntake{
+		Subject:     subject,
+		MessageID:   messageID,
+		Reason:      reason,
+		Description: req.Description,
+		Key:         key,
+	}, nil
+}
+
+// RaiseReport handles POST /v1/jobs/{id}/reports (SHIP-155a).
+//
+// A collection under the job, and plural, for `POST /v1/jobs/{id}/disputes`' reason: the thing being
+// created is a record with an identifier of its own, and a job may carry many.
+//
+// **One endpoint rather than two**, with the subject in the body. The alternative was
+// `POST /v1/jobs/{id}/reports` beside `POST /v1/jobs/{id}/messages/{message_id}/reports`, and it was
+// rejected on SHIP-162's reasoning for `/admin/notes`: "a note is about a user *or* a job and one
+// endpoint that takes the kind is one place the rule has to hold". Here the rule is the party check,
+// and one endpoint is one place it is made.
+//
+// 201 when a report was raised, 200 when this idempotency key had already raised it and nothing was
+// written. Both carry the same shape, so a client that does not care which happened parses one type.
+//
+// # No transaction, and that is the ticket rather than an economy
+//
+// `RaiseDispute` opens one because the dispute row and the job's move to 'Disputed' must commit
+// together. **A report moves no job status** — Docs/02 §2 has no transition for it and Docs/04 §6
+// puts the outcome in an administrator's hands — so this is one insert, and one statement is atomic
+// with itself. The absence of `db.InTx` here is the same statement report.go makes by giving
+// [Reports] no [Jobs] collaborator to move anything with.
+func (h *Handler) RaiseReport() http.Handler {
+	return httpx.H(func(w http.ResponseWriter, r *http.Request) error {
+		reporterID, err := callerID(r.Context())
+		if err != nil {
+			return err
+		}
+
+		jobID, err := jobIDFrom(r)
+		if err != nil {
+			return err
+		}
+
+		var req raiseReportRequest
+		if err := httpx.DecodeJSON(r, &req); err != nil {
+			return err
+		}
+
+		intake, err := reportIntakeFrom(req, r.Header.Get(httpx.HeaderIdempotencyKey))
+		if err != nil {
+			return err
+		}
+
+		pool, err := h.database(r)
+		if err != nil {
+			return err
+		}
+
+		report, raised, err := h.reports.Raise(r.Context(), pool, reporterID, jobID, intake)
+		if err != nil {
+			return apiError(err)
+		}
+
+		if !raised {
+			// Logged because it is the signal that the middleware's entry had gone and the
+			// database caught the retry instead. That is the mechanism working, and it is
+			// otherwise invisible: the response is indistinguishable from an ordinary one.
+			httpx.LoggerFrom(r.Context()).Info("a report retry was answered from the record rather than raised again",
+				slog.String("job_id", jobID.String()),
+				slog.String("report_id", report.ID.String()))
+
+			httpx.WriteJSON(w, http.StatusOK, reportFrom(report))
+			return nil
+		}
+
+		httpx.WriteJSON(w, http.StatusCreated, reportFrom(report))
 		return nil
 	})
 }
@@ -641,6 +874,12 @@ func apiError(err error) error {
 
 	case errors.Is(err, ErrNoteSubjectMissing):
 		return fieldProblem("subject_id", err)
+
+	case errors.Is(err, ErrMessageNotOnJob):
+		// A field-level problem naming `message_id`, not a 404 (SHIP-155a). The job was found
+		// and the caller is party to it — only a party reaches this — so the thing that is
+		// wrong is a field in the body. [ErrNoteSubjectMissing] above takes the same shape.
+		return fieldProblem("message_id", err)
 
 	case errors.Is(err, ErrUserNotFound):
 		// Disclosed plainly. The caller is an administrator holding a permission over accounts,

@@ -68,6 +68,32 @@ func init() {
 
 		Route{
 			Method:  http.MethodPost,
+			Pattern: "/jobs/{id}/reports",
+			Group:   GroupV1,
+
+			// SHIP-155a — the producing end of Docs/04 §5's second moderation queue.
+			//
+			// RequireUser, for the reason the dispute route above records: the reporter is a
+			// customer or a provider on the ordinary access token, and the administrative
+			// stages of Docs/04 §6 are separate tickets behind a separate credential.
+			//
+			// **Under /jobs rather than /admin**, and the line is the one `GET /v1/admin/jobs`
+			// drew: this is a party reporting their own job, scoped to the caller by
+			// construction. SHIP-156's queue is every report on the platform, scoped to
+			// nothing, and belongs under /admin when it is written.
+			//
+			// LimitWrite like every other state-changing route. It is worth naming here
+			// because a report endpoint is the one a bad actor would most like to run in a
+			// loop, and Docs/12's write class is what stands between them and a queue full of
+			// noise — there is deliberately no "one report per job" rule to lean on
+			// (`000805`).
+			Auth:    RequireUser,
+			Limit:   LimitWrite,
+			Handler: func(d Deps) http.Handler { return adminHandler(d).RaiseReport() },
+		},
+
+		Route{
+			Method:  http.MethodPost,
 			Pattern: "/admin/sessions",
 			Group:   GroupV1,
 
@@ -553,6 +579,13 @@ func init() {
 func adminHandler(d Deps) *admin.Handler {
 	svc := admin.NewService(disputeLifecycle{jobs: newJobService(d)}, jobPartiesLookup{}, d.Clock)
 
+	// SHIP-155a. **The same `jobPartiesLookup` the dispute intake takes, deliberately**: the
+	// ticket's *Done when* resolves the reporter's side "from the job and its accepted bid",
+	// which is that adapter's query verbatim. It takes no `disputeLifecycle` — a report moves no
+	// job status, and the absence of the collaborator is what makes that true rather than
+	// intended (admin/report.go).
+	reports := admin.NewReports(jobPartiesLookup{}, jobMessageLookup{})
+
 	hasher, err := passwords.NewHasher(passwords.Argon2Profile{
 		MemoryKiB:   d.Config.Passwords.Argon2.MemoryKiB,
 		Iterations:  d.Config.Passwords.Argon2.Iterations,
@@ -725,6 +758,7 @@ func adminHandler(d Deps) *admin.Handler {
 		Expiry:        expiry,
 
 		DisputeWorkflow: disputeWorkflow,
+		Reports:         reports,
 	}, d.Pool, d.Logger)
 	if err != nil {
 		panic("cmd/api: admin handler: " + err.Error())
@@ -1026,12 +1060,59 @@ func (jobPartiesLookup) PartyOn(
 	return admin.Party(*party), true, nil
 }
 
+// jobMessageLookup implements admin.JobMessages over `internal/bidding`s rows (SHIP-155a).
+//
+// # Why the query is here rather than in a domain
+//
+// It reads `job_messages`, which is `internal/bidding`s table (`000506`). `admin` may import that
+// domain and the boundary lint refuses it, so the statement lives in the composition root beside
+// jobPartiesLookup and exceptionQueueLookup — which is the only place a dependency between two
+// domains is visible to somebody reading how the service is assembled.
+//
+// # What it establishes, and what it deliberately does not
+//
+// **That the message is on the job, and nothing else.** No foreign key can say so — it is a
+// comparison between two tables, and a CHECK may not contain the subquery it would need — which is
+// why this port exists at all rather than the schema carrying the rule.
+//
+// It does **not** check who may read the message. `admin.Reports` calls this only after
+// jobPartiesLookup has established the caller as the job's customer or its awarded provider, and on
+// this job's rows those are the two accounts a conversation can involve. admin.JobMessages records
+// what has to change if a later ticket widens who counts as a party.
+
+type jobMessageLookup struct{}
+
+// MessageOnJob is whether the message belongs to the job.
+//
+// `SELECT EXISTS` rather than reading the row: the answer is a boolean, the caller has no use for
+// the body or the author, and a message a moderator will open is opened by SHIP-156 through its own
+// query. A port is what a domain needs rather than what the other domain has.
+//
+// No lock. Nothing deletes a `job_messages` row — `000506` records that a negotiation stays readable
+// after it ends — so a message that exists now exists when the insert lands, and
+// `fk_reports_message` is what would refuse it if that ever stopped being true.
+func (jobMessageLookup) MessageOnJob(
+	ctx context.Context,
+	r db.Runner,
+	jobID, messageID uuid.UUID,
+) (bool, error) {
+	const q = `SELECT EXISTS (SELECT 1 FROM job_messages WHERE id = $1 AND job_id = $2)`
+
+	var onJob bool
+	if err := r.QueryRow(ctx, q, messageID, jobID).Scan(&onJob); err != nil {
+		return false, fmt.Errorf("cmd/api: reading whether %s is a message on %s: %w",
+			messageID, jobID, err)
+	}
+	return onJob, nil
+}
+
 // Compile-time proof that the two adapters satisfy the ports admin declared, which is the only place
 // in the build where that can be established — admin names neither type and neither type names
 // admin, so nothing else links them.
 var (
 	_ admin.Jobs                  = disputeLifecycle{}
 	_ admin.JobParties            = jobPartiesLookup{}
+	_ admin.JobMessages           = jobMessageLookup{}
 	_ admin.ExceptionQueue        = exceptionQueueLookup{}
 	_ admin.CancellationQueue     = cancellationQueueLookup{}
 	_ admin.JobDirectory          = jobDirectory{}
