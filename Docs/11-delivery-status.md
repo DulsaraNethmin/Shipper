@@ -19406,9 +19406,15 @@ Kept, struck, because the shape recurs and this is the second instance of it. **
 **Found while adding SHIP-156's two rows to `Docs/12` §5, and corrected in the same change.** §8 read
 *"Twelve of the **88** routes key on a network address"* and, four paragraphs later, *"The other
 **75** routes are unaffected by the proxy"*. Against `routes_golden.txt` at `4ab2591` the manifest
-served **89**, so the total was two tickets behind; the remainder was four behind; and **12 + 75 has
-never equalled 88** on any tree, which means the pair was internally inconsistent from the day it was
-written. They now read 91 and 79, measured.
+served **89**, so the total was one behind and the remainder — 89 − 12 = 77 — was two. And **12 + 75
+has never equalled 88** on any tree, which means the pair was internally inconsistent from the day it
+was written, before either half went stale. They now read 91 and 79, measured.
+
+**The first version of this paragraph said "two" and "four", and the correction is the finding
+repeating itself inside its own entry.** Both numbers were reasoned about rather than measured;
+`git show 4ab2591:services/core/cmd/api/routes_golden.txt | wc -l` returns 89 and settles both in one
+command. That is the third time in this pass that a figure someone arrived at by thinking was wrong
+and a figure someone measured was right.
 
 **The figure that did *not* drift is the twelve**, and the reason is the whole point of the finding:
 `TestTheAddressKeyedRoutesEnforceTheirClass` recomputes it from the manifest, so a public route added
