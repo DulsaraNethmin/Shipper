@@ -6,10 +6,16 @@
 
 Built for a **solo developer**, so this is a single ordered queue rather than parallel workstreams. Ticket IDs run in build order: at any point the next ticket is simply the lowest-numbered one still open. Track X is the exception — it is non-code work that must start on day one and run alongside everything else.
 
-**265 tickets, 831 points.** Counted from the rows on 2026-08-29, on a branch whose base is
-`develop` at `806b933`. The previous figure — 249 and 776 — was correct for the tree it was written
-on; this pass adds **four M8 rows** that build the admin panel, **X-12** for the maps account the
-plan has always assumed, and **M9** — eleven rows covering map-based locations and readable mail.
+**267 tickets, 836 points.** Counted from the rows on 2026-08-30, on a branch whose base is
+`develop` at `b75325a`. The previous figure — 265 and 831 — was correct for the tree it was written
+on; this pass adds the **two rows `Docs/11` §6 has been owed for eleven passes**: `SHIP-155a`, which
+creates the reports SHIP-156's queue was written to list, and **X-13**, which procures the
+observability account SHIP-174 needs. Neither is new work — both are prerequisites the plan assumed
+and never wrote down, and until now each read as a strike against nothing.
+
+**The line before that read 265 and 831.** Counted on 2026-08-29 on a branch based at `806b933`,
+where the pass added four M8 rows for the admin panel, X-12 for the maps account, and M9's eleven
+rows covering map-based locations and readable mail.
 
 **Track X's `Size:` line was already wrong when this pass opened, and that is the more useful
 finding.** It read ten rows and twenty-nine points against a table of eleven worth thirty-one: X-11
@@ -81,25 +87,25 @@ whenever a row is added rather than left for a later pass to reconcile.
 
 | Milestone | Goal | Tickets | Points |
 |---|---|---|---|
-| **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 12 | 34 |
+| **X** — External dependencies | Unblock everything that depends on a third party. None of this is code; all of it is slow. | 13 | 36 |
 | **M0** — Foundation | The stack runs locally, CI is green, and a signed build reaches a real device. | 41 | 117 |
 | **M1** — Identity and access | A person can register, verify, choose a role, and stay signed in across app restarts. | 29 | 83 |
 | **M2** — Jobs | A verified customer can create, publish, amend, and cancel a job from the app. | 28 | 84 |
 | **M3** — Bidding and award | Providers discover eligible jobs, bid privately, negotiate, and a customer awards exactly one. | 39 | 133 |
 | **M4** — Delivery execution | A driver completes a delivery with proof, offline, through a link that needs no account. | 33 | 112 |
 | **M5** — Notifications | Every essential event reaches the right person, without a notification failure losing the event. | 14 | 48 |
-| **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 22 | 69 |
+| **M6** — Administration and moderation | Support can see everything, act on it, and leave an auditable trail. | 23 | 72 |
 | **M7** — Hardening and pilot readiness | The store prerequisites are met, the system is observable, and the release gate can be run. | 24 | 72 |
 | **M8** — Demonstration | The marketplace runs at a stable address and a buyer can drive the whole journey unaided. | 12 | 44 |
 | **M9** — Maps and mail | A customer drops a pin where the goods actually are, and every message the platform sends can be opened rather than inferred from a log. | 11 | 35 |
-| | | **265** | **831** |
+| | | **267** | **836** |
 
 Each milestone ends somewhere demonstrable. That matters more when working alone than it does on a team — a milestone you can show someone is the thing that tells you the plan is still real.
 
 ## Track X — External dependencies
 
 **Goal:** Unblock everything that depends on a third party. None of this is code; all of it is slow.  
-**Size:** 12 tickets, 34 points
+**Size:** 13 tickets, 36 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -115,6 +121,7 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 | X-10 | Create the Firebase project and issue its push credentials | 3 | A Firebase project exists; a service-account key is in the CI secret store and in no commit; `google-services.json` and `GoogleService-Info.plist` are available to the mobile build; and a push sent with the platform's own credential arrives on a real handset | — |
 | X-11 | Register the demonstration hostname and point its records at the host | 2 | Three names — the API, the object store and the mailbox — resolve to the demonstration host's public IPv4, and ports 80 and 443 reach it from the public internet | — |
 | X-12 | Create the maps project and issue its API keys | 3 | A cloud project exists with the Android and iOS map SDKs, the geocoding API and the places API enabled; a billing account is attached with a budget alert set, because these are metered and a runaway client is a bill rather than an error; **two** keys exist — one restricted to the Android signing certificate and the iOS bundle identifier for map tiles, one restricted by server address for the platform's own lookups — and neither is in a commit; and a request from the server key returns a coordinate for a real Australian address, while the same key used from a browser is refused | — |
+| X-13 | Create the observability account and issue its ingestion credential | 2 | An organisation exists on a **named site region**, with a plan attached and a usage alert set, because ingestion is metered by host and by volume rather than sold as a seat; an API key and an application key are in the CI secret store and in no commit; the site region is recorded beside them, because a key issued for one site is not an account on another and sending to the wrong one answers with an authentication failure rather than with a wrong address; and a trace and a log line sent by hand from a developer's machine with that credential are both searchable in the organisation | — |
 
 **X-10 was written at the wave-11 reconciliation, eleven waves after the work behind it started, and the reason it stayed invisible is worth more than the row.** `Docs/11` §5 lists only work blocked on a Track-X ticket, and **this was blocked on nothing** — there was no row to be blocked on. So SHIP-139 built the Firebase adapter against a fake FCM server, SHIP-143 shipped a `PushTokenSource` seam with a test asserting the absence, both said in their own write-ups that no project exists, and neither could do anything about it. **A prerequisite the backlog assumed and never wrote down is invisible to every instrument here**: `make status` counts rows, `make verify` exercises endpoints, and neither can report a thing that is missing from the plan itself. It is the same shape as the SHIP-153 gap the wave-10 reconciliation found, and the same answer — write the row.
 
@@ -129,6 +136,14 @@ Each milestone ends somewhere demonstrable. That matters more when working alone
 **It depends on nothing and needs no third-party approval — only a card.** Unlike X-10 there is no half that waits on Apple: restricting a key to an iOS bundle identifier needs the identifier, not the enrolment, and `apps/mobile/ios/Runner` already has one. What it needs that no earlier X row did is **a billing account** — the maps platform will not serve a tile without one, which makes this the first Track X row carrying a recurring cost rather than a one-off approval. That is why the budget alert is in the criterion rather than in a note beside it.
 
 **Two keys rather than one, and it is not defence in depth.** A key that renders map tiles must ship inside the application binary — there is no way to draw a tile without it — so it is restricted by signing certificate and bundle identifier and is *expected* to be extractable. A key that geocodes and autocompletes lives only in `deploy/.env`, is restricted by server address, and is never sent to a device. One key doing both would be an extractable credential with the platform's own metered quota behind it, which is a bill rather than a leak and is worse for being neither obviously.
+
+**X-13 is the fifth instance of the shape X-10 named, and the first this file predicted in writing before anybody wrote the row.** `Docs/11` §5 states the test in one sentence — *"for every external service in `Docs/06`'s stack table, name the Track-X row that procures it"* — and names Datadog in the same breath as a service with none. §6 then carried SHIP-174 **struck for eleven consecutive passes**, re-measured on most of them, with the note that no Track-X row procures an account. **Every one of those measurements was correct and none of them could be acted on**, which is what a strike against a missing row looks like from the inside: no ticket, no owner and no date, so `make status` counts SHIP-174 among the remaining and nothing here can report it as stalled. **A strike in a tracker is a note about a row; a row is a thing somebody can be handed.** That is the whole of the difference and it took twelve passes to spend two points on it.
+
+**It gates four rows and 10 points, and only one of them takes the edge.** SHIP-174 declares it below; SHIP-175, SHIP-176, SHIP-177 and SHIP-184 sit behind SHIP-174 and declare nothing of their own, exactly as SHIP-146 sits behind SHIP-145 for X-10. **Two points rather than X-12's three, because there is no second credential to restrict and no client to enable**: the maps row needed two keys with different restrictions precisely because one of them ships inside a binary, and every credential here stays server-side.
+
+**The site region is in the criterion rather than in a note beside it, and that is the one detail worth paying for in advance.** The vendor runs several independent sites; an organisation lives on exactly one, its ingestion endpoint differs by hostname, and a key issued for one is not an account on another. Sending to the wrong site answers with an authentication failure — **a wrong-address error wearing a bad-credential message**, which is the kind of thing SHIP-174 otherwise loses an afternoon to and then records in `Docs/11` §9 for somebody else to lose it again.
+
+**AWS is the other service §5's test names and it deliberately does not get a row here.** The difference is that nothing open depends on an account: `Docs/06` names AWS as the pilot's deployment target, and the demonstration deploys to whatever host X-11's records point at — SHIP-188's criterion is a hostname and HTTPS over it, not a vendor. **A row procuring AWS would gate nothing and would read as a decision the demonstration had taken**, which is the opposite failure from the one X-13 fixes. Whichever pilot row first cannot be built without it is the row that names it.
 
 ## M0 — Foundation
 
@@ -449,7 +464,7 @@ Five segments or more are safe, because the literal route has only three after `
 ## M6 — Administration and moderation
 
 **Goal:** Support can see everything, act on it, and leave an auditable trail.  
-**Size:** 22 tickets, 69 points
+**Size:** 23 tickets, 72 points
 
 | ID | Ticket | Pts | Done when | Depends on |
 |---|---|---|---|---|
@@ -464,7 +479,8 @@ Five segments or more are safe, because the literal route has only three after `
 | SHIP-153 | Admin verification queue | 3 | Pending provider verifications listed oldest first | SHIP-152, SHIP-81a |
 | SHIP-154 | Admin verification review and decision | 5 | Reviewer sets Verified, Restricted, Rejected, or Suspended with a recorded reason | SHIP-153, SHIP-150 |
 | SHIP-155 | Admin document viewer for private evidence | 3 | Verification images render through short-lived signed URLs and are access-logged | SHIP-154, SHIP-114 |
-| SHIP-156 | Admin reported jobs and messages queue | 3 | Reports surface with the job and conversation in context | SHIP-152 |
+| SHIP-155a | Report a job or a message | 3 | A customer or provider who is party to a job reports the job itself or one message on it, with a reason from a closed list and a description; the report records its reporter, its subject and the moment it was made, and **moves no job status**, because `Docs/02` §2 has no transition for it and `Docs/04` §6 puts the outcome in an administrator's hands; a report names a job or a message and never both, so SHIP-156's queue can open the context the report is actually about; a repeated `Idempotency-Key` answers with the report already raised rather than raising a second; and a party cannot report a job they are not on, because the platform resolves which side they were from the job and its accepted bid rather than taking it from the request | SHIP-97 |
+| SHIP-156 | Admin reported jobs and messages queue | 3 | Reports surface with the job and conversation in context | SHIP-152, SHIP-155a |
 | SHIP-157 | Admin delivery exception queue | 3 | Overdue pickup, delayed delivery, failed proof, and unsynced milestones surface here | SHIP-152, SHIP-128 |
 | SHIP-158 | Admin post-award cancellation queue | 2 | Cancellations after award are listed with the provider's history | SHIP-152 |
 | SHIP-159 | Admin verification expiry queue | 3 | Expiring and expired provider documents surface ahead of time | SHIP-154 |
@@ -486,6 +502,14 @@ Five segments or more are safe, because the literal route has only three after `
 
 **Its hard constraint is in the *Done when* because it is what makes the ticket non-trivial.** `internal/httpx` is infrastructure and imports neither a domain nor an adapter — `CLAUDE.md` calls this the rule easiest to break by accident and hardest to see afterwards, because every domain imports `httpx`. So the administrator's identity cannot reach `SubjectScope` by `httpx` importing `internal/admin`; it arrives through a function or an interface `httpx` declares itself, with `cmd/api` supplying the closure, exactly as `newAdminGuard` already does for the guard.
 
+**SHIP-155a is the row `Docs/11` §6 has been asking for since wave 8, and it is X-10's shape in a second key.** SHIP-156's *Done when* is *"Reports surface with the job and conversation in context"* and **nothing anywhere creates a report**: no `reports` table in any migration, no report route on `routes_golden.txt`, and no row that builds one — re-measured on this branch, where the four files matching `reports` under `services/core/migrations` are the verb in a comment and a sentence inside a test fixture. The strike in §6 has been carried for **eleven consecutive passes** and re-measured on most of them. **Every one of those measurements was right and none of them had anywhere to go**, which is the same finding X-10, X-11, X-12 and now X-13 each produced: `make status` counts rows, `make verify` exercises endpoints, and **neither can report a prerequisite that is missing from the plan itself**. A queue with no producer is not blocked on a dependency; it is short a row.
+
+**It is lettered rather than numbered into the 190s, for the reason SHIP-188a records.** SHIP-156 must depend on it, so a row numbered after SHIP-156 would make that a *forward* edge and move the ten-edge count this file maintains by hand. `SHIP-155a` sorts after SHIP-155 and before SHIP-156, every edge stays backward, and the count above is untouched — the same argument that put the admin-panel rows at `SHIP-188a` rather than in the 190s.
+
+**Both subjects already exist, which is what separates this row from the verification chain that read as startable for four waves and was not.** `Docs/04` §5's second queue is *"reported jobs or messages"* — two subjects, one queue — and `jobs` has been there since 000400 and `job_messages` since 000506. **So this waits on nothing**, unlike SHIP-153, which wanted to list verification submissions that no table held.
+
+**What it must not copy from `disputes` (000800) is the status transition, and that is the one modelling decision the row hands forward.** Raising a dispute moves the job to `Disputed` because `Docs/02` §2 has a row for exactly that and §3 has the freeze it buys. **Raising a report moves nothing**: §2 has no transition for it, and `Docs/04` §6 has an administrator choose between no action, warning, content removal, cancellation, restriction, suspension and escalation *after* reviewing. **A report that froze a job would hand either party a unilateral freeze** over the other's delivery, on their own say-so, which is a denial-of-service dressed as moderation. Everything else about 000800 is the precedent to follow — a closed reason list derived in the migration from the documents that do enumerate things and held to the Go constants by a test, `Other` as the escape so an unanticipated complaint is not mis-filed, and the reporter's side resolved by the platform from the job rather than taken from the request.
+
 ## M7 — Hardening and pilot readiness
 
 **Goal:** The store prerequisites are met, the system is observable, and the release gate can be run.  
@@ -503,7 +527,7 @@ Five segments or more are safe, because the literal route has only three after `
 | SHIP-171b | A pseudonymised account stops being a notification recipient | 3 | No notification is written addressed to a pseudonymised account and none already queued dispatches to one, so the attempts counter stops climbing on a person the platform has deleted | SHIP-171 |
 | SHIP-172 | Cascade deletion of personal artefacts | 5 | Verification documents, message bodies, device tokens, and attributable images are removed | SHIP-171 |
 | SHIP-173 | Flutter account deletion UI | 3 | Deletion is initiated in-app with clear consequences and confirmation | SHIP-169, SHIP-49 |
-| SHIP-174 | Datadog APM and log ingestion | 3 | Traces and structured logs arrive from the Go service and are searchable | SHIP-9 |
+| SHIP-174 | Datadog APM and log ingestion | 3 | Traces and structured logs arrive from the Go service and are searchable | SHIP-9, X-13 |
 | SHIP-175 | Datadog job and bid outcome dashboards | 3 | Publication, bid, and award success rates are visible on one board | SHIP-174 |
 | SHIP-176 | Notification failure alerting | 2 | A rise in undelivered notifications pages someone | SHIP-174, SHIP-137 |
 | SHIP-177 | Delayed and stuck job alerting | 2 | Jobs stalled in a status beyond threshold raise an alert | SHIP-174 |
